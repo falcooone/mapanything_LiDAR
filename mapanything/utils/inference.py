@@ -7,12 +7,12 @@
 Inference utilities.
 """
 
+import warnings
 from typing import Any, Dict, List
 
 import numpy as np
 import torch
 
-from mapanything.utils.device import get_amp_dtype, get_autocast_device_type
 from mapanything.utils.geometry import (
     depth_edge,
     get_rays_in_camera_frame,
@@ -37,6 +37,11 @@ ALLOWED_VIEW_KEYS = {
     "true_shape",  # Optional - original image shape
     "idx",  # Optional - index of the view
     "instance",  # Optional - instance info of the view
+    "pcd",
+    "confidence",
+    "cast",
+    "normal",
+    "lidar_depth_scale",
 }
 
 REQUIRED_KEYS = {"img", "data_norm_type"}
@@ -98,15 +103,25 @@ def loss_of_one_batch_multi_view(
 
     # Determine the mixed precision floating point type
     if use_amp:
-        amp_dtype = get_amp_dtype(device, amp_dtype)
+        if amp_dtype == "fp16":
+            amp_dtype = torch.float16
+        elif amp_dtype == "bf16":
+            if torch.cuda.is_bf16_supported():
+                amp_dtype = torch.bfloat16
+            else:
+                warnings.warn(
+                    "bf16 is not supported on this device. Using fp16 instead."
+                )
+                amp_dtype = torch.float16
+        elif amp_dtype == "fp32":
+            amp_dtype = torch.float32
     else:
         amp_dtype = torch.float32
 
     # Run model and compute loss
-    device_type = get_autocast_device_type(device)
-    with torch.autocast(device_type, enabled=bool(use_amp), dtype=amp_dtype):
+    with torch.autocast("cuda", enabled=bool(use_amp), dtype=amp_dtype):
         preds = model(batch)
-        with torch.autocast(device_type, enabled=False):
+        with torch.autocast("cuda", enabled=False):
             loss = criterion(batch, preds) if criterion is not None else None
 
     result = {f"view{i + 1}": view for i, view in enumerate(batch)}
@@ -201,6 +216,7 @@ def preprocess_input_views_for_inference(
     2. Convert depth_z to depth_along_ray
     3. Convert camera_poses to the expected input keys (camera_pose_quats and camera_pose_trans)
     4. Default is_metric_scale to True when not provided
+    5. Ensure lidar-related keys (pcd, cast, normal) are torch tensors, float32, and optionally normalize pcd to [0,1]
 
     Args:
         views: List of view dictionaries
@@ -270,6 +286,25 @@ def preprocess_input_views_for_inference(
             processed_view["is_metric_scale"] = torch.ones(
                 batch_size, dtype=torch.bool, device=view["img"].device
             )
+
+        # Step 5: Ensure lidar-related keys are torch tensors, float32, and normalize if needed
+        lidar_keys = ['pcd', 'cast', 'normal']
+        for key in lidar_keys:
+            if key in processed_view:
+                val = processed_view[key]
+                # Convert to torch tensor if not already (defensive)
+                if not isinstance(val, torch.Tensor):
+                    val = torch.tensor(val, dtype=torch.float32)
+                else:
+                    # Ensure dtype is float32
+                    if val.dtype != torch.float32:
+                        val = val.to(dtype=torch.float32)
+                # Optional normalization: if key is 'pcd' and values likely in [0,255], scale to [0,1]
+                # Adjust this based on your actual data range and model expectations.
+                if key == 'pcd' and val.max() > 1.0:  # heuristic: if max > 1, assume 0-255 range
+                    val = val / 255.0
+                # For 'cast' (depth) and 'normal' (unit vector), no normalization needed.
+                processed_view[key] = val
 
         # Rename keys to match expected model input format
         if "ray_directions" in processed_view:

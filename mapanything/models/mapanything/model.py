@@ -1,5 +1,3 @@
-# Copyright (c) Meta Platforms, Inc. and affiliates.
-#
 # This source code is licensed under the Apache License, Version 2.0
 # found in the LICENSE file in the root directory of this source tree.
 
@@ -7,6 +5,7 @@
 MapAnything model class defined using UniCeption modules.
 """
 
+import warnings
 from functools import partial
 from typing import Any, Callable, Dict, List, Tuple, Type, Union
 
@@ -14,11 +13,6 @@ import torch
 import torch.nn as nn
 from huggingface_hub import PyTorchModelHubMixin
 
-from mapanything.utils.device import (
-    empty_cache,
-    get_amp_dtype,
-    get_autocast_device_type,
-)
 from mapanything.utils.geometry import (
     apply_log_to_norm,
     convert_ray_dirs_depth_along_ray_pose_trans_quats_to_pointmap,
@@ -87,6 +81,35 @@ if hasattr(torch.backends.cuda, "matmul") and hasattr(
     torch.backends.cuda.matmul, "allow_tf32"
 ):
     torch.backends.cuda.matmul.allow_tf32 = True
+
+
+# ========================= Added: LiDAR FiLM Module =========================
+class LidarScaleFiLM(nn.Module):
+    """
+    Feature-wise Linear Modulation for LiDAR global depth scale.
+    Input: ResNet-50 spatial features + log(z_d) scalar
+    Output: Globally scale-recalibrated spatial features
+    """
+    def __init__(self, feat_dim: int, hidden_dim: int = 256):
+        super().__init__()
+        self.mlp = nn.Sequential(
+            nn.Linear(1, hidden_dim),
+            nn.ReLU(inplace=True),
+            nn.Linear(hidden_dim, feat_dim * 2)   # gamma and beta
+        )
+        # Identity init: gamma=0, beta=0 at start => F * (1+0) + 0 = F
+        nn.init.zeros_(self.mlp[-1].weight)
+        nn.init.zeros_(self.mlp[-1].bias)
+
+    def forward(self, feat: torch.Tensor, log_zd: torch.Tensor):
+        # feat:      (B, C, H, W)
+        # log_zd:    (B,)
+        gamma_beta = self.mlp(log_zd.view(-1, 1))       # (B, 2C)
+        gamma, beta = gamma_beta.chunk(2, dim=1)        # each (B, C)
+        gamma = gamma.view(-1, feat.size(1), 1, 1)      # (B, C, 1, 1)
+        beta  = beta.view(-1, feat.size(1), 1, 1)       # (B, C, 1, 1)
+        return feat * (1 + gamma) + beta
+# ========================================================================
 
 
 class MapAnything(nn.Module, PyTorchModelHubMixin):
@@ -174,6 +197,19 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         ray_dirs_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
         ray_dirs_encoder_config["patch_size"] = self.encoder.patch_size
         self.ray_dirs_encoder = encoder_factory(**ray_dirs_encoder_config)
+        
+        # Initialize the encoder for lidars
+        lidars_encoder_config = self.geometric_input_config["lidars_encoder_config"]
+        lidars_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
+        lidars_encoder_config["patch_size"] = self.encoder.patch_size
+        self.lidars_encoder = encoder_factory(**lidars_encoder_config)
+
+        # ========================= Added: LiDAR FiLM Module =========================
+        self.lidar_film = LidarScaleFiLM(
+            feat_dim=self.encoder.enc_embed_dim,
+            hidden_dim=256
+        )
+        # ========================================================================
 
         # Initialize the encoder for depth (normalized per view and values after normalization are scaled logarithmically)
         depth_encoder_config = self.geometric_input_config["depth_encoder_config"]
@@ -205,6 +241,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         cam_trans_scale_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
         self.cam_trans_scale_encoder = encoder_factory(**cam_trans_scale_encoder_config)
 
+        # NOTICE
+        # Added fusion conv layer
+        self.fusion_conv = nn.Conv2d(
+            2 * self.encoder.enc_embed_dim,
+            self.encoder.enc_embed_dim,
+            kernel_size=1
+        )
+
         # Initialize the fusion norm layer
         self.fusion_norm_layer = fusion_norm_layer(self.encoder.enc_embed_dim)
 
@@ -234,7 +278,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self._initialize_adaptors(pred_head_config)
 
         # Load pretrained weights
-        self._load_pretrained_weights()
+        # self._load_pretrained_weights()
 
     @property
     def device(self) -> torch.device:
@@ -662,7 +706,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         encoder_input = ViTEncoderInput(
             image=all_imgs_across_views, data_norm_type=data_norm_type
         )
-        encoder_output = self.encoder(encoder_input)
+        with torch.autocast("cuda", enabled=False):
+            encoder_output = self.encoder(encoder_input)
         all_encoder_features_across_views = encoder_output.features.chunk(
             num_views, dim=0
         )
@@ -1163,20 +1208,87 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return all_encoder_features_across_views
 
+    def _encode_lidars(
+        self,
+        views,
+        num_views,
+        batch_size_per_view,
+        all_encoder_features_across_views,
+        per_sample_lidars_input_mask,
+    ):
+        """
+        Encode the lidars for all the views and fuse it with the other encoder features in a single forward pass.
+
+        Args:
+            views (List[dict]): List of dictionaries containing the input views' images and instance information.
+            num_views (int): Number of views.
+            batch_size_per_view (int): Batch size per view.
+            all_encoder_features_across_views (torch.Tensor): Tensor containing the encoded features for all N views.
+
+        Returns:
+            torch.Tensor: A tensor containing the encoded features for all the views.
+        """
+        # Get the height and width of the images
+        _, _, height, width = views[0]["img"].shape
+
+        # Get the ray directions for all the views where info is provided and the ray direction input mask is True
+        lidars_list = []
+        for view_idx in range(num_views):
+            per_sample_lidar_input_mask_for_curr_view =(
+                per_sample_lidars_input_mask[
+                    view_idx * batch_size_per_view : (view_idx + 1)
+                    * batch_size_per_view
+                ]
+            )
+            lidars_for_curr_view = torch.zeros(
+                (batch_size_per_view, height, width, 7),
+                dtype=all_encoder_features_across_views.dtype,
+                device=all_encoder_features_across_views.device,
+            )
+            if (
+                "pcd" in views[view_idx]
+            ):
+                lidars_for_curr_view[per_sample_lidar_input_mask_for_curr_view] = (
+                    views[view_idx]["pcd"][
+                        per_sample_lidar_input_mask_for_curr_view
+                    ]
+                )
+            else:
+                per_sample_lidars_input_mask[
+                    view_idx * batch_size_per_view : (view_idx + 1)
+                    * batch_size_per_view
+                ] = False
+                print(f"LiDAR Fuse Error on view {view_idx}! Using zeros.")
+                # Keep lidars_for_curr_view as zeros and continue
+            lidars_list.append(lidars_for_curr_view)
+
+        # Stack the lidars for all the views and permute to (B * V, C, H, W)
+        lidars = torch.cat(lidars_list, dim=0)  # (B * V, H, W, 7)
+        lidars = lidars.permute(0, 3, 1, 2).contiguous()  # (B * V, 7, H, W)
+
+        # Encode the lidar
+        lidars_features_across_views = self.lidars_encoder(
+            ViTEncoderNonImageInput(data=lidars)
+        )
+
+        return lidars_features_across_views.features
+
     def _encode_and_fuse_optional_geometric_inputs(
-        self, views, all_encoder_features_across_views_list
+        self, views, all_encoder_features_across_views_list, use_lidar
     ):
         """
         Encode all the input optional geometric modalities and fuses it with the image encoder features in a single forward pass.
         Assumes all the input views have the same shape and batch size.
-
+    
         Args:
             views (List[dict]): List of dictionaries containing the input views' images and instance information.
             all_encoder_features_across_views (List[torch.Tensor]): List of tensors containing the encoded image features for all N views.
-
+    
         Returns:
             List[torch.Tensor]: A list containing the encoded features for all N views.
         """
+
+        
         num_views = len(views)
         batch_size_per_view, _, _, _ = views[0]["img"].shape
         device = all_encoder_features_across_views_list[0].device
@@ -1184,14 +1296,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         all_encoder_features_across_views = torch.cat(
             all_encoder_features_across_views_list, dim=0
         )
-
+    
         # Get the overall input mask for all the views
         overall_geometric_input_mask = (
             torch.rand(batch_size_per_view, device=device)
             < self.geometric_input_config["overall_prob"]
         )
         overall_geometric_input_mask = overall_geometric_input_mask.repeat(num_views)
-
+    
         # Get the per sample input mask after dropout
         # Per sample input mask is in view-major order so that index v*B + b in each mask corresponds to sample b of view v: (B * V)
         per_sample_geometric_input_mask = torch.rand(
@@ -1200,7 +1312,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         per_sample_geometric_input_mask = (
             per_sample_geometric_input_mask & overall_geometric_input_mask
         )
-
+    
         # Get the ray direction input mask
         per_sample_ray_dirs_input_mask = (
             torch.rand(batch_size_per_view, device=device)
@@ -1212,7 +1324,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         per_sample_ray_dirs_input_mask = (
             per_sample_ray_dirs_input_mask & per_sample_geometric_input_mask
         )
-
+    
         # Get the depth input mask
         per_sample_depth_input_mask = (
             torch.rand(batch_size_per_view, device=device)
@@ -1222,7 +1334,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         per_sample_depth_input_mask = (
             per_sample_depth_input_mask & per_sample_geometric_input_mask
         )
-
+    
         # Get the camera input mask
         per_sample_cam_input_mask = (
             torch.rand(batch_size_per_view, device=device)
@@ -1232,7 +1344,28 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         per_sample_cam_input_mask = (
             per_sample_cam_input_mask & per_sample_geometric_input_mask
         )
-
+    
+        # Get the lidar input mask
+        per_sample_lidars_input_mask = torch.ones(
+            batch_size_per_view * num_views,
+            device=device,
+            dtype=torch.bool
+        )
+    
+        # Get the lidar input mask
+        per_sample_trace_input_mask = torch.ones(
+            batch_size_per_view * num_views,
+            device=device,
+            dtype=torch.bool
+        )
+    
+        # Get the lidar input mask
+        per_sample_normal_input_mask = torch.ones(
+            batch_size_per_view * num_views,
+            device=device,
+            dtype=torch.bool
+        )
+        
         # Compute the pose quats and trans for all the non-reference views in the frame of the reference view 0
         # Returned pose quats and trans represent identity pose for views/samples where the camera input mask is False
         pose_quats_across_views, pose_trans_across_views, per_sample_cam_input_mask = (
@@ -1245,7 +1378,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 per_sample_cam_input_mask,
             )
         )
-
+    
         # Encode the ray directions and fuse with the image encoder features
         all_encoder_features_across_views = self._encode_and_fuse_ray_dirs(
             views,
@@ -1254,7 +1387,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             all_encoder_features_across_views,
             per_sample_ray_dirs_input_mask,
         )
-
+    
         # Encode the depths and fuse with the image encoder features
         all_encoder_features_across_views = self._encode_and_fuse_depths(
             views,
@@ -1263,7 +1396,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             all_encoder_features_across_views,
             per_sample_depth_input_mask,
         )
-
+    
         # Encode the cam quat and trans and fuse with the image encoder features
         all_encoder_features_across_views = self._encode_and_fuse_cam_quats_and_trans(
             views,
@@ -1274,7 +1407,94 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             pose_trans_across_views,
             per_sample_cam_input_mask,
         )
+        # Debug: view RGB/PCD shapes
+        # print("view shape:")
+        # print("  RGB image shape:", views[1]["img"].shape)
+        # print("  PCD shape:", views[1]["pcd"].shape)
+        
+        # ========== RGB Feature Map Info ==========
+        # B = batch_size_per_view
+        # V = num_views
+        # C, Hf, Wf = all_encoder_features_across_views.shape[1], all_encoder_features_across_views.shape[2], all_encoder_features_across_views.shape[3]
+        # print(f"\n[RGB Feature Map] shape: {all_encoder_features_across_views.shape} -> B*V={B*V}, C={C}, Hf={Hf}, Wf={Wf}")
+        # print(f"  B (batch_size_per_view) = {B}, V (num_views) = {V}, C = {C}, Hf = {Hf}, Wf = {Wf}")
+        
+        # NOTICE!!!
+        # my_mapanything
+        # Encode the Lidar and fuse with the image encoder features
+        if use_lidar:
+            # Get image feature map size (from DINOv2)
+            # Note: all_encoder_features_across_views is spatial: (B*V, C, H_feat, W_feat)
+            _, _, H_feat, W_feat = all_encoder_features_across_views.shape
 
+            # Encode LiDAR to spatial feature map
+            lidars_features_across_views = self._encode_lidars(
+                views,
+                num_views,
+                batch_size_per_view,
+                all_encoder_features_across_views,
+                per_sample_lidars_input_mask,
+            )   # (B*V, enc_embed_dim, H_lidar_feat, W_lidar_feat)
+
+            # ========== Fused Feature Map Info ==========
+            # C_fused, Hf_fused, Wf_fused = lidars_features_across_views.shape[1], lidars_features_across_views.shape[2], lidars_features_across_views.shape[3]
+            # print(f"\n[Lidar Feature Map] shape: {lidars_features_across_views.shape} -> B*V={B*V}, C={C_fused}, Hf={Hf_fused}, Wf={Wf_fused}")
+            # print(f"  B (batch_size_per_view) = {B}, V (num_views) = {V}, C = {C_fused}, Hf = {Hf_fused}, Wf = {Wf_fused}")
+            
+            # ========================= Added: FiLM Global Scale Modulation =========================
+            # Extract per-frame lidar_depth_scale (provided by Dataset)
+            lidar_scale_list = []
+            for view_idx in range(num_views):
+                per_sample_lidar_input_mask_for_curr_view = per_sample_lidars_input_mask[
+                    view_idx * batch_size_per_view : (view_idx + 1) * batch_size_per_view
+                ]
+                z = torch.ones(
+                    batch_size_per_view,
+                    dtype=lidars_features_across_views.dtype,
+                    device=lidars_features_across_views.device,
+                )
+                if "lidar_depth_scale" in views[view_idx] and per_sample_lidar_input_mask_for_curr_view.any():
+                    z[per_sample_lidar_input_mask_for_curr_view] = (
+                        views[view_idx]["lidar_depth_scale"][per_sample_lidar_input_mask_for_curr_view]
+                    )
+                lidar_scale_list.append(z)
+            
+            z_d = torch.cat(lidar_scale_list, dim=0)  # (B*V,)
+            log_zd = torch.log(z_d.clamp(min=1e-3) + 1e-8)  # (B*V,)
+            
+            # FiLM: only modulate LiDAR local features with global scale
+            lidars_features_across_views = self.lidar_film(
+                lidars_features_across_views, log_zd
+            )
+            # ========================================================================
+            
+            # Upsample LiDAR feature map to match image feature size
+            if lidars_features_across_views.shape[2] != H_feat or lidars_features_across_views.shape[3] != W_feat:
+                lidars_features_across_views = torch.nn.functional.interpolate(
+                    lidars_features_across_views,
+                    size=(H_feat, W_feat),
+                    mode='bilinear',
+                    align_corners=False
+                )
+
+            # Confidence-based weighting
+            view_confidences = torch.stack([views[i]["confidence"] for i in range(num_views)])  # (V,)
+            conf_RGB = view_confidences.repeat_interleave(batch_size_per_view, dim=0).view(batch_size_per_view * num_views, 1, 1, 1)
+            half = torch.tensor(0.5, dtype=conf_RGB.dtype, device=conf_RGB.device)
+            conf_Lidar = half / (half + conf_RGB)
+            conf_RGB = 1 - conf_Lidar
+
+             # Apply weights
+            all_encoder_features_across_views = all_encoder_features_across_views * conf_RGB
+            lidars_features_across_views = lidars_features_across_views * conf_Lidar
+
+            # Concatenate along channel dim
+            combined = torch.cat([all_encoder_features_across_views, lidars_features_across_views], dim=1)  # (B*V, 3072, H_img, W_img)
+        
+            all_encoder_features_across_views = self.fusion_conv(combined)   # (B*V, 1536, H_img, W_img)                           
+
+            # print("Lidar In")
+    
         # Normalize the fused features (permute -> normalize -> permute)
         all_encoder_features_across_views = all_encoder_features_across_views.permute(
             0, 2, 3, 1
@@ -1285,12 +1505,12 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         all_encoder_features_across_views = all_encoder_features_across_views.permute(
             0, 3, 1, 2
         ).contiguous()
-
+    
         # Split the batched views into individual views
         fused_all_encoder_features_across_views = (
             all_encoder_features_across_views.chunk(num_views, dim=0)
         )
-
+    
         return fused_all_encoder_features_across_views
 
     def _compute_adaptive_minibatch_size(
@@ -1310,7 +1530,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         if device.type == "cuda":
             # Get available GPU memory
-            empty_cache(device)
+            torch.cuda.empty_cache()
             available_memory = torch.cuda.mem_get_info()[0]  # Free memory in bytes
             usable_memory = (
                 available_memory * memory_safety_factor
@@ -1480,8 +1700,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                     **pose_pred_data_dict
                 )
 
-            # Clear device cache for better memory efficiency
-            empty_cache(device)
+            # Clear CUDA cache for better memory efficiency
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
         else:
             # Run prediction for all (batch_size * num_views) in one go
             # Dense prediction
@@ -1514,13 +1735,13 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         )
         scale_final_output = scale_final_output.value.squeeze(-1)  # (B, 1, 1) -> (B, 1)
 
-        # Clear device cache for better memory efficiency
-        if memory_efficient_inference:
-            empty_cache(device)
+        # Clear CUDA cache for better memory efficiency
+        if memory_efficient_inference and device.type == "cuda":
+            torch.cuda.empty_cache()
 
         return dense_final_outputs, pose_final_outputs, scale_final_output
 
-    def forward(self, views, memory_efficient_inference=False, minibatch_size=None):
+    def forward(self, views, memory_efficient_inference=False, minibatch_size=None, use_lidar=False):
         """
         Forward pass performing the following operations:
         1. Encodes the N input views (images).
@@ -1562,10 +1783,10 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         # Encode the optional geometric inputs and fuse with the encoded features from the N input views
         # Use high precision to prevent NaN values after layer norm in dense representation encoder (due to high variance in last dim of features)
-        with torch.autocast(get_autocast_device_type(self.device), enabled=False):
+        with torch.autocast("cuda", enabled=False):
             all_encoder_features_across_views = (
                 self._encode_and_fuse_optional_geometric_inputs(
-                    views, all_encoder_features_across_views
+                    views, all_encoder_features_across_views, use_lidar
                 )
             )
 
@@ -1648,7 +1869,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 f"Invalid pred_head_type: {self.pred_head_type}. Valid options: ['linear', 'dpt', 'dpt+pose']"
             )
 
-        with torch.autocast(get_autocast_device_type(self.device), enabled=False):
+        with torch.autocast("cuda", enabled=False):
             # Prepare inputs for the downstream heads
             if self.pred_head_type == "linear":
                 dense_head_inputs = dense_head_inputs
@@ -1967,7 +2188,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         use_depth: bool,
         use_pose: bool,
         use_depth_scale: bool,
-        use_pose_scale: bool,
+        use_pose_scale: bool
     ):
         """
         Configure the geometric input configuration
@@ -2002,7 +2223,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                     "cam_prob": 1.0 if use_pose else 0.0,
                     "sparse_depth_prob": 0.0,
                     "depth_scale_norm_all_prob": 0.0 if use_depth_scale else 1.0,
-                    "pose_scale_norm_all_prob": 0.0 if use_pose_scale else 1.0,
+                    "pose_scale_norm_all_prob": 0.0 if use_pose_scale else 1.0
                 }
             )
 
@@ -2035,6 +2256,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         use_multiview_confidence: bool = False,
         multiview_conf_depth_abs_thresh: float = 0.02,
         multiview_conf_depth_rel_thresh: float = 0.02,
+        use_lidar: bool = False,
     ) -> List[Dict[str, torch.Tensor]]:
         """
         User-friendly inference with strict input validation and automatic conversion.
@@ -2108,7 +2330,18 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         """
         # Determine the mixed precision floating point type
         if use_amp:
-            amp_dtype = get_amp_dtype(self.device, amp_dtype)
+            if amp_dtype == "fp16":
+                amp_dtype = torch.float16
+            elif amp_dtype == "bf16":
+                if torch.cuda.is_bf16_supported():
+                    amp_dtype = torch.bfloat16
+                else:
+                    warnings.warn(
+                        "bf16 is not supported on this device. Using fp16 instead."
+                    )
+                    amp_dtype = torch.float16
+            elif amp_dtype == "fp32":
+                amp_dtype = torch.float32
         else:
             amp_dtype = torch.float32
 
@@ -2148,13 +2381,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             use_pose_scale=not ignore_pose_scale_inputs,
         )
 
+          
         # Run the model
-        device_type = get_autocast_device_type(self.device)
-        with torch.autocast(device_type, enabled=bool(use_amp), dtype=amp_dtype):
+        with torch.autocast("cuda", enabled=bool(use_amp), dtype=amp_dtype):
             preds = self.forward(
                 processed_views,
                 memory_efficient_inference=memory_efficient_inference,
                 minibatch_size=minibatch_size,
+                use_lidar=use_lidar, 
             )
 
         # Post-process the model outputs (including multi-view confidence if requested)

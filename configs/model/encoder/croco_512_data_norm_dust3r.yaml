@@ -13,4 +13,4 @@ pretrained_checkpoint_path: '${machine.root_uniception_pretrained_checkpoints_di
 # Override attributes in the pretrained checkpoint
 override_checkpoint_attributes: True
 # Flag to indicate whether model class uses torch hub
-uses_torch_hub: False
+uses_torch_hub: True

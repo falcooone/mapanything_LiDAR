@@ -22,7 +22,6 @@ from pathlib import Path
 import torch
 
 from mapanything.models import MapAnything
-from mapanything.utils.device import get_device
 
 
 def parse_args():
@@ -58,12 +57,13 @@ def parse_args():
 def main():
     args = parse_args()
 
-    # Determine device (auto-detects CUDA > MPS > CPU if args.device == "auto")
+    # Determine device
     if args.device == "auto":
-        device = get_device()
+        device = "cuda" if torch.cuda.is_available() else "cpu"
     else:
-        device = torch.device(args.device)
+        device = args.device
 
+    device = torch.device(device)
     print(f"Using device: {device}")
 
     # Use Apache model if requested

@@ -21,7 +21,6 @@ from wai_processing.utils.covis_utils import (
 )
 from wai_processing.utils.state import SceneProcessLock, set_processing_state
 
-from mapanything.utils.device import get_device
 from mapanything.utils.wai.core import load_data, store_data
 from mapanything.utils.wai.scene_frame import get_scene_names
 
@@ -178,8 +177,7 @@ if __name__ == "__main__":
     if overwrite:
         logger.warning("Careful: Overwrite enabled!")
 
-    device_str = cfg.get("device", "cuda")
-    device = get_device(preferred=device_str if device_str != "auto" else None)
+    device = cfg.get("device", "cuda")
     scene_names = get_scene_names(
         cfg, shuffle=cfg.get("random_scene_processing_order", True)
     )
