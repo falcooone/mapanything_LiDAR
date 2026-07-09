@@ -972,9 +972,9 @@ def build_model(model_dir: str, device: str, rank: int, use_compile: bool = True
                     gate_mlp[-1].weight.zero_()
                     gate_mlp[-1].bias.zero_()
                     if lidar_warmup_epochs > 0:
-                        gate_mlp[-1].bias.fill_(-0.5)
+                        gate_mlp[-1].bias.fill_(-3.0)
                         if is_main_process(rank):
-                            print(f"  -> fusion_module warmup init: slightly RGB-biased gate (warmup={lidar_warmup_epochs} epochs)")
+                            print(f"  -> fusion_module warmup init: strongly RGB-biased gate (warmup={lidar_warmup_epochs} epochs)")
                     else:
                         if is_main_process(rank):
                             print("  -> fusion_module standard init: neutral gate")
@@ -1212,6 +1212,12 @@ def _freeze_fusion_rgb_branch_hook(enc_dim):
     return _hook
 
 
+def _gate_bias_from_alpha(alpha: float) -> float:
+    """Convert a desired sigmoid gate value into the corresponding bias."""
+    alpha = float(max(1e-4, min(1.0 - 1e-4, alpha)))
+    return math.log(alpha / (1.0 - alpha))
+
+
 def set_lidar_warmup_phase(model, enable_warmup, args, rank):
     global _fusion_rgb_hook_handle
     target_model = model.module if hasattr(model, 'module') else model
@@ -1227,7 +1233,9 @@ def set_lidar_warmup_phase(model, enable_warmup, args, rank):
         is_shared = any(k in clean_name for k in ('shared_linear', 'shared_decoder', 'output_proj'))
 
         if enable_warmup:
-            if is_lidar or is_head_base or is_shared:
+            # Keep the warmup RGB-safe: train LiDAR encoder and heads, but hold
+            # fusion blocks frozen until the LiDAR branch has stabilized.
+            if ('lidars_encoder' in clean_name) or is_head_base or is_shared:
                 param.requires_grad = True
                 unfrozen_count += 1
             else:
@@ -1362,13 +1370,13 @@ def reinitialize_fusion_module_for_joint_training(model, rank, smooth_alpha=0.35
         gate_mlp = getattr(fusion_module, "gate_mlp", None)
         if gate_mlp is not None and len(gate_mlp) >= 3 and hasattr(gate_mlp[-1], "weight"):
             gate_mlp[-1].weight.zero_()
-            gate_mlp[-1].bias.zero_()
+            gate_mlp[-1].bias.fill_(_gate_bias_from_alpha(smooth_alpha))
         refine = getattr(fusion_module, "refine", None)
         if refine is not None and hasattr(refine, "weight"):
             refine.weight.zero_()
 
     if is_main_process(rank):
-        print("  -> fusion_module reinitialized to a neutral gate")
+        print(f"  -> fusion_module reinitialized to a conservative gate (alpha={smooth_alpha:.2f})")
 
 def build_scheduler(optimizer, args, steps_per_epoch):
     """构建学习率调度器"""
@@ -1734,8 +1742,8 @@ def main():
                         help="??N ??epoch ??? LoRA?????? LiDAR + Heads (???: 2)")
     parser.add_argument("--lidar_warmup_lr_scale", type=float, default=1.0,
                         help="warmup ??? LiDAR ????????(???: 1.0)")
-    parser.add_argument("--fusion_smooth_alpha", type=float, default=0.35,
-                        help="warmup ?????fusion_module ?????? (???: 0.35)")
+    parser.add_argument("--fusion_smooth_alpha", type=float, default=0.30,
+                        help="joint phase fusion gate bias target (default: 0.30)")
     # ========================================
     
     # 训练开关
