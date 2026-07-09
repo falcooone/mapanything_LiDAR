@@ -1,42 +1,29 @@
 #!/usr/bin/env python3
-#coding=gbk
+# coding: utf-8
 """
-MapAnything LiDAR Fusion Training Script (Joint Training: LoRA for RGB/Heads + Full Train for LiDAR)
-================================================================================================
-Training mode:
-  - RGB Encoder (DINOv2)        : LoRA fine-tune  (rank=8, alpha=16)
-  - Info Sharing (Transformer)    : LoRA fine-tune
-  - Dense Head / Pose Head / Scale Head : LoRA fine-tune
-  - LiDAR Encoder (ResNet-50)     : full training
-  - LiDAR FiLM                  : full training
-  - Fusion Conv (1x1)           : full training, zero-initialized as identity on RGB side
+MapAnything Training Script (LiDAR Warmup + Unified Training)
+================================================================
+  --lora  : è®­ç»ƒ LoRA å‚æ•° (RGB Encoder / Info Sharing / Heads)
+  --lidar : è®­ç»ƒ LiDAR æ¨¡å— (LiDAR Encoder / FiLM / Fusion)
+  --lidar_warmup_epochs N : å‰ N ä¸ª epoch å†»ç»“ LoRAï¼Œå¼ºåˆ¶ LiDAR ä¸»å¯¼
 
-Key fixes:
-  1. Global depth normalization (instead of per-frame) to preserve absolute scale.
-  2. Grouped optimizer: LiDAR params lr*2, LoRA params lr, others frozen.
-  3. Scheduler step() called right after optimizer step() at accumulation boundary.
-  4. Forced logging of rpe_trans / rpe_rot / depth / ray instead of per-view clutter.
-  5. Safe resume from Stage1 ckpt: load model weights only, re-init optimizer.
-  6. DDP find_unused_parameters=True (±ØĞë¿ªÆô£¬ÈİÈÌ¶¯Ì¬ loss Â·¾¶µ¼ÖÂµÄ unused params).
-  7. PYTORCH_CUDA_ALLOC_CONF=expandable_segments:True set before torch import.
-  8. Loss function: use sum(loss_components) instead of in-place += on leaf tensor,
-     ensuring total_loss always has requires_grad=True and DDP never skips backward.
-  9. Ã¿¸ö accumulation boundary Êä³ö GradNorm ÓÃÓÚ¼à¿ØÌİ¶È½¡¿µ¶È.
- 10. [¹Ø¼üĞŞ¸´] LinearWithLoRA ·Ç in-place forward£¬±ÜÃâ DDP ÏÂÆÆ»µ autograd.
- 11. [¹Ø¼üĞŞ¸´] ¿Õ loss Ê±Ìø¹ı backward£¬±ÜÃâ 0 Ìİ¶ÈÀË·Ñ¼ÆËã.
- 12. [¹Ø¼üĞŞ¸´] LoRA ³õÊ¼»¯ std Ôö´ó + lr Ä¬ÈÏÌá¸ß + ¶ÀÁ¢ lora_lr ²ÎÊı.
- 13. [¹Ø¼üĞŞ¸´] resume Ä¬ÈÏÖØÖÃ optimizer£¬±ÜÃâÀúÊ·´íÎó¶¯Á¿ÎÛÈ¾ LoRA.
- 14. [¹Ø¼üĞŞ¸´] Ôö¼ÓÄ£ĞÍÊä³ö keys Õï¶Ï + LoRA ×¨ÊôÌİ¶È·¶Êı¼à¿Ø.
- 15. [Modality Dropout] ÑµÁ·Ê±ÒÔÒ»¶¨¸ÅÂÊËæ»ú¶ªÆú LiDAR ÊäÈë£¬·ÀÖ¹ LiDAR ¹ıÄâºÏ²¢Ç¿»¯ LoRA µÄ RGB Ñ§Ï°ÄÜÁ¦.
- 16. [Multi-Seq] Ö§³ÖÍ¬Ê±´«Èë¶à¸ö seq_root Â·¾¶£¬×Ô¶¯ ConcatDataset ºÏ²¢ÑµÁ·.
- 17. [¶ÔÆëµÚÒ»¸ö½Å±¾] ËğÊ§º¯Êı¡¢Éî¶È¼ÓÔØ¡¢LoRA ±£´æ/»Ö¸´¡¢ÈÕÖ¾¸ñÊ½ÍêÈ«Óë Pure RGB LoRA ½Å±¾Ò»ÖÂ.
+  å†·å¯åŠ¨é˜¶æ®µ (epoch <= warmup):
+    - å†»ç»“æ‰€æœ‰ LoRA å‚æ•° (lora_A / lora_B)
+    - fusion_module : LiDAR/RGB gated fusion (LiDAR warmup favors the LiDAR branch)
+    - å¯è®­ç»ƒ: lidars_encoder, fusion_module, pose_head*, dense_head*
+    - Pose/Dense heads ä¸­åŸæœ¬å†»ç»“çš„åŸºå‚æ•°ä¹Ÿä¼šè§£å†»ï¼Œè®© head é€‚é… LiDAR ç‰¹å¾
+
+  è”åˆè®­ç»ƒé˜¶æ®µ (epoch > warmup):
+    - è§£å†»æ‰€æœ‰ LoRA å‚æ•°
+    - fusion_module gate æ¢å¤ä¸ºä¸­æ€§/å¯¹ç§°åˆå§‹åŒ–
+    - é‡æ–°æ„å»ºä¼˜åŒ–å™¨ï¼Œå¯ç”¨å®Œæ•´çš„ param_groups
 """
 
-# ========================= ¹Ø¼üĞŞ¸´£º±ØĞëÔÚ import torch Ö®Ç°ÉèÖÃ =========================
 import os
 os.environ['PYTORCH_CUDA_ALLOC_CONF'] = 'expandable_segments:True'
 
 import gc
+import copy
 import sys
 import json
 import time
@@ -65,7 +52,7 @@ from safetensors.torch import load_file
 
 warnings.filterwarnings('ignore')
 
-# ========================= DDP ¹¤¾ß =========================
+# ========================= DDP å·¥å…· =========================
 
 def setup_ddp():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -84,17 +71,105 @@ def cleanup_ddp(is_ddp):
 def is_main_process(rank):
     return rank == 0
 
-# ========================= LoRA (embedded, no external deps) =========================
+# ========================= æ•°å€¼ç¨³å®šå·¥å…·å‡½æ•° =========================
+
+def f_log(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
+    x = x.float()
+    sign_x = torch.sign(x)
+    abs_x = torch.abs(x) + eps
+    return (sign_x * torch.log1p(abs_x)).to(x.dtype)
+
+
+class RobustRegressionLoss(nn.Module):
+    def __init__(self, alpha: float = 0.5, scaling_c: float = 0.05):
+        super().__init__()
+        self.alpha = alpha
+        self.c = scaling_c
+
+    def forward(self, pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor = None) -> torch.Tensor:
+        diff = pred - target
+        abs_diff = torch.abs(diff)
+        with torch.no_grad():
+            if valid_mask is not None and valid_mask.any():
+                thresh = self.c * torch.median(abs_diff[valid_mask])
+            else:
+                thresh = self.c * torch.median(abs_diff) if abs_diff.numel() > 0 else torch.tensor(self.c)
+            thresh = thresh.clamp_min(1e-6)
+        quadratic = 0.5 * (diff ** 2) / thresh
+        linear = abs_diff - 0.5 * thresh
+        loss = torch.where(abs_diff <= thresh, quadratic, linear)
+        if valid_mask is not None:
+            return loss[valid_mask].mean() if valid_mask.any() else torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
+        return loss.mean()
+
+
+def so3_chordal_distance(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
+    R_diff = torch.bmm(R_pred.transpose(1, 2), R_gt)
+    trace = R_diff[:, 0, 0] + R_diff[:, 1, 1] + R_diff[:, 2, 2]
+    trace = torch.clamp(trace, -3.0, 3.0)
+    chordal_sq = torch.clamp(2.0 * (3.0 - trace), min=0.0)
+    return torch.sqrt(chordal_sq + 1e-8)
+
+
+def exclude_top_n_percent(loss_map: torch.Tensor, n_percent: float = 5.0, valid_mask: torch.Tensor = None) -> torch.Tensor:
+    if valid_mask is not None and valid_mask.shape != loss_map.shape:
+        if valid_mask.ndim == loss_map.ndim and valid_mask.shape[-1] != loss_map.shape[-1]:
+            valid_mask = valid_mask.any(dim=-1, keepdim=True)
+        if valid_mask.shape != loss_map.shape:
+            try:
+                valid_mask = valid_mask.expand_as(loss_map)
+            except RuntimeError:
+                valid_mask = None
+    if n_percent <= 0:
+        return loss_map.mean() if valid_mask is None else loss_map[valid_mask].mean()
+    if valid_mask is not None:
+        loss_vec = loss_map[valid_mask]
+    else:
+        loss_vec = loss_map.flatten()
+    if loss_vec.numel() == 0:
+        return torch.tensor(0.0, device=loss_map.device, dtype=loss_map.dtype)
+    k = max(1, int(loss_vec.numel() * n_percent / 100.0))
+    threshold = torch.topk(loss_vec, k, largest=True)[0][-1]
+    keep_mask = loss_vec < threshold
+    if keep_mask.any():
+        return loss_vec[keep_mask].mean()
+    return loss_vec.mean()
+
+
+class ConfidenceLoss(nn.Module):
+    def __init__(self, conf_alpha: float = 0.2):
+        super().__init__()
+        self.conf_alpha = conf_alpha
+
+    def forward(self, confidence: torch.Tensor, loss_map: torch.Tensor, valid_mask: torch.Tensor = None) -> torch.Tensor:
+        if valid_mask is None:
+            valid_mask = torch.ones_like(loss_map, dtype=torch.bool)
+        conf = confidence[valid_mask].flatten()
+        loss_vals = loss_map[valid_mask].flatten().detach()
+        if conf.numel() == 0:
+            return torch.tensor(0.0, device=confidence.device)
+        with torch.no_grad():
+            loss_normalized = loss_vals / (loss_vals.mean() + 1e-8)
+            loss_normalized = torch.clamp(loss_normalized, 0.0, 10.0)
+            target_conf = torch.exp(-loss_normalized)
+        conf_clamped = torch.clamp(conf, 1e-6, 1.0 - 1e-6)
+        conf_loss = F.binary_cross_entropy(conf_clamped, target_conf.float())
+        return self.conf_alpha * conf_loss
+
+
+# ========================= LoRA =========================
 
 class LinearWithLoRA(nn.Module):
-    def __init__(self, linear: nn.Linear, r: int = 8, lora_alpha: int = 16):
+    def __init__(self, linear: nn.Linear, r: int = 8, lora_alpha: int = 8):
         super().__init__()
         self.linear = linear
+        self.r = r
+        self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / r
         self.lora_A = nn.Parameter(torch.zeros(linear.in_features, r))
-        self.lora_B = nn.Parameter(torch.zeros(r, linear.out_features))
-        nn.init.normal_(self.lora_A, mean=0.0, std=0.02)
-        nn.init.zeros_(self.lora_B)
+        self.lora_B = nn.Parameter(torch.randn(r, linear.out_features) * 0.01)
+        std = 1.0 / math.sqrt(r)
+        nn.init.normal_(self.lora_A, mean=0.0, std=std)
         for p in self.linear.parameters():
             p.requires_grad = False
 
@@ -103,12 +178,10 @@ class LinearWithLoRA(nn.Module):
         lora = x.float() @ self.lora_A.float()
         lora = lora @ self.lora_B.float()
         lora = lora.to(out.dtype)
-        if not torch.isfinite(out).all():
-            print(f"[¾¯¸æ] DINOv2Ö÷Â·Êä³önan! ÊäÈë·¶Î§: [{x.min():.3f}, {x.max():.3f}]")
         return out + lora * self.scaling
 
 
-def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: int = 16):
+def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: int = 8):
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
             setattr(module, name, LinearWithLoRA(child, r, lora_alpha))
@@ -116,62 +189,26 @@ def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: int = 16):
             inject_lora_to_module(child, r, lora_alpha)
 
 
-# ========================= ÏÔ´æÓÅ»¯: Gradient Checkpointing =========================
+# ========================= EMA =========================
 
-def load_lidar_encoder_pretrained(model, rank):
-    try:
-        import torchvision.models as models
-        src = models.resnet50(weights=models.ResNet50_Weights.DEFAULT)
-        src_state = src.state_dict()
-        dst_state = model.lidars_encoder.state_dict()
-        matched = {}
+class ModelEMA:
+    def __init__(self, model: nn.Module, decay: float = 0.999):
+        self.decay = decay
+        self.shadow = {}
+        self._register(model)
 
-        for k, v in src_state.items():
-            if k in dst_state and v.shape == dst_state[k].shape:
-                matched[k] = v
+    def _register(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone()
 
-        if len(matched) < 10:
-            for prefix in ['backbone.', 'encoder.', 'model.', 'resnet.']:
-                for k, v in src_state.items():
-                    pk = prefix + k
-                    if pk in dst_state and v.shape == dst_state[pk].shape:
-                        matched[pk] = v
+    def update(self, model: nn.Module):
+        for name, param in model.named_parameters():
+            if param.requires_grad and name in self.shadow:
+                self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
 
-        if len(matched) < 10:
-            for dk in list(dst_state.keys()):
-                for sk, sv in src_state.items():
-                    if dk.endswith('.' + sk) or sk.endswith('.' + dk.split('.')[-1]):
-                        if sv.shape == dst_state[dk].shape:
-                            matched[dk] = sv
-                            break
 
-        conv1_candidates = [k for k in matched if 'conv1.weight' in k and matched[k].dim() == 4]
-        for ck in conv1_candidates:
-            w = matched[ck]
-            if w.shape[1] == 3 and ck in dst_state and dst_state[ck].shape[1] == 7:
-                w_new = w.new_zeros(dst_state[ck].shape)
-                w_new[:, :3, :, :] = w
-                mean_ch = w.mean(dim=1, keepdim=True)
-                w_new[:, 3:, :, :] = mean_ch.expand(-1, 4, -1, -1)
-                matched[ck] = w_new
-                if is_main_process(rank):
-                    print(f"  -> LiDAR conv1 ÒÑÀ©Õ¹: {w.shape} -> {w_new.shape}")
-
-        if matched:
-            missing, unexpected = model.lidars_encoder.load_state_dict(matched, strict=False)
-            if is_main_process(rank):
-                print(f"  -> LiDAR±àÂëÆ÷Ô¤ÑµÁ·È¨ÖØ: ³É¹¦¼ÓÔØ {len(matched)}/{len(dst_state)} ¸ö²ÎÊı")
-                if missing:
-                    print(f"     È±Ê§ {len(missing)} ¸ökey (½«Ëæ»ú³õÊ¼»¯): {missing[:3]}...")
-                if unexpected:
-                    print(f"     ÒâÍâ {len(unexpected)} ¸ökey")
-        else:
-            if is_main_process(rank):
-                print("  -> Î´ÄÜ×Ô¶¯Æ¥ÅäLiDAR±àÂëÆ÷Ô¤ÑµÁ·È¨ÖØ£¬½«Ê¹ÓÃËæ»ú³õÊ¼»¯")
-    except Exception as e:
-        if is_main_process(rank):
-            print(f"  -> LiDAR±àÂëÆ÷Ô¤ÑµÁ·È¨ÖØ¼ÓÔØÊ§°Ü£¨½«Ëæ»ú³õÊ¼»¯£©: {e}")
-
+# ========================= é€šç”¨å·¥å…· =========================
 
 def enable_gradient_checkpointing_safe(model, rank):
     import torch.utils.checkpoint as cp
@@ -197,14 +234,13 @@ def enable_gradient_checkpointing_safe(model, rank):
                 wrapped_names.append(name)
             except Exception as e:
                 if is_main_process(rank):
-                    print(f"  -> Ìø¹ı {name} checkpointing: {e}")
+                    print(f"  -> è·³è¿‡ {name} checkpointing: {e}")
 
     if wrapped_names and is_main_process(rank):
-        print(f"  -> Gradient Checkpointing ÒÑÆôÓÃÄ£¿é: {wrapped_names}")
-    elif is_main_process(rank):
-        print("  -> Î´×Ô¶¯Ê¶±ğµ½¿ÉÆôÓÃ checkpointing µÄÄ£¿éÃû£¨²»Ó°ÏìÑµÁ·£©")
+        print(f"  -> Gradient Checkpointing å·²å¯ç”¨: {wrapped_names}")
 
-# ========================= ¸¨Öúº¯Êı =========================
+
+# ========================= è¾…åŠ©å‡½æ•° =========================
 
 def rotation_matrix_from_lookat(direction, up=np.array([0, 0, 1])):
     z_cam = direction / (np.linalg.norm(direction) + 1e-8)
@@ -234,19 +270,19 @@ def compute_features_for_indices(pcd, indices, radius=0.1, max_nn=30):
         centroid = np.mean(neighbors, axis=0)
         cov = np.cov((neighbors - centroid).T)
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        ¦Ë1, ¦Ë2, ¦Ë3 = eigenvalues
+        Î»1, Î»2, Î»3 = eigenvalues
         normals[i] = eigenvectors[:, 0]
-        total = ¦Ë1 + ¦Ë2 + ¦Ë3
-        curv[i] = ¦Ë1 / total if total > 1e-12 else 0.0
-        if ¦Ë3 > 1e-12:
-            aniso[i] = (¦Ë3 - ¦Ë2) / ¦Ë3
-            plan[i] = (¦Ë2 - ¦Ë1) / ¦Ë3
+        total = Î»1 + Î»2 + Î»3
+        curv[i] = Î»1 / total if total > 1e-12 else 0.0
+        if Î»3 > 1e-12:
+            aniso[i] = (Î»3 - Î»2) / Î»3
+            plan[i] = (Î»2 - Î»1) / Î»3
         else:
             aniso[i] = 0.0; plan[i] = 0.0
     return normals, curv, aniso, plan
 
 
-# ========================= È«¾ÖÉî¶È¹éÒ»»¯£¨±£Áô¾ø¶Ô³ß¶È£© =========================
+# ========================= å…¨å±€æ·±åº¦å½’ä¸€åŒ– =========================
 GLOBAL_DEPTH_MAX = 40.0
 
 
@@ -317,13 +353,13 @@ def generate_pcd_7channel(pcd_path: str, gen_size: int = 224) -> Tuple[np.ndarra
     return pcd_7ch, z_d
 
 
-# ========================= Êı¾İ¼¯ =========================
+# ========================= æ•°æ®é›† =========================
 
 class Seq1LidarDataset(Dataset):
     def __init__(self, seq_root: str, seq_len: int = 2, stride: int = 1,
                  img_size: int = 448, pcd_gen_size: int = 224,
                  cache_dir: str = None, tolerance: float = 0.01,
-                 img_exts: tuple = None):
+                 img_exts: tuple = None, use_lidar: bool = True):
         super().__init__()
         self.seq_root = seq_root
         self.seq_len = seq_len
@@ -332,6 +368,7 @@ class Seq1LidarDataset(Dataset):
         self.pcd_gen_size = pcd_gen_size
         self.tolerance = tolerance
         self.cache_dir = cache_dir
+        self.use_lidar = use_lidar
         if img_exts is None:
             img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp')
         self.img_exts = tuple(e.lower() for e in img_exts)
@@ -342,18 +379,17 @@ class Seq1LidarDataset(Dataset):
             if os.path.isdir(full_path) and re.match(r'shuangchuang_seq\d+_(night|daytime)\d+th', item):
                 self.part_folders.append(item)
         if not self.part_folders:
-            raise ValueError(f"ÔÚ {seq_root} ÖĞÎ´ÕÒµ½·ûºÏÃüÃû¹æÔòµÄ part ÎÄ¼ş¼Ğ")
+            raise ValueError(f"åœ¨ {seq_root} ä¸­æœªæ‰¾åˆ°ç¬¦åˆå‘½åè§„åˆ™çš„ part æ–‡ä»¶å¤¹")
 
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print(f"[Dataset] ¹²Ê¶±ğµ½ {len(self.part_folders)} ¸ö part ÎÄ¼ş¼Ğ: {self.part_folders}")
+            print(f"[Dataset] å…±è¯†åˆ«åˆ° {len(self.part_folders)} ä¸ª part æ–‡ä»¶å¤¹: {self.part_folders}")
 
         self.gt_poses = self._load_tum_poses(os.path.join(seq_root, "extrinsics.tum"))
         self.gt_timestamps = np.array(sorted(self.gt_poses.keys()))
         self.gt_poses_list = [self.gt_poses[ts] for ts in self.gt_timestamps]
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print(f"[Dataset] TUM ÕæÖµÎ»×Ë: {len(self.gt_poses_list)} Ö¡, Ê±¼ä´Á·¶Î§ [{self.gt_timestamps.min():.3f}, {self.gt_timestamps.max():.3f}]")
+            print(f"[Dataset] TUM çœŸå€¼ä½å§¿: {len(self.gt_poses_list)} å¸§")
 
-        # [¶ÔÆëµÚÒ»¸ö½Å±¾] Éî¶ÈÍ¼°´ part ¶èĞÔ¼ÓÔØ£¬Ö§³Ö¶à¸ñÊ½
         self.part_depths = []
         for pidx, part in enumerate(self.part_folders):
             depth_dir = os.path.join(seq_root, part, "depth")
@@ -372,14 +408,7 @@ class Seq1LidarDataset(Dataset):
                         ts = int(m.group(1))
                         valid_files.append(df)
                         depth_ts.append(ts)
-                if is_main_process(int(os.environ.get('RANK', 0))):
-                    print(f"[Dataset] {part}/depth: É¨Ãèµ½ {len(valid_files)} ÕÅÉî¶ÈÍ¼")
-                    if len(valid_files) > 0:
-                        print(f"[Dataset] {part}/depth: Ñù±¾¼ü={depth_ts[:3]}")
-                self.part_depths.append({
-                    'files': valid_files,
-                    'timestamps': np.array(depth_ts, dtype=np.int64)
-                })
+                self.part_depths.append({'files': valid_files, 'timestamps': np.array(depth_ts, dtype=np.int64)})
             else:
                 self.part_depths.append({'files': [], 'timestamps': np.array([], dtype=np.int64)})
 
@@ -391,15 +420,11 @@ class Seq1LidarDataset(Dataset):
         for pidx, part in enumerate(self.part_folders):
             rgb_dir = os.path.join(seq_root, part, "rgb")
             if not os.path.exists(rgb_dir):
-                if is_main_process(int(os.environ.get('RANK', 0))):
-                    print(f"[Dataset] ¾¯¸æ: {part}/rgb ²»´æÔÚ£¬Ìø¹ı")
                 continue
             img_paths = []
             for fname in sorted(os.listdir(rgb_dir)):
                 if fname.lower().endswith(self.img_exts):
                     img_paths.append(os.path.join(rgb_dir, fname))
-            raw_img_count = len(img_paths)
-            regex_ok_count = 0; ts_ok_count = 0
             for ipath in img_paths:
                 basename = os.path.basename(ipath)
                 match = re.search(r'color_(\d+)', basename)
@@ -407,8 +432,6 @@ class Seq1LidarDataset(Dataset):
                     match = re.search(r'(\d+)', basename)
                 if not match:
                     continue
-                regex_ok_count += 1
-                # [¶ÔÆëµÚÒ»¸ö½Å±¾] ´æ´¢ÄÉÃëÊ±¼ä´Á
                 img_ts_ns = int(match.group(1))
                 img_ts_sec = img_ts_ns / 1e9
                 pos = np.searchsorted(self.gt_timestamps, img_ts_sec)
@@ -423,39 +446,32 @@ class Seq1LidarDataset(Dataset):
                 diff = abs(self.gt_timestamps[nearest_idx] - img_ts_sec)
                 if diff < tolerance:
                     self.all_views_meta.append((ipath, img_ts_ns, pidx, nearest_idx))
-                    ts_ok_count += 1
                 else:
                     timestamp_diffs.append(diff)
-            if is_main_process(int(os.environ.get('RANK', 0))):
-                print(f"[Dataset] {part}: Ô­Ê¼Í¼Ïñ {raw_img_count} | ÕıÔòÆ¥Åä {regex_ok_count} | Ê±¼ä´ÁÆ¥Åä³É¹¦ {ts_ok_count} (tolerance={tolerance}s)")
-
-        if timestamp_diffs and is_main_process(int(os.environ.get('RANK', 0))):
-            diffs = np.array(timestamp_diffs)
-            print(f"[Dataset] Ê±¼ä´ÁÆ¥ÅäÊ§°ÜÍ³¼Æ: ¹² {len(diffs)} Ö¡, ²îÖµÖĞÎ»Êı {np.median(diffs):.3f}s, ¾ùÖµ {np.mean(diffs):.3f}s")
-            if np.median(diffs) > 1.0:
-                print("[Dataset] ¾¯¸æ: Ê±¼ä´Áµ¥Î»¿ÉÄÜ²»Æ¥Åä!")
-            elif np.median(diffs) > tolerance * 10:
-                print(f"[Dataset] ÌáÊ¾: ½¨Òéµ÷´ó --tolerance")
 
         if not self.all_views_meta and is_main_process(int(os.environ.get('RANK', 0))):
-            raise ValueError("Ã»ÓĞÈÎºÎÍ¼ÏñÍ¨¹ıÊ±¼ä´ÁÆ¥Åä£¡")
+            raise ValueError("æ²¡æœ‰ä»»ä½•å›¾åƒé€šè¿‡æ—¶é—´æˆ³åŒ¹é…ï¼")
 
         self.part_pcds = []
-        for part in self.part_folders:
-            lidar_dir = os.path.join(seq_root, part, "lidar")
-            pcd_files = sorted(glob.glob(os.path.join(lidar_dir, "*.pcd")))
-            pcd_ts = []
-            for pf in pcd_files:
-                m = re.search(r'(\d+)', os.path.basename(pf))
-                ts = int(m.group(1)) if m else int(os.path.getmtime(pf) * 1e9)
-                pcd_ts.append(ts)
-            self.part_pcds.append({'files': pcd_files, 'timestamps': np.array(pcd_ts, dtype=np.int64)})
+        if use_lidar:
+            for part in self.part_folders:
+                lidar_dir = os.path.join(seq_root, part, "lidar")
+                pcd_files = sorted(glob.glob(os.path.join(lidar_dir, "*.pcd")))
+                pcd_ts = []
+                for pf in pcd_files:
+                    m = re.search(r'(\d+)', os.path.basename(pf))
+                    ts = int(m.group(1)) if m else int(os.path.getmtime(pf) * 1e9)
+                    pcd_ts.append(ts)
+                self.part_pcds.append({'files': pcd_files, 'timestamps': np.array(pcd_ts, dtype=np.int64)})
+        else:
+            for _ in self.part_folders:
+                self.part_pcds.append({'files': [], 'timestamps': np.array([], dtype=np.int64)})
 
-        if cache_dir:
+        if cache_dir and use_lidar:
             os.makedirs(cache_dir, exist_ok=True)
             self._build_cache()
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print(f"[Dataset] ×îÖÕÓĞĞ§Ö¡×ÜÊı: {len(self.all_views_meta)}")
+            print(f"[Dataset] æœ€ç»ˆæœ‰æ•ˆå¸§æ€»æ•°: {len(self.all_views_meta)}")
 
     def _load_tum_poses(self, tum_file: str):
         poses = {}
@@ -521,7 +537,7 @@ class Seq1LidarDataset(Dataset):
 
     def _build_cache(self):
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print("Ô¤¼ÆËã 7 Í¨µÀ LiDAR ÌØÕ÷...")
+            print("é¢„è®¡ç®— 7 é€šé“ LiDAR ç‰¹å¾...")
         for i, (ipath, img_ts_ns, pidx, _) in enumerate(self.all_views_meta):
             cache_path = os.path.join(self.cache_dir, f"pcd_{img_ts_ns}.npz")
             if os.path.exists(cache_path):
@@ -533,7 +549,7 @@ class Seq1LidarDataset(Dataset):
             feat, z_d = generate_pcd_7channel(pcd_path, self.pcd_gen_size)
             np.savez(cache_path, feat=feat, scale=z_d)
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print("»º´æÍê³É")
+            print("ç¼“å­˜å®Œæˆ")
 
     def _get_pcd_feature(self, img_ts_sec: float, pidx: int):
         if self.cache_dir:
@@ -559,15 +575,12 @@ class Seq1LidarDataset(Dataset):
                 indices.append(indices[-1])
         views = []
         for meta_idx in indices:
-            # [¶ÔÆëµÚÒ»¸ö½Å±¾] ½â°üÄÉÃëÊ±¼ä´Á
             ipath, img_ts_ns, pidx, gt_idx = self.all_views_meta[meta_idx]
             img_ts_sec = img_ts_ns / 1e9
 
             img = Image.open(ipath).convert('RGB')
             img_np_color = np.array(img)
             if not np.isfinite(img_np_color).all():
-                if is_main_process(int(os.environ.get('RANK', 0))):
-                    print(f"[Dataset] ¾¯¸æ: {ipath} °üº¬·ÇÓĞÏŞÏñËØ£¬Ê¹ÓÃÁãÌî³ä")
                 img_np_color = np.zeros_like(img_np_color)
             img_np = img_np_color.transpose(2, 0, 1).astype(np.float32) / 255.0
             img_tensor = torch.from_numpy(img_np)
@@ -582,18 +595,21 @@ class Seq1LidarDataset(Dataset):
             rms = np.sqrt(np.mean((img_gray_np - mean) ** 2))
             confidence = float(rms) if not np.isnan(rms) else 0.5
 
-            pcd_7ch, z_d = self._get_pcd_feature(img_ts_sec, pidx)
-            pcd_tensor = torch.from_numpy(pcd_7ch)
-            if pcd_tensor.shape[1] != self.img_size or pcd_tensor.shape[2] != self.img_size:
-                pcd_tensor = F.interpolate(
-                    pcd_tensor.unsqueeze(0), size=(self.img_size, self.img_size),
-                    mode='bilinear', align_corners=False
-                ).squeeze(0)
-            pcd_tensor = pcd_tensor.permute(1, 2, 0).unsqueeze(0)
+            if self.use_lidar:
+                pcd_7ch, z_d = self._get_pcd_feature(img_ts_sec, pidx)
+                pcd_tensor = torch.from_numpy(pcd_7ch)
+                if pcd_tensor.shape[1] != self.img_size or pcd_tensor.shape[2] != self.img_size:
+                    pcd_tensor = F.interpolate(
+                        pcd_tensor.unsqueeze(0), size=(self.img_size, self.img_size),
+                        mode='bilinear', align_corners=False
+                    ).squeeze(0)
+                pcd_tensor = pcd_tensor.permute(1, 2, 0).unsqueeze(0)
+            else:
+                pcd_tensor = torch.zeros((1, self.img_size, self.img_size, 7), dtype=torch.float32)
+                z_d = 1.0
 
             gt_pose = torch.from_numpy(self.gt_poses_list[gt_idx])
 
-            # [¶ÔÆëµÚÒ»¸ö½Å±¾] ¶èĞÔ¼ÓÔØÉî¶ÈÍ¼£¬Ö§³Ö¶à¸ñÊ½
             gt_depth = torch.zeros((1, 1, self.img_size, self.img_size), dtype=torch.float32)
             depth_file = self._find_closest_depth(img_ts_ns, pidx)
             if depth_file is not None:
@@ -626,18 +642,43 @@ def collate_fn(batch):
     return views
 
 
-# ========================= ËğÊ§º¯Êı£¨ÓëµÚÒ»¸ö½Å±¾ÍêÈ«Ò»ÖÂ£© =========================
+# ========================= æŸå¤±å‡½æ•° =========================
 
 class MapAnythingLoss(nn.Module):
-    def __init__(self, w_depth=1.0, w_pose_trans=3.0, w_pose_rot=1.0, w_ray=0.5, w_pts3d_cam=1.0):
+    def __init__(self, 
+                 w_depth: float = 0.1,
+                 w_pose_trans: float = 0.1,
+                 w_pose_rot: float = 0.1,
+                 w_ray: float = 0.1,
+                 w_pts3d_cam: float = 0.1,
+                 w_world_pts: float = 1.0,
+                 w_confidence: float = 0.2,
+                 w_scale: float = 0.1,
+                 robust_alpha: float = 0.5,
+                 robust_c: float = 0.05,
+                 top_n_percent: float = 5.0,
+                 use_log_depth: bool = True,
+                 use_chordal_rot: bool = True):
         super().__init__()
-        self.w_depth = w_depth; self.w_pose_trans = w_pose_trans; self.w_pose_rot = w_pose_rot
-        self.w_ray = w_ray; self.w_pts3d_cam = w_pts3d_cam
+        self.w_depth = w_depth
+        self.w_pose_trans = w_pose_trans
+        self.w_pose_rot = w_pose_rot
+        self.w_ray = w_ray
+        self.w_pts3d_cam = w_pts3d_cam
+        self.w_world_pts = w_world_pts
+        self.w_confidence = w_confidence
+        self.w_scale = w_scale
+        self.use_log_depth = use_log_depth
+        self.use_chordal_rot = use_chordal_rot
+        self.top_n_percent = top_n_percent
+        self.robust_loss = RobustRegressionLoss(alpha=robust_alpha, scaling_c=robust_c)
+        self.conf_loss_fn = ConfidenceLoss(conf_alpha=w_confidence)
 
     @staticmethod
     def _quat_to_rotmat(quats):
         norm = torch.norm(quats, dim=-1, keepdim=True)
         quats = quats / (norm + 1e-8)
+        quats = torch.where(quats[:, 3:4] < 0, -quats, quats)
         qx, qy, qz, qw = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
         B = quats.shape[0]
         rot = torch.zeros(B, 3, 3, device=quats.device, dtype=quats.dtype)
@@ -657,17 +698,29 @@ class MapAnythingLoss(nn.Module):
         B = trans.shape[0]
         R = MapAnythingLoss._quat_to_rotmat(quats)
         T = torch.eye(4, device=trans.device, dtype=trans.dtype).unsqueeze(0).repeat(B, 1, 1)
-        T[:, :3, :3] = R; T[:, :3, 3] = trans
+        T[:, :3, :3] = R
+        T[:, :3, 3] = trans
         return T
 
     @staticmethod
     def _inv_transform(T):
-        R = T[:, :3, :3]; t = T[:, :3, 3]
+        R = T[:, :3, :3]
+        t = T[:, :3, 3]
         T_inv = torch.eye(4, device=T.device, dtype=T.dtype).unsqueeze(0).repeat(T.shape[0], 1, 1)
         R_T = R.transpose(-2, -1)
         T_inv[:, :3, :3] = R_T
         T_inv[:, :3, 3] = -(R_T @ t.unsqueeze(-1)).squeeze(-1)
         return T_inv
+
+    def _compute_world_frame_points_loss(self, pred_pts3d_world, gt_pts3d_world, valid_mask=None):
+        if valid_mask is None or not valid_mask.any():
+            if pred_pts3d_world is None or gt_pts3d_world is None:
+                return torch.tensor(0.0, device=pred_pts3d_world.device if pred_pts3d_world is not None else 'cuda')
+            valid_mask = torch.isfinite(pred_pts3d_world).all(dim=-1) & torch.isfinite(gt_pts3d_world).all(dim=-1)
+        pred_log = f_log(pred_pts3d_world)
+        gt_log = f_log(gt_pts3d_world)
+        loss_map = torch.abs(pred_log - gt_log).mean(dim=-1, keepdim=True)
+        return exclude_top_n_percent(loss_map, self.top_n_percent, valid_mask)
 
     def forward(self, predictions: List[Dict], views: List[Dict], seq_len: int = 2):
         device = predictions[0]['pts3d'].device
@@ -676,26 +729,41 @@ class MapAnythingLoss(nn.Module):
         N = len(predictions)
 
         for i, (pred, view) in enumerate(zip(predictions, views)):
+            H, W = pred['pts3d'].shape[1:3] if 'pts3d' in pred else (448, 448)
+            B = 1
+
             if 'depth_along_ray' in pred and view.get('gt_depth') is not None:
-                pred_d = pred['depth_along_ray']; gt_d = view['gt_depth'].to(device)
+                pred_d = pred['depth_along_ray']
+                gt_d = view['gt_depth'].to(device)
                 pred_d = pred_d.permute(0, 3, 1, 2)
                 if pred_d.shape[-2:] != gt_d.shape[-2:]:
                     gt_d = F.interpolate(gt_d, size=pred_d.shape[-2:], mode='bilinear', align_corners=False)
-                valid = (gt_d > 1e-3) & (pred_d > 1e-3)
+                valid = (gt_d > 1e-4) & torch.isfinite(pred_d)
                 if valid.any():
-                    pred_d_clamped = torch.clamp(pred_d[valid], min=1e-6)
-                    loss_d = F.l1_loss(torch.log(pred_d_clamped), torch.log(gt_d[valid] + 1e-6))
+                    if self.use_log_depth:
+                        pred_d_log = f_log(pred_d)
+                        gt_d_log = f_log(gt_d)
+                        loss_map = torch.abs(pred_d_log - gt_d_log)
+                    else:
+                        loss_map = torch.abs(pred_d - gt_d)
+                    loss_d = exclude_top_n_percent(loss_map, self.top_n_percent, valid)
                     loss_components.append(self.w_depth * loss_d)
                     metrics[f'depth_{i}'] = loss_d.item()
 
             if 'ray_directions' in pred and view.get('gt_intrinsics') is not None:
                 K = view['gt_intrinsics'].to(device)
-                if K.dim() == 2: K = K.unsqueeze(0)
+                if K.dim() == 2:
+                    K = K.unsqueeze(0)
                 pred_ray = pred['ray_directions']
                 B, H, W, _ = pred_ray.shape
                 u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
                 pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1).float()
-                rays_cam = (torch.linalg.inv(K) @ pixels.reshape(-1, 3).T.unsqueeze(0).expand(B, -1, -1))
+                with torch.cuda.amp.autocast(enabled=False):
+                    K_f32 = K.float()
+                    pixels_f32 = pixels.reshape(-1, 3).float()
+                    K_inv = torch.linalg.inv(K_f32)
+                    rays_cam = (K_inv @ pixels_f32.T.unsqueeze(0).expand(B, -1, -1))
+                rays_cam = rays_cam.to(pred_ray.dtype)
                 rays_cam = rays_cam.permute(0, 2, 1).reshape(B, H, W, 3)
                 rays_cam = rays_cam / (torch.norm(rays_cam, dim=-1, keepdim=True) + 1e-8)
                 cos_sim = F.cosine_similarity(pred_ray, rays_cam, dim=-1)
@@ -703,84 +771,133 @@ class MapAnythingLoss(nn.Module):
                 loss_components.append(self.w_ray * loss_ray)
                 metrics[f'ray_{i}'] = loss_ray.item()
 
+            gt_pts3d_cam = None
             if 'pts3d_cam' in pred and view.get('gt_depth') is not None and view.get('gt_intrinsics') is not None:
                 gt_d = view['gt_depth'].to(device)
-                if gt_d.dim() == 2: gt_d = gt_d.unsqueeze(0).unsqueeze(0)
-                elif gt_d.dim() == 3: gt_d = gt_d.unsqueeze(0)
+                if gt_d.dim() == 2:
+                    gt_d = gt_d.unsqueeze(0).unsqueeze(0)
+                elif gt_d.dim() == 3:
+                    gt_d = gt_d.unsqueeze(0)
                 K = view['gt_intrinsics'].to(device)
-                if K.dim() == 2: K = K.unsqueeze(0)
-                B = K.shape[0]; H, W = pred['pts3d_cam'].shape[1:3]
+                if K.dim() == 2:
+                    K = K.unsqueeze(0)
+                B = K.shape[0]
+                H, W = pred['pts3d_cam'].shape[1:3]
                 if gt_d.shape[-2:] != (H, W):
                     gt_d = F.interpolate(gt_d, size=(H, W), mode='bilinear', align_corners=False)
                 u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
                 pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1).float()
-                rays = (torch.linalg.inv(K) @ pixels.reshape(-1, 3).T.unsqueeze(0).expand(B, -1, -1))
+                with torch.cuda.amp.autocast(enabled=False):
+                    K_f32 = K.float()
+                    pixels_f32 = pixels.reshape(-1, 3).float()
+                    K_inv = torch.linalg.inv(K_f32)
+                    rays = (K_inv @ pixels_f32.T.unsqueeze(0).expand(B, -1, -1))
+                rays = rays.to(pred['pts3d_cam'].dtype)
                 rays = rays.permute(0, 2, 1).reshape(B, H, W, 3)
                 rays = rays / (torch.norm(rays, dim=-1, keepdim=True) + 1e-8)
                 gt_pts3d_cam = rays * gt_d.permute(0, 2, 3, 1)
                 pred_pts3d_cam = pred['pts3d_cam']
-                valid = (gt_d.permute(0, 2, 3, 1) > 1e-3).expand_as(pred_pts3d_cam)
+                valid = (gt_d.permute(0, 2, 3, 1) > 1e-4).expand_as(pred_pts3d_cam)
                 if valid.any():
-                    loss_pc = F.l1_loss(pred_pts3d_cam[valid], gt_pts3d_cam[valid])
+                    pred_log = f_log(pred_pts3d_cam)
+                    gt_log = f_log(gt_pts3d_cam)
+                    loss_map = torch.abs(pred_log - gt_log).mean(dim=-1, keepdim=True)
+                    loss_pc = exclude_top_n_percent(loss_map, self.top_n_percent, valid)
                     loss_components.append(self.w_pts3d_cam * loss_pc)
                     metrics[f'pts3d_cam_{i}'] = loss_pc.item()
+
+            if 'pts3d' in pred and view.get('gt_pose') is not None and view.get('gt_depth') is not None and gt_pts3d_cam is not None:
+                pred_world = pred['pts3d']
+                gt_pose = view['gt_pose'].to(device)
+                if gt_pose.dim() == 2:
+                    gt_pose = gt_pose.unsqueeze(0)
+                gt_pts3d_world = torch.matmul(gt_pts3d_cam.reshape(B, -1, 3),
+                                               gt_pose[:, :3, :3].transpose(1, 2)) + gt_pose[:, :3, 3:4].transpose(1, 2)
+                gt_pts3d_world = gt_pts3d_world.reshape(B, H, W, 3)
+                valid_world = torch.isfinite(pred_world).all(dim=-1) & torch.isfinite(gt_pts3d_world).all(dim=-1)
+                if valid_world.any():
+                    loss_world = self._compute_world_frame_points_loss(pred_world, gt_pts3d_world, valid_world)
+                    loss_components.append(self.w_world_pts * loss_world)
+                    metrics[f'world_pts_{i}'] = loss_world.item()
+
+            if 'confidence' in pred and ('depth_along_ray' in pred or 'pts3d_cam' in pred):
+                if 'depth_along_ray' in pred and view.get('gt_depth') is not None:
+                    pred_d = pred['depth_along_ray'].permute(0, 3, 1, 2)
+                    gt_d = view['gt_depth'].to(device)
+                    if pred_d.shape[-2:] != gt_d.shape[-2:]:
+                        gt_d = F.interpolate(gt_d, size=pred_d.shape[-2:], mode='bilinear', align_corners=False)
+                    valid = (gt_d > 1e-4) & torch.isfinite(pred_d)
+                    if valid.any():
+                        with torch.no_grad():
+                            err_map = torch.abs(f_log(pred_d) - f_log(gt_d))
+                        conf = pred['confidence'] if 'confidence' in pred else torch.ones_like(err_map)
+                        if conf.shape != err_map.shape:
+                            conf = F.interpolate(conf, size=err_map.shape[-2:], mode='bilinear', align_corners=False)
+                        loss_conf = self.conf_loss_fn(conf, err_map, valid)
+                        if loss_conf > 0:
+                            loss_components.append(loss_conf)
+                            metrics[f'conf_{i}'] = loss_conf.item()
 
         if seq_len >= 2 and N >= seq_len:
             batch_size = N // seq_len
             for b in range(batch_size):
                 start = b * seq_len
                 for k in range(seq_len - 1):
-                    idx1 = start + k; idx2 = start + k + 1
+                    idx1 = start + k
+                    idx2 = start + k + 1
                     pred1, pred2 = predictions[idx1], predictions[idx2]
                     view1, view2 = views[idx1], views[idx2]
-                    if not ('cam_trans' in pred1 and 'cam_quats' in pred1 and 'cam_trans' in pred2 and 'cam_quats' in pred2 and view1.get('gt_pose') is not None and view2.get('gt_pose') is not None):
+                    required_keys = ['cam_trans', 'cam_quats']
+                    if not all(k in pred1 and k in pred2 for k in required_keys):
+                        continue
+                    if view1.get('gt_pose') is None or view2.get('gt_pose') is None:
                         continue
                     gt_pose1 = view1['gt_pose'].to(device)
                     gt_pose2 = view2['gt_pose'].to(device)
-                    if gt_pose1.dim() == 2: gt_pose1 = gt_pose1.unsqueeze(0)
-                    if gt_pose2.dim() == 2: gt_pose2 = gt_pose2.unsqueeze(0)
+                    if gt_pose1.dim() == 2:
+                        gt_pose1 = gt_pose1.unsqueeze(0)
+                    if gt_pose2.dim() == 2:
+                        gt_pose2 = gt_pose2.unsqueeze(0)
                     T_pred1 = self._build_transform(pred1['cam_trans'], pred1['cam_quats'])
                     T_pred2 = self._build_transform(pred2['cam_trans'], pred2['cam_quats'])
                     T_rel_gt = self._inv_transform(gt_pose1) @ gt_pose2
                     T_rel_pred = self._inv_transform(T_pred1) @ T_pred2
-                    if torch.isnan(T_pred1).any() or torch.isinf(T_pred1).any() or torch.isnan(T_pred2).any() or torch.isinf(T_pred2).any():
-                        continue
-                    if torch.isnan(T_rel_pred).any() or torch.isinf(T_rel_pred).any() or torch.isnan(T_rel_gt).any() or torch.isinf(T_rel_gt).any():
+                    if not (torch.isfinite(T_rel_pred).all() and torch.isfinite(T_rel_gt).all()):
                         continue
                     t_norm_pred = torch.norm(T_rel_pred[:, :3, 3], dim=-1).mean()
                     t_norm_gt = torch.norm(T_rel_gt[:, :3, 3], dim=-1).mean()
-                    if not torch.isfinite(t_norm_pred) or not torch.isfinite(t_norm_gt):
+                    if not torch.isfinite(t_norm_pred) or t_norm_gt < 1e-12:
                         continue
-                    if t_norm_gt < 1e-12:
-                        continue
-                    if t_norm_pred > 10000.0:
-                        continue
-                    loss_t = F.smooth_l1_loss(T_rel_pred[:, :3, 3], T_rel_gt[:, :3, 3], beta=0.5)
-                    R_pred = T_rel_pred[:, :3, :3]
-                    R_gt = T_rel_gt[:, :3, :3]
-                    R_diff = torch.bmm(R_pred.transpose(1, 2), R_gt)
-                    trace = R_diff[:, 0, 0] + R_diff[:, 1, 1] + R_diff[:, 2, 2]
-                    trace = torch.clamp(trace, -1.0, 3.0)
-                    cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0 + 1e-6, 1.0 - 1e-6)
-                    angle = torch.acos(cos_angle)
-                    loss_r = angle.mean()
-                    if not torch.isfinite(loss_t) or not torch.isfinite(loss_r):
-                        continue
-                    loss_components.append(self.w_pose_trans * loss_t + self.w_pose_rot * loss_r)
-                    metrics[f'rpe_trans_b{b}_k{k}'] = loss_t.item()
+                    trans_diff = T_rel_pred[:, :3, 3] - T_rel_gt[:, :3, 3]
+                    trans_diff_clipped = torch.clamp(trans_diff, -1.0, 1.0)
+                    loss_t = F.smooth_l1_loss(trans_diff_clipped, torch.zeros_like(trans_diff_clipped), beta=0.1)
+                    if self.use_chordal_rot:
+                        loss_r = so3_chordal_distance(T_rel_pred[:, :3, :3], T_rel_gt[:, :3, :3]).mean()
+                    else:
+                        R_diff = torch.bmm(T_rel_pred[:, :3, :3].transpose(1, 2), T_rel_gt[:, :3, :3])
+                        trace = R_diff[:, 0, 0] + R_diff[:, 1, 1] + R_diff[:, 2, 2]
+                        trace = torch.clamp(trace, -1.0, 3.0)
+                        cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
+                        loss_r = torch.acos(cos_angle).mean()
+                    if torch.isfinite(loss_t) and torch.isfinite(loss_r):
+                        loss_components.append(self.w_pose_trans * loss_t + self.w_pose_rot * loss_r)
+                        metrics[f'rpe_trans_b{b}_k{k}'] = loss_t.item()
                     metrics[f'rpe_rot_b{b}_k{k}'] = loss_r.item()
 
         rpe_trans_vals = [v for k, v in metrics.items() if k.startswith('rpe_trans_b')]
-        rpe_rot_vals   = [v for k, v in metrics.items() if k.startswith('rpe_rot_b')]
+        rpe_rot_vals = [v for k, v in metrics.items() if k.startswith('rpe_rot_b')]
         if rpe_trans_vals:
             metrics['rpe_trans'] = sum(rpe_trans_vals) / len(rpe_trans_vals)
-            metrics['rpe_rot']   = sum(rpe_rot_vals) / len(rpe_rot_vals)
+            metrics['rpe_rot'] = sum(rpe_rot_vals) / len(rpe_rot_vals)
         depth_vals = [v for k, v in metrics.items() if k.startswith('depth_')]
         if depth_vals:
             metrics['depth'] = sum(depth_vals) / len(depth_vals)
         ray_vals = [v for k, v in metrics.items() if k.startswith('ray_')]
         if ray_vals:
             metrics['ray'] = sum(ray_vals) / len(ray_vals)
+        world_vals = [v for k, v in metrics.items() if k.startswith('world_pts_')]
+        if world_vals:
+            metrics['world_pts'] = sum(world_vals) / len(world_vals)
 
         if loss_components:
             total_loss = sum(loss_components)
@@ -793,9 +910,15 @@ class MapAnythingLoss(nn.Module):
         return total_loss, metrics
 
 
-# ========================= Ä£ĞÍ¹¹½¨ =========================
+# ========================= æ¨¡å‹æ„å»º =========================
 
-def build_model(model_dir: str, device: str, rank: int, use_compile: bool = True, lora_r: int = 8, lora_alpha: int = 16):
+def build_model(model_dir: str, device: str, rank: int, use_compile: bool = True,
+                lora_r: int = 8, lora_alpha: int = 8,
+                use_lora: bool = True, use_lidar: bool = True,
+                lidar_warmup_epochs: int = 0):
+    """
+    æ„å»ºæ¨¡å‹ã€‚LiDAR ç¼–ç å™¨é»˜è®¤ä»éšæœºåˆå§‹åŒ–å¼€å§‹ï¼Œå¹¶å…¨å‚æ•°å‚ä¸è®­ç»ƒã€‚
+    """
     config_path = os.path.join(model_dir, "config.json")
     weights_path = os.path.join(model_dir, "model.safetensors")
     with open(config_path, 'r') as f:
@@ -803,124 +926,137 @@ def build_model(model_dir: str, device: str, rank: int, use_compile: bool = True
     encoder_config = config.get("encoder_config", {}).copy()
     encoder_config.pop("pretrained", None); encoder_config.pop("weights", None)
     encoder_config["uses_torch_hub"] = False
+    geometric_input_config = copy.deepcopy(config.get("geometric_input_config", {}))
+    lidar_encoder_config = geometric_input_config.get("lidars_encoder_config", {})
+    for key in ("pretrained", "weights", "pretrained_checkpoint_path", "checkpoint_path", "custom_ckpt_path", "load_pretrained_weights"):
+        lidar_encoder_config.pop(key, None)
+    lidar_encoder_config["pretrained"] = False
+    lidar_encoder_config["weights"] = None
+    lidar_encoder_config["uses_torch_hub"] = False
+    geometric_input_config["lidars_encoder_config"] = lidar_encoder_config
     model = MapAnything(
         name=config.get("name", "mapanything"),
         encoder_config=encoder_config,
         info_sharing_config=config.get("info_sharing_config", {}),
         pred_head_config=config.get("pred_head_config", {}),
-        geometric_input_config=config.get("geometric_input_config", {}),
+        geometric_input_config=geometric_input_config,
         pretrained_checkpoint_path=None,
         torch_hub_force_reload=False,
         info_sharing_mlp_layer_str="swiglufused"
     )
     if os.path.exists(weights_path):
         if is_main_process(rank):
-            print(f"¼ÓÔØÔ¤ÑµÁ·È¨ÖØ: {weights_path}")
+            print(f"åŠ è½½é¢„è®­ç»ƒæƒé‡: {weights_path}")
         state_dict = load_file(weights_path)
+        if use_lidar:
+            lidar_encoder_keys = [
+                key for key in state_dict.keys()
+                if key.replace('_orig_mod.', '').startswith('lidars_encoder.')
+            ]
+            if lidar_encoder_keys:
+                for key in lidar_encoder_keys:
+                    state_dict.pop(key, None)
+                if is_main_process(rank):
+                    print(f"  -> å·²è·³è¿‡ {len(lidar_encoder_keys)} ä¸ª LiDAR encoder æƒé‡é”®ï¼Œä¿æŒéšæœºåˆå§‹åŒ–")
         model.load_state_dict(state_dict, strict=False)
     else:
         if is_main_process(rank):
-            print("¾¯¸æ: Î´ÕÒµ½Ô¤ÑµÁ·È¨ÖØ")
+            print("è­¦å‘Š: æœªæ‰¾åˆ°é¢„è®­ç»ƒæƒé‡")
 
-    enc_dim = model.encoder.enc_embed_dim
-    with torch.no_grad():
-        model.fusion_conv.weight.zero_()
-        eye = torch.eye(enc_dim, device=model.fusion_conv.weight.device)
-        model.fusion_conv.weight[:, :enc_dim, 0, 0] = eye
-        model.fusion_conv.bias.zero_()
-    if is_main_process(rank):
-        print("  -> fusion_conv ÒÑÁã³õÊ¼»¯£¨RGB ²àºãµÈ£¬LiDAR ²àÈ«Áã£©")
-
-    if hasattr(model, 'lidars_encoder') and model.lidars_encoder is not None:
-        load_lidar_encoder_pretrained(model, rank)
-
-    lora_targets = []
-    if hasattr(model, 'encoder') and model.encoder is not None:
-        lora_targets.append(model.encoder)
-    if hasattr(model, 'info_sharing') and model.info_sharing is not None:
-        lora_targets.append(model.info_sharing)
-    if hasattr(model, 'dense_head') and model.dense_head is not None:
-        lora_targets.append(model.dense_head)
-    if hasattr(model, 'pose_head') and model.pose_head is not None:
-        lora_targets.append(model.pose_head)
-    if hasattr(model, 'scale_head') and model.scale_head is not None:
-        lora_targets.append(model.scale_head)
-
-    for target in lora_targets:
-        inject_lora_to_module(target, r=lora_r, lora_alpha=lora_alpha)
-
-    if is_main_process(rank):
-        lora_layer_count = sum(1 for _ in model.modules() if isinstance(_, LinearWithLoRA))
-        print(f"  -> ÒÑ×¢Èë LoRA: {lora_layer_count} ¸ö Linear ²ã (r={lora_r}, alpha={lora_alpha})")
-
-    nan_weights = []
-    for name, param in model.named_parameters():
-        if not torch.isfinite(param).all():
-            nan_weights.append(name)
-    if nan_weights:
-        print(f"  -> ¾¯¸æ: {len(nan_weights)} ¸ö²ÎÊıº¬nan/inf!")
-        for n in nan_weights[:5]:
-            print(f"     {n}")
+    if use_lidar:
+        fusion_module = getattr(model, "fusion_module", None)
+        if fusion_module is not None:
+            with torch.no_grad():
+                gate_mlp = getattr(fusion_module, "gate_mlp", None)
+                if gate_mlp is not None and len(gate_mlp) >= 3 and hasattr(gate_mlp[-1], "weight"):
+                    gate_mlp[-1].weight.zero_()
+                    gate_mlp[-1].bias.zero_()
+                    if lidar_warmup_epochs > 0:
+                        gate_mlp[-1].bias.fill_(-0.5)
+                        if is_main_process(rank):
+                            print(f"  -> fusion_module warmup init: slightly RGB-biased gate (warmup={lidar_warmup_epochs} epochs)")
+                    else:
+                        if is_main_process(rank):
+                            print("  -> fusion_module standard init: neutral gate")
+                refine = getattr(fusion_module, "refine", None)
+                if refine is not None and hasattr(refine, "weight"):
+                    refine.weight.zero_()
+        elif is_main_process(rank):
+            print("  -> warning: fusion_module not found; skipping fusion initialization")
+        if hasattr(model, 'lidars_encoder') and model.lidars_encoder is not None and is_main_process(rank):
+            print("  -> LiDAR encoder initialized for training")
     else:
-        print("  -> ËùÓĞÔ¤ÑµÁ·È¨ÖØ¼ì²éÍ¨¹ı£¨ÎŞnan/inf£©")
+        if is_main_process(rank):
+            print("  -> LiDAR disabled")
 
+    if use_lora:
+        lora_targets = []
+        if hasattr(model, 'encoder') and model.encoder is not None:
+            lora_targets.append(model.encoder)
+        if hasattr(model, 'info_sharing') and model.info_sharing is not None:
+            lora_targets.append(model.info_sharing)
+        if hasattr(model, 'dense_head') and model.dense_head is not None:
+            lora_targets.append(model.dense_head)
+        if hasattr(model, 'pose_head') and model.pose_head is not None:
+            lora_targets.append(model.pose_head)
+        if hasattr(model, 'scale_head') and model.scale_head is not None:
+            lora_targets.append(model.scale_head)
+
+        for target in lora_targets:
+            inject_lora_to_module(target, r=lora_r, lora_alpha=lora_alpha) 
+
+        if is_main_process(rank):
+            lora_layer_count = sum(1 for _ in model.modules() if isinstance(_, LinearWithLoRA))
+            print(f"  -> å·²æ³¨å…¥ LoRA: {lora_layer_count} ä¸ª Linear å±‚ (r={lora_r}, alpha={lora_alpha})")
+    else:
+        if is_main_process(rank):
+            print("  -> LoRA å·²ç¦ç”¨")
+
+    # åˆå§‹çŠ¶æ€ï¼šå…¨éƒ¨å†»ç»“
     for param in model.parameters():
         param.requires_grad = False
 
-    lidar_keywords = ('lidars_encoder', 'lidar_film', 'fusion_conv')
+    # LiDAR å‚æ•°å§‹ç»ˆå¯è®­ç»ƒï¼ˆå¦‚æœå¯ç”¨ï¼‰
     trainable_names = []
-    for name, param in model.named_parameters():
-        clean_name = name.replace('_orig_mod.', '')
-        if clean_name.startswith(lidar_keywords):
-            param.requires_grad = True
-            trainable_names.append(name)
-        elif 'lora_A' in name or 'lora_B' in name:
-            param.requires_grad = True
-            trainable_names.append(name)
+    if use_lidar:
+        lidar_keywords = ('lidars_encoder', 'lidar_film', 'fusion_module')
+        for name, param in model.named_parameters():
+            clean_name = name.replace('_orig_mod.', '')
+            if clean_name.startswith(lidar_keywords):
+                param.requires_grad = True
+                trainable_names.append(name)
+
+    # LoRA å‚æ•°åœ¨ warmup é˜¶æ®µä¿æŒå†»ç»“ï¼Œä¹‹åè§£å†»
+    if use_lora and lidar_warmup_epochs == 0:
+        for name, param in model.named_parameters():
+            if 'lora_A' in name or 'lora_B' in name:
+                param.requires_grad = True
+                trainable_names.append(name)
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
 
     if trainable == 0:
-        if is_main_process(rank):
-            print("=" * 60)
-            print("´íÎó: Î´Æ¥Åäµ½ÈÎºÎ¿ÉÑµÁ·²ÎÊı£¡")
-            for name, param in model.named_parameters():
-                print(f"  {name}: shape={tuple(param.shape)}")
-            print("=" * 60)
-        raise RuntimeError("Ã»ÓĞÈÎºÎ¿ÉÑµÁ·²ÎÊı£¬Çë¼ì²éÄ£¿éÃûÆ¥Åä¹æÔò¡£")
+        raise RuntimeError("æ²¡æœ‰ä»»ä½•å¯è®­ç»ƒå‚æ•°ï¼Œè¯·è‡³å°‘å¯ç”¨ --lora æˆ– --lidarã€‚")
 
     if is_main_process(rank):
-        print(f"  -> ×Ü²ÎÊıÁ¿: {total/1e6:.2f}M, ¿ÉÑµÁ·: {trainable/1e6:.2f}M ({len(trainable_names)} modules)")
-        print(f"     LiDAR+Fusion ²ÎÊı: {sum(p.numel() for n,p in model.named_parameters() if p.requires_grad and any(k in n for k in lidar_keywords))/1e6:.2f}M")
-        print(f"     LoRA ²ÎÊı: {sum(p.numel() for n,p in model.named_parameters() if p.requires_grad and ('lora_A' in n or 'lora_B' in n))/1e6:.2f}M")
+        print(f"  -> æ€»å‚æ•°é‡: {total/1e6:.2f}M, å¯è®­ç»ƒ: {trainable/1e6:.2f}M ({len(trainable_names)} modules)")
+        if use_lidar:
+            print(f"     LiDAR+Fusion: {sum(p.numel() for n,p in model.named_parameters() if p.requires_grad and any(k in n for k in ('lidars_encoder', 'lidar_film', 'fusion_module')))/1e6:.2f}M")
+        if use_lora and lidar_warmup_epochs == 0:
+            print(f"     LoRA: {sum(p.numel() for n,p in model.named_parameters() if p.requires_grad and ('lora_A' in n or 'lora_B' in n))/1e6:.2f}M")
+        if lidar_warmup_epochs > 0:
+            print(f"     [Warmup æ¨¡å¼] LoRA å‚æ•°å·²å†»ç»“ï¼Œå‰ {lidar_warmup_epochs} ä¸ª epoch åªè®­ç»ƒ LiDAR")
 
     enable_gradient_checkpointing_safe(model, rank)
-
     model = model.to(device)
 
     if is_main_process(rank):
-        def make_hook(name):
-            def hook(module, input, output):
-                if isinstance(output, torch.Tensor) and not torch.isfinite(output).all():
-                    print(f"[HOOK] {name} Êä³öº¬nan! ĞÎ×´={tuple(output.shape)}, ·¶Î§=[{output.min():.3f}, {output.max():.3f}]")
-                elif isinstance(output, tuple):
-                    for i, o in enumerate(output):
-                        if isinstance(o, torch.Tensor) and not torch.isfinite(o).all():
-                            print(f"[HOOK] {name} Êä³ö[{i}]º¬nan! ĞÎ×´={tuple(o.shape)}")
-            return hook
-
-        if hasattr(model, 'encoder') and hasattr(model.encoder, 'model') and hasattr(model.encoder.model, 'blocks'):
-            for i, blk in enumerate(model.encoder.model.blocks):
-                if i < 3:
-                    blk.register_forward_hook(make_hook(f"encoder.blocks.{i}"))
-
-    if is_main_process(rank):
-        print("[ÑéÖ¤] Ö´ĞĞdummy forward¼ì²éÊä³ö¸ñÊ½...")
+        print("[éªŒè¯] æ‰§è¡Œ dummy forward...")
         model.eval()
         with torch.no_grad():
             dummy_img = torch.randn(1, 3, 224, 224, device=device)
-            dummy_pcd = torch.randn(1, 224, 224, 7, device=device)
+            dummy_pcd = torch.randn(1, 224, 224, 7, device=device) if use_lidar else torch.zeros(1, 224, 224, 7, device=device)
             dummy_views = [{
                 "img": dummy_img,
                 "pcd": dummy_pcd,
@@ -929,23 +1065,17 @@ def build_model(model_dir: str, device: str, rank: int, use_compile: bool = True
                 "confidence": torch.tensor(0.5, device=device),
             }]
             try:
-                dummy_pred = model(dummy_views, use_lidar=True)
+                dummy_pred = model(dummy_views, use_lidar=use_lidar)
                 if isinstance(dummy_pred, list) and len(dummy_pred) > 0:
-                    print(f"  -> Ä£ĞÍÊä³ökeys: {list(dummy_pred[0].keys())}")
-                    has_pose = 'cam_trans' in dummy_pred[0] and 'cam_quats' in dummy_pred[0]
-                    has_depth = 'depth_along_ray' in dummy_pred[0]
-                    has_ray = 'ray_directions' in dummy_pred[0]
-                    print(f"  -> Ö§³ÖÎ»×Ëloss: {has_pose}, Éî¶Èloss: {has_depth}, ÉäÏßloss: {has_ray}")
-                else:
-                    print(f"  -> ¾¯¸æ: Ä£ĞÍÊä³ö¸ñÊ½Òì³£: {type(dummy_pred)}")
+                    print(f"  -> è¾“å‡ºkeys: {list(dummy_pred[0].keys())}")
             except Exception as e:
-                print(f"  -> dummy forwardÊ§°Ü£¨²»Ó°ÏìÑµÁ·£¬½öÓÃÓÚÕï¶Ï£©: {e}")
+                print(f"  -> dummy forward å¤±è´¥: {e}")
         model.train()
 
     return model
 
 
-# ========================= ÏÔ´æÇåÀí¸¨Öúº¯Êı£¨ÓëµÚÒ»¸ö½Å±¾ÍêÈ«Ò»ÖÂ£© =========================
+# ========================= æ˜¾å­˜æ¸…ç† =========================
 
 def _cleanup_batch_tensors(views, predictions, loss=None, loss_scaled=None):
     if views is not None:
@@ -957,7 +1087,6 @@ def _cleanup_batch_tensors(views, predictions, loss=None, loss_scaled=None):
                         view[key] = val.cpu()
                         del view[key]
         del views
-
     if predictions is not None:
         for pred in predictions:
             if isinstance(pred, dict):
@@ -967,86 +1096,449 @@ def _cleanup_batch_tensors(views, predictions, loss=None, loss_scaled=None):
                         pred[key] = val.cpu()
                         del pred[key]
         del predictions
-
     if loss is not None:
         del loss
     if loss_scaled is not None:
         del loss_scaled
-
     gc.collect()
     if torch.cuda.is_available():
         torch.cuda.synchronize()
 
 
-# ========================= LoRA-only ±£´æ/¼ÓÔØ¹¤¾ß£¨ÓëµÚÒ»¸ö½Å±¾ÍêÈ«Ò»ÖÂ£© =========================
+# ========================= ä¿å­˜ä¸æ¢å¤ =========================
 
-def get_lora_state_dict(model):
-    return {k: v.detach().cpu() for k, v in model.named_parameters()
-            if 'lora_A' in k or 'lora_B' in k}
-
-
-def save_checkpoint_lora(save_model, optimizer, scheduler, scaler, epoch, best_loss, path, is_main):
+def save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, path, is_main, ema=None):
     if not is_main:
         return
-
-    lora_state = get_lora_state_dict(save_model)
+    full_state = {k: v.detach().cpu() for k, v in save_model.state_dict().items()}
     checkpoint = {
         'epoch': epoch,
-        'lora_state_dict': lora_state,
+        'model_state_dict': full_state,
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'scaler_state_dict': scaler.state_dict() if scaler.is_enabled() else None,
         'best_loss': best_loss,
     }
-
+    if ema is not None:
+        checkpoint['ema_shadow'] = {k: v.clone() for k, v in ema.shadow.items()}
+    
     tmp_path = path + ".tmp"
     try:
         torch.save(checkpoint, tmp_path)
         os.replace(tmp_path, path)
-        print(f"  -> ±£´æ LoRA checkpoint ({len(lora_state)} ¸ö²ÎÊı): {path}")
+        print(f"  -> ä¿å­˜å®Œæ•´æ¨¡å‹ ({len(full_state)} keys) | epoch={epoch} | {path}")
     except Exception as e:
-        print(f"  -> ±£´æÊ§°Ü (´ÅÅÌÂú?): {e}")
+        print(f"  -> ä¿å­˜å¤±è´¥: {e}")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
 
 
-# ========================= ÑµÁ·Ñ­»·£¨º¬ Modality Dropout£¬ÈÕÖ¾¸ñÊ½¶ÔÆëµÚÒ»¸ö½Å±¾£© =========================
+def smart_resume(model, optimizer, scheduler, scaler, ema, ckpt_path, rank, device):
+    """ä» checkpoint æ¢å¤å®Œæ•´æ¨¡å‹æƒé‡å’Œè®­ç»ƒçŠ¶æ€"""
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        return 0, float('inf')
 
-def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epoch, args, rank, scheduler):
+    if is_main_process(rank):
+        print(f"[Resume] æ¢å¤: {ckpt_path}")
+
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+
+    if 'model_state_dict' in ckpt:
+        model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        if is_main_process(rank):
+            print(f"  -> æ¨¡å‹æƒé‡å·²æ¢å¤")
+    else:
+        if is_main_process(rank):
+            print("  -> è­¦å‘Š: checkpoint ä¸­æ²¡æœ‰ model_state_dict")
+
+    if optimizer is not None and 'optimizer_state_dict' in ckpt:
+        try:
+            optimizer.load_state_dict(ckpt['optimizer_state_dict'])
+            if is_main_process(rank):
+                print(f"  -> ä¼˜åŒ–å™¨çŠ¶æ€å·²æ¢å¤")
+        except Exception as e:
+            if is_main_process(rank):
+                print(f"  -> ä¼˜åŒ–å™¨æ¢å¤å¤±è´¥ï¼ˆç»“æ„ä¸åŒ¹é…ï¼‰: {e}")
+                print(f"     å°†ä½¿ç”¨æ–°ä¼˜åŒ–å™¨ï¼Œä»…ä¿ç•™æ¨¡å‹æƒé‡")
+
+    if scheduler is not None and 'scheduler_state_dict' in ckpt and ckpt['scheduler_state_dict'] is not None:
+        try:
+            scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+            if is_main_process(rank):
+                print(f"  -> è°ƒåº¦å™¨å·²æ¢å¤")
+        except Exception as e:
+            if is_main_process(rank):
+                print(f"  -> è°ƒåº¦å™¨æ¢å¤å¤±è´¥: {e}")
+
+    if scaler is not None and 'scaler_state_dict' in ckpt and ckpt['scaler_state_dict'] is not None:
+        try:
+            scaler.load_state_dict(ckpt['scaler_state_dict'])
+        except Exception as e:
+            if is_main_process(rank):
+                print(f"  -> Scaler æ¢å¤å¤±è´¥: {e}")
+
+    if ema is not None:
+        ema._register(model)
+        if is_main_process(rank):
+            print(f"  -> EMA é‡æ–°åˆå§‹åŒ–")
+
+    epoch = ckpt.get('epoch', 0)
+    best_loss = ckpt.get('best_loss', float('inf'))
+
+    if is_main_process(rank):
+        print(f"  -> æ¢å¤ epoch {epoch}, best_loss={best_loss:.4f}")
+
+    del ckpt
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
+
+    return epoch, best_loss
+
+
+# ========================= Warmup å·¥å…·å‡½æ•° =========================
+
+# å…¨å±€çŠ¶æ€ï¼šä¿å­˜ fusion_conv RGB åˆ†æ”¯çš„ hook handle
+_fusion_rgb_hook_handle = None
+
+
+def _freeze_fusion_rgb_branch_hook(enc_dim):
+    """è¿”å›ä¸€ä¸ª backward hookï¼Œç”¨äºå†»ç»“ fusion_conv çš„ RGB åˆ†æ”¯æ¢¯åº¦"""
+    def _hook(grad):
+        if grad is not None:
+            grad = grad.clone()
+            grad[:, :enc_dim, 0, 0].zero_()
+        return grad
+    return _hook
+
+
+def set_lidar_warmup_phase(model, enable_warmup, args, rank):
+    global _fusion_rgb_hook_handle
+    target_model = model.module if hasattr(model, 'module') else model
+
+    unfrozen_count = 0
+    frozen_count = 0
+
+    for name, param in target_model.named_parameters():
+        clean_name = name.replace('_orig_mod.', '')
+        is_lora = 'lora_A' in clean_name or 'lora_B' in clean_name
+        is_lidar = any(k in clean_name for k in ('lidars_encoder', 'lidar_film', 'fusion_module', 'fusion_conv'))
+        is_head_base = any(h in clean_name for h in ('pose_head', 'dense_head', 'scale_head')) and not is_lora
+        is_shared = any(k in clean_name for k in ('shared_linear', 'shared_decoder', 'output_proj'))
+
+        if enable_warmup:
+            if is_lidar or is_head_base or is_shared:
+                param.requires_grad = True
+                unfrozen_count += 1
+            else:
+                param.requires_grad = False
+                frozen_count += 1
+        else:
+            if is_lidar or is_lora:
+                param.requires_grad = True
+                unfrozen_count += 1
+            else:
+                param.requires_grad = False
+                frozen_count += 1
+
+    if _fusion_rgb_hook_handle is not None:
+        _fusion_rgb_hook_handle.remove()
+        _fusion_rgb_hook_handle = None
+
+    if is_main_process(rank):
+        phase = "LiDAR-Warmup-V2(shared)" if enable_warmup else "Joint-Training-V2"
+        print(f"\n{'='*60}")
+        print(f"[phase switch] {phase}")
+        print(f"  unfrozen: {unfrozen_count} | frozen: {frozen_count}")
+
+    return unfrozen_count, frozen_count
+
+
+def build_optimizer_for_phase(model, args, rank, phase='warmup'):
+    """
+    æ ¹æ®å½“å‰é˜¶æ®µæ„å»ºä¼˜åŒ–å™¨ã€‚
+    phase='warmup': LiDAR + Head åŸºå‚æ•° + Shared æŠ•å½±å±‚
+    phase='joint':  LoRAï¼ˆæ‰€æœ‰çº¿æ€§å±‚çš„ A/Bï¼‰+ LiDAR
+    """
+    target_model = model.module if hasattr(model, 'module') else model
+    
+    lora_A_params_encoder = []
+    lora_B_params_encoder = []
+    lora_A_params_head = []
+    lora_B_params_head = []
+    lidar_params = []
+    head_base_params = []
+    shared_params = []
+    
+    for name, param in target_model.named_parameters():
+        if not param.requires_grad:
+            continue
+        
+        clean_name = name.replace('_orig_mod.', '')
+        is_encoder = 'encoder' in clean_name
+        is_B = 'lora_B' in clean_name
+        is_lidar = any(k in clean_name for k in ('lidars_encoder', 'lidar_film', 'fusion_module', 'fusion_conv'))
+        is_head_base = any(h in clean_name for h in ('pose_head', 'dense_head', 'scale_head')) and 'lora' not in clean_name
+        is_shared = any(k in clean_name for k in ('shared_linear', 'shared_decoder', 'output_proj'))
+        
+        # LoRA å‚æ•°ä¼˜å…ˆçº§æœ€é«˜ï¼ˆæ— è®ºå®ƒä»¬åœ¨å“ªä¸ªæ¨¡å—é‡Œï¼‰
+        if is_lidar:
+            lidar_params.append(param)
+        elif phase == 'joint' and 'lora_B' in clean_name:
+            if is_encoder:
+                lora_B_params_encoder.append(param)
+            else:
+                lora_B_params_head.append(param)
+        elif phase == 'joint' and 'lora_A' in clean_name:
+            if is_encoder:
+                lora_A_params_encoder.append(param)
+            else:
+                lora_A_params_head.append(param)
+        elif is_shared:
+            shared_params.append(param)
+        elif is_head_base:
+            head_base_params.append(param)
+    
+    param_groups = []
+    
+    if phase == 'warmup':
+        if lidar_params:
+            param_groups.append({
+                'params': lidar_params,
+                'lr': args.lr * args.lidar_lr_scale,
+                'weight_decay': args.weight_decay,
+                'name': 'lidar_warmup'
+            })
+        if shared_params:
+            param_groups.append({
+                'params': shared_params,
+                'lr': args.lr * 0.5,  # shared å±‚ç”¨è¾ƒä½å­¦ä¹ ç‡
+                'weight_decay': args.weight_decay,
+                'name': 'shared_proj'
+            })
+        if head_base_params:
+            param_groups.append({
+                'params': head_base_params,
+                'lr': args.lr,
+                'weight_decay': args.weight_decay,
+                'name': 'head_base'
+            })
+    else:
+        # è”åˆè®­ç»ƒï¼šåªè®­ LoRAï¼ˆæ‰€æœ‰çº¿æ€§å±‚çš„ A/Bï¼‰+ LiDAR
+        # Head å’Œ Shared çš„åŸºå‚æ•°å†»ç»“ï¼Œåªé€šè¿‡ LoRA å¾®è°ƒ
+        if lora_A_params_head:
+            param_groups.append({'params': lora_A_params_head, 'lr': args.lr, 'weight_decay': args.weight_decay, 'name': 'head_lora_A'})
+        if lora_B_params_head:
+            param_groups.append({'params': lora_B_params_head, 'lr': args.lr * args.lr_b_multiplier, 'weight_decay': 0.0, 'name': 'head_lora_B'})
+        if lora_A_params_encoder:
+            param_groups.append({'params': lora_A_params_encoder, 'lr': args.lr * args.encoder_lr_ratio, 'weight_decay': args.weight_decay, 'name': 'enc_lora_A'})
+        if lora_B_params_encoder:
+            param_groups.append({'params': lora_B_params_encoder, 'lr': args.lr * args.lr_b_multiplier * args.encoder_lr_ratio, 'weight_decay': 0.0, 'name': 'enc_lora_B'})
+        if lidar_params:
+            param_groups.append({'params': lidar_params, 'lr': args.lr * args.lidar_lr_scale, 'weight_decay': args.weight_decay, 'name': 'lidar_full'})
+    
+    if not param_groups:
+        raise RuntimeError(f"æ— å¯è®­ç»ƒå‚æ•°ï¼phase={phase}")
+    
+    optimizer = AdamW(param_groups, betas=(0.9, 0.999))
+    
+    if is_main_process(rank):
+        print(f"[ä¼˜åŒ–å™¨V2] phase={phase}, groups={len(param_groups)}")
+        for g in param_groups:
+            print(f"  {g['name']}: lr={g['lr']:.2e}, params={sum(p.numel() for p in g['params'])/1e6:.2f}M")
+    
+    return optimizer
+
+
+def reinitialize_fusion_module_for_joint_training(model, rank, smooth_alpha=0.35):
+    target_model = model.module if hasattr(model, 'module') else model
+    fusion_module = getattr(target_model, "fusion_module", None)
+    if fusion_module is None:
+        if is_main_process(rank):
+            print("  -> warning: fusion_module not found; skipping reinitialization")
+        return
+
+    with torch.no_grad():
+        gate_mlp = getattr(fusion_module, "gate_mlp", None)
+        if gate_mlp is not None and len(gate_mlp) >= 3 and hasattr(gate_mlp[-1], "weight"):
+            gate_mlp[-1].weight.zero_()
+            gate_mlp[-1].bias.zero_()
+        refine = getattr(fusion_module, "refine", None)
+        if refine is not None and hasattr(refine, "weight"):
+            refine.weight.zero_()
+
+    if is_main_process(rank):
+        print("  -> fusion_module reinitialized to a neutral gate")
+
+def build_scheduler(optimizer, args, steps_per_epoch):
+    """æ„å»ºå­¦ä¹ ç‡è°ƒåº¦å™¨"""
+    total_steps = args.epochs * steps_per_epoch
+    warmup_steps = min(args.warmup_steps, total_steps // 2)
+    cosine_steps = max(1, total_steps - warmup_steps)
+
+    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
+    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=args.lr * 0.01)
+    scheduler = SequentialLR(
+        optimizer,
+        schedulers=[warmup_scheduler, cosine_scheduler],
+        milestones=[warmup_steps]
+    )
+    return scheduler, warmup_steps
+
+
+# ========================= è®­ç»ƒå¾ªç¯ =========================
+
+def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epoch, args, rank, scheduler, ema=None, phase='joint'):
     model.train()
-    # [¶ÔÆëµÚÒ»¸ö½Å±¾] DDP barrier
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
 
     total_loss = 0.0
     num_batches = 0
-    data_time = 0.0
-    train_time = 0.0
     optimizer.zero_grad(set_to_none=True)
 
     lidar_dropout_count = 0
     lidar_total_count = 0
+    b_first_norm = None
+    nan_grad_batches = 0
 
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(device)
+    # ===================== æ¢¯åº¦ç›‘æ§ç³»ç»Ÿ =====================
+    CHECK_GRAD_ONLY = os.environ.get('CHECK_GRAD', '0') == '1'
+    MAX_CHECK_BATCHES = 30
+    check_grad_accum_count = 0
 
-    # [¶ÔÆëµÚÒ»¸ö½Å±¾] ³õÊ¼»¯ LoRA Ìİ¶È¼à¿Ø±äÁ¿
-    last_grad_norm = 0.0
-    lora_grad_count = 0
-    lora_grad_norm = 0.0
+    from collections import defaultdict
+    grad_history = defaultdict(list)
+    grad_window = defaultdict(list)
+    accum_boundary_count = 0
+
+    def _collect_grad_norm(group_params):
+        total_norm = 0.0
+        num_params = 0
+        for p in group_params:
+            if p.grad is not None:
+                param_norm = p.grad.data.norm(2).item()
+                total_norm += param_norm ** 2
+                num_params += 1
+        if num_params == 0:
+            return 0.0
+        return total_norm ** 0.5
+
+    def _print_grad_window(window, epoch, accum_count):
+        if not window or not is_main_process(rank):
+            return
+        phase_tag = "WARM" if phase == 'warmup' else "JOINT"
+        print(f"\n{'â”€'*55}")
+        print(f"[Epoch {epoch} | {phase_tag} | accum_boundary {accum_count}] æœ€è¿‘50æ­¥æ¢¯åº¦é€ŸæŠ¥")
+        print(f"{'â”€'*55}")
+        for name, norms in sorted(window.items()):
+            if not norms or name == 'total_loss':
+                continue
+            mean_norm = sum(norms) / len(norms)
+            std_norm = (sum((x - mean_norm)**2 for x in norms) / len(norms)) ** 0.5
+            cv = std_norm / (mean_norm + 1e-12)
+            mid = len(norms) // 2
+            trend = "?"
+            if mid > 0:
+                early = sum(norms[:mid]) / mid
+                late = sum(norms[mid:]) / (len(norms) - mid)
+                trend = "â†“æ”¶æ•›" if late < early * 0.9 else ("â†‘æ´»è·ƒ" if late > early * 1.1 else "â†’å¹³ç¨³")
+            print(f"  {name:18s} mean={mean_norm:.4e} std={std_norm:.2e} CV={cv:.2f} | {trend}")
+
+        lidar_n = window.get('lidar', [])
+        lora_n = window.get('lora_A', []) + window.get('lora_B', [])
+        if lidar_n and lora_n:
+            ratio = (sum(lidar_n)/len(lidar_n)) / (sum(lora_n)/len(lora_n) + 1e-12)
+            flag = "LiDAR>>LoRA" if ratio > 10 else ("LoRA>>LiDAR" if ratio < 0.1 else "å¹³è¡¡")
+            print(f"  [æ¢¯åº¦æ¯”] LiDAR/LoRA={ratio:.2f} {flag}")
+
+        losses = window.get('total_loss', [])
+        if losses:
+            l_mean = sum(losses) / len(losses)
+            l_mid = len(losses) // 2
+            l_trend = "?"
+            if l_mid > 0:
+                el = sum(losses[:l_mid]) / l_mid
+                ll = sum(losses[l_mid:]) / (len(losses) - l_mid)
+                l_trend = "â†“é™" if ll < el * 0.95 else ("â†‘å‡" if ll > el * 1.05 else "â†’å¹³")
+            print(f"  [Loss] mean={l_mean:.4f} | {l_trend}")
+        print(f"{'â”€'*55}")
+
+    def _print_grad_diagnostics(grad_history, epoch):
+        if not grad_history or not is_main_process(rank):
+            return
+        phase_tag = "WARM" if phase == 'warmup' else "JOINT"
+        print(f"\n{'='*60}")
+        print(f"[Epoch {epoch} {phase_tag} æ¢¯åº¦è¯Šæ–­ - å…¨ epoch ç´¯ç§¯]")
+        print(f"{'='*60}")
+        for name, norms in sorted(grad_history.items()):
+            if not norms or name == 'total_loss':
+                continue
+            mean_norm = sum(norms) / len(norms)
+            std_norm = (sum((x - mean_norm)**2 for x in norms) / len(norms)) ** 0.5
+            max_norm = max(norms)
+            min_norm = min(norms)
+            cv = std_norm / (mean_norm + 1e-12)
+            mid = len(norms) // 2
+            trend = "?"
+            if mid > 0:
+                early = sum(norms[:mid]) / mid
+                late = sum(norms[mid:]) / (len(norms) - mid)
+                trend = "â†“æ”¶æ•›" if late < early * 0.9 else ("â†‘æ´»è·ƒ" if late > early * 1.1 else "â†’å¹³ç¨³")
+            print(f"  {name:18s} | mean={mean_norm:.4e} std={std_norm:.2e} | "
+                  f"min={min_norm:.2e} max={max_norm:.2e} | CV={cv:.2f} | {trend}")
+
+        lidar_norms = grad_history.get('lidar', [])
+        lora_all = grad_history.get('lora_A', []) + grad_history.get('lora_B', [])
+        if lidar_norms and lora_all:
+            lidar_mean = sum(lidar_norms) / len(lidar_norms)
+            lora_mean = sum(lora_all) / len(lora_all)
+            ratio = lidar_mean / (lora_mean + 1e-12)
+            flag = "LiDAR>>LoRA" if ratio > 10 else ("LoRA>>LiDAR" if ratio < 0.1 else "å¹³è¡¡")
+            print(f"\n  [æ¢¯åº¦æ¯”] LiDAR/LoRA={ratio:.2f} {flag}")
+
+        all_norms = []
+        for k, v in grad_history.items():
+            if k != 'total_loss':
+                all_norms.extend(v)
+        if all_norms:
+            overall_mean = sum(all_norms) / len(all_norms)
+            if overall_mean < 1e-5:
+                print(f"  â†’ æ¢¯åº¦æå°({overall_mean:.2e})ï¼Œå¯èƒ½å·²æ”¶æ•›æˆ–å­¦ä¹ ç‡å¤ªå°")
+            elif overall_mean > 10.0:
+                print(f"  â†’ æ¢¯åº¦æå¤§({overall_mean:.2e})ï¼Œå­¦ä¹ ç‡è¿‡å¤§æˆ–éœ‡è¡")
+            else:
+                print(f"  â†’ æ¢¯åº¦æ­£å¸¸({overall_mean:.2e})")
+
+        losses = grad_history.get('total_loss', [])
+        if losses:
+            mid = len(losses) // 2
+            if mid > 0:
+                early_l = sum(losses[:mid]) / mid
+                late_l = sum(losses[mid:]) / (len(losses) - mid)
+                print(f"  [Lossè¶‹åŠ¿] å‰={early_l:.4f} å={late_l:.4f} ", end="")
+                print("â†“ä¸‹é™" if late_l < early_l * 0.95 else ("â†‘ä¸Šå‡" if late_l > early_l * 1.05 else "â†’æŒå¹³"))
+        print(f"{'='*60}\n")
+    # ======================================================
 
     t_start = time.time()
     for batch_idx, views in enumerate(dataloader):
-        t_data_end = time.time()
-        data_time += (t_data_end - t_start)
-
         for view in views:
             for key, val in view.items():
                 if torch.is_tensor(val):
                     view[key] = val.to(device, non_blocking=True)
 
+        # # ========== Warmup é˜¶æ®µï¼šRGB è¾“å…¥ç½®é›¶ï¼Œå¼ºåˆ¶æ¨¡å‹åªä¾èµ– LiDAR ==========
+        rgb_zeroed = False
+        # if phase == 'warmup':
+        #     for view in views:
+        #         if 'img' in view and torch.is_tensor(view['img']):
+        #             view['img'].zero_()
+        #     rgb_zeroed = True
+        # # ================================================================
+
         lidar_dropped = False
-        if args.lidar_dropout_prob > 0.0 and random.random() < args.lidar_dropout_prob:
+        if args.lidar and args.lidar_dropout_prob > 0.0 and random.random() < args.lidar_dropout_prob:
             lidar_dropped = True
             lidar_dropout_count += 1
             for view in views:
@@ -1057,43 +1549,21 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
         lidar_total_count += 1
 
         with autocast(enabled=args.amp, dtype=torch.bfloat16):
-            predictions = model(views, use_lidar=True)
+            predictions = model(views, use_lidar=args.lidar)
 
             if batch_idx == 0 and is_main_process(rank):
-                print(f"[Õï¶Ï] Epoch{epoch} Batch0 Ä£ĞÍÊä³ökeys: {list(predictions[0].keys()) if predictions else []}")
-                print(f"[Õï¶Ï] views[0] keys: {list(views[0].keys()) if views else []}")
-
-            for i, pred in enumerate(predictions):
-                for k, v in pred.items():
-                    if torch.is_tensor(v) and not torch.isfinite(v).all():
-                        if is_main_process(rank):
-                            print(f"[Epoch {epoch}] batch {batch_idx}: Ô¤²âÊä³ö nan! "
-                                  f"view={i}, key={k}, shape={tuple(v.shape)}")
+                print(f"[è¯Šæ–­] Epoch{epoch} Batch0 keys: {list(predictions[0].keys()) if predictions else []}")
 
             loss, metrics = criterion(predictions, views, seq_len=args.seq_len)
 
         if loss is None:
-            if is_main_process(rank):
-                valid_keys = list(predictions[0].keys()) if predictions else []
-                drop_tag = "[LIDAR_DROP]" if lidar_dropped else ""
-                print(f"[Epoch {epoch}] batch {batch_idx}: ÎŞÓĞĞ§loss·ÖÁ¿! {drop_tag} "
-                      f"predictions_keys={valid_keys}, Ìø¹ı")
             _cleanup_batch_tensors(views, predictions, None, None)
             t_start = time.time()
             continue
 
         loss_val = loss.item() if torch.isfinite(loss) else float('nan')
 
-        if not loss.requires_grad:
-            if is_main_process(rank):
-                print(f"¾¯¸æ: loss ÎŞÌİ¶È, Ìø¹ı batch {batch_idx}")
-            _cleanup_batch_tensors(views, predictions, loss, None)
-            t_start = time.time()
-            continue
-
-        if not torch.isfinite(loss):
-            if is_main_process(rank):
-                print(f"¾¯¸æ: batch {batch_idx} ³öÏÖ·ÇÓĞÏŞloss ({loss_val:.4f}), Ìø¹ı")
+        if not loss.requires_grad or not torch.isfinite(loss):
             _cleanup_batch_tensors(views, predictions, loss, None)
             t_start = time.time()
             continue
@@ -1104,6 +1574,12 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
         else:
             loss_scaled.backward()
 
+        if batch_idx == 0 and b_first_norm is None:
+            for name, p in model.named_parameters():
+                if 'lora_B' in name and p.requires_grad:
+                    b_first_norm = p.norm().item()
+                    break
+
         _cleanup_batch_tensors(views, predictions, loss, loss_scaled)
 
         total_loss += loss_val
@@ -1112,89 +1588,104 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
         is_accum_boundary = ((batch_idx + 1) % args.accum_iter == 0) or (batch_idx + 1 == len(dataloader))
         if is_accum_boundary:
             has_nan_grad = False
-            nan_param_names = []
             for name, p in model.named_parameters():
                 if p.grad is not None and not torch.isfinite(p.grad).all():
                     has_nan_grad = True
-                    nan_param_names.append(name)
-
+                    break
             if has_nan_grad:
-                if is_main_process(rank):
-                    print(f"[Epoch {epoch}] batch {batch_idx}: ¼ì²âµ½nanÌİ¶È£¬Ìø¹ıstep£¡")
-                    for n in nan_param_names[:3]:
-                        print(f"    {n}")
                 optimizer.zero_grad(set_to_none=True)
-                last_grad_norm = float('nan')
+                nan_grad_batches += 1
                 torch.cuda.empty_cache()
                 continue
 
-            params_for_clip = list(filter(lambda p: p.requires_grad, model.parameters()))
+            # å‚æ•°åˆ†ç»„
+            lora_A_params = [p for n, p in model.named_parameters() if p.requires_grad and 'lora_A' in n]
+            lora_B_params = [p for n, p in model.named_parameters() if p.requires_grad and 'lora_B' in n]
+            lidar_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ('lidars_encoder', 'lidar_film', 'fusion_module'))]
+            pose_head_params = [p for n, p in model.named_parameters() if p.requires_grad and 'pose_head' in n and 'lora' not in n]
+            dense_head_params = [p for n, p in model.named_parameters() if p.requires_grad and 'dense_head' in n and 'lora' not in n]
+            shared_params = [p for n, p in model.named_parameters() if p.requires_grad and any(k in n for k in ('shared_linear', 'shared_decoder', 'output_proj'))]
+
+            # æ”¶é›†æ¢¯åº¦èŒƒæ•°
+            grad_snapshot = {}
+            if lora_A_params: grad_snapshot['lora_A'] = _collect_grad_norm(lora_A_params)
+            if lora_B_params: grad_snapshot['lora_B'] = _collect_grad_norm(lora_B_params)
+            if lidar_params:  grad_snapshot['lidar'] = _collect_grad_norm(lidar_params)
+            if pose_head_params: grad_snapshot['pose_head'] = _collect_grad_norm(pose_head_params)
+            if dense_head_params: grad_snapshot['dense_head'] = _collect_grad_norm(dense_head_params)
+            if shared_params: grad_snapshot['shared'] = _collect_grad_norm(shared_params)
+            grad_snapshot['total_loss'] = loss_val
+
+            for k, v in grad_snapshot.items():
+                grad_history[k].append(v)
+                grad_window[k].append(v)
+                if len(grad_window[k]) > 50:
+                    grad_window[k] = grad_window[k][-50:]
+
+            accum_boundary_count += 1
+
+            if accum_boundary_count % 50 == 0:
+                _print_grad_window(grad_window, epoch, accum_boundary_count)
+
             if args.amp:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(params_for_clip, max_norm=args.grad_clip)
+                if lora_A_params:
+                    torch.nn.utils.clip_grad_norm_(lora_A_params, max_norm=args.grad_clip)
+                if lora_B_params:
+                    torch.nn.utils.clip_grad_norm_(lora_B_params, max_norm=args.grad_clip * 5.0)
+                if lidar_params:
+                    torch.nn.utils.clip_grad_norm_(lidar_params, max_norm=0.3)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(params_for_clip, max_norm=args.grad_clip)
+                if lora_A_params:
+                    torch.nn.utils.clip_grad_norm_(lora_A_params, max_norm=args.grad_clip)
+                if lora_B_params:
+                    torch.nn.utils.clip_grad_norm_(lora_B_params, max_norm=args.grad_clip * 5.0)
+                if lidar_params:
+                    torch.nn.utils.clip_grad_norm_(lidar_params, max_norm=0.3)
                 optimizer.step()
 
-            # [¶ÔÆëµÚÒ»¸ö½Å±¾] ¼ÆËã LoRA ×¨ÊôÌİ¶È·¶Êı
-            lora_grad_norm = 0.0
-            lora_grad_count = 0
-            for name, p in model.named_parameters():
-                if p.grad is not None and ('lora_A' in name or 'lora_B' in name):
-                    lora_grad_norm += p.grad.norm().item() ** 2
-                    lora_grad_count += 1
-            if lora_grad_count > 0:
-                lora_grad_norm = math.sqrt(lora_grad_norm)
-
-            if math.isfinite(grad_norm):
-                last_grad_norm = float(grad_norm)
-            else:
-                last_grad_norm = float('nan')
-
+            if ema is not None:
+                ema.update(model)
             if scheduler is not None:
                 scheduler.step()
 
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
 
-            if is_main_process(rank) and batch_idx % (args.log_interval * 5) == 0:
-                allocated = torch.cuda.memory_allocated(device) / 1024**3
-                reserved = torch.cuda.memory_reserved(device) / 1024**3
-                peak = torch.cuda.max_memory_allocated(device) / 1024**3
-                print(f"  -> ÏÔ´æ: ÒÑ·ÖÅä {allocated:.2f}GB | Ô¤Áô {reserved:.2f}GB | ·åÖµ {peak:.2f}GB")
+            check_grad_accum_count += 1
+            if CHECK_GRAD_ONLY and check_grad_accum_count >= MAX_CHECK_BATCHES:
+                if is_main_process(rank):
+                    print(f"\n CHECK_GRAD æ¨¡å¼ï¼šå·²å®Œæˆ {MAX_CHECK_BATCHES} ä¸ª accum_boundary")
+                    _print_grad_diagnostics(grad_history, epoch)
+                    print(" è¯Šæ–­å®Œæˆï¼Œè¿›ç¨‹é€€å‡º")
+                cleanup_ddp(torch.distributed.is_initialized())
+                sys.exit(0)
 
-        t_train_end = time.time()
-        train_time += (t_train_end - t_data_end)
-
-        # [¶ÔÆëµÚÒ»¸ö½Å±¾] ÈÕÖ¾¸ñÊ½Í³Ò»
         if is_main_process(rank) and batch_idx % args.log_interval == 0:
             lr_str = "/".join([f"{g['lr']:.2e}" for g in optimizer.param_groups])
             drop_tag = "[DROP]" if lidar_dropped else "[LID]"
-            log_str = (f"[Epoch {epoch}] [{batch_idx}/{len(dataloader)}] {drop_tag} "
+            phase_tag = "W" if phase == 'warmup' else "J"
+            rgb_tag = "[ZERO-RGB]" if rgb_zeroed else ""
+            log_str = (f"[Epoch {epoch}] [{batch_idx}/{len(dataloader)}] {phase_tag}{drop_tag}{rgb_tag} "
                        f"LR: {lr_str} Loss: {loss_val:.4f}")
-            for key in ['rpe_trans', 'rpe_rot', 'depth', 'ray']:
+            for key in ['rpe_trans', 'rpe_rot', 'depth', 'ray', 'world_pts']:
                 if key in metrics:
                     log_str += f" {key}: {metrics[key]:.4f}"
-            if 'rpe_trans' not in metrics and batch_idx % (args.log_interval * 5) == 0:
-                log_str += " | (ÎŞ RPE£¬¼ì²é pose Êä³ö)"
-            if math.isfinite(last_grad_norm):
-                log_str += f" | GradNorm: {last_grad_norm:.4f}"
-            else:
-                log_str += " | GradNorm: nan/inf"
-            if lora_grad_count > 0:
-                log_str += f" | LoRA_Grad: {lora_grad_norm:.4f}({lora_grad_count})"
-            elif batch_idx % (args.log_interval * 5) == 0:
-                log_str += " | LoRA_Grad: N/A"
             print(log_str)
 
         t_start = time.time()
 
     if is_main_process(rank) and lidar_total_count > 0:
         drop_rate = lidar_dropout_count / lidar_total_count
-        print(f"[Epoch {epoch}] LiDAR Modality Dropout Í³¼Æ: {lidar_dropout_count}/{lidar_total_count} "
-              f"({drop_rate*100:.1f}%) batches ¶ªÆúÁË LiDAR")
+        print(f"[Epoch {epoch}] LiDAR Dropout: {lidar_dropout_count}/{lidar_total_count} ({drop_rate*100:.1f}%)")
+
+    if is_main_process(rank):
+        b_norms = [p.norm().item() for n, p in model.named_parameters() if 'lora_B' in n and p.requires_grad]
+        avg_b = sum(b_norms) / len(b_norms) if b_norms else 0
+        print(f"[Epoch {epoch} ç»“æŸ] B_avg: {avg_b:.4e} | NaNGrad: {nan_grad_batches}")
+        _print_grad_diagnostics(grad_history, epoch)
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
@@ -1204,45 +1695,54 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
 # ========================= Main =========================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train MapAnything LiDAR Fusion (Joint LoRA + Full LiDAR)")
+    parser = argparse.ArgumentParser(description="MapAnything LiDAR Warmup Training")
     parser.add_argument("--seq_root", type=str, nargs='+',
                         default=["/add02/users/xuyh/seq1/", "/add02/users/xuyh/seq3/"],
-                        help="ÑµÁ·Êı¾İÂ·¾¶£¬¿ÉÖ¸¶¨¶à¸öĞòÁĞ (Èç --seq_root /path/to/seq1 /path/to/seq3)")
+                        help="è®­ç»ƒæ•°æ®è·¯å¾„ï¼Œå¯æŒ‡å®šå¤šä¸ªåºåˆ—")
     parser.add_argument("--model_dir", type=str, default="/home/xuyh/mapanything/")
-    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/lidar/")
+    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/32_lora_lidar")
     parser.add_argument("--cache_dir", type=str, default="./cache/lidar_7ch")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=4)
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--img_size", type=int, default=448)
-    parser.add_argument("--lr", type=float, default=5e-5, help="»ù´¡Ñ§Ï°ÂÊ (LoRA Ä¬ÈÏÊ¹ÓÃ´Ë lr)")
-    parser.add_argument("--lora_lr", type=float, default=None, help="LoRA×¨ÊôÑ§Ï°ÂÊ£¬Ä¬ÈÏµÈÓÚlr")
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr_b_multiplier", type=float, default=25.0)
+    parser.add_argument("--encoder_lr_ratio", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.05)
-    parser.add_argument("--warmup_steps", type=int, default=200)
-    parser.add_argument("--grad_clip", type=float, default=0.5)
+    parser.add_argument("--warmup_steps", type=int, default=500)
+    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=8)
-    parser.add_argument("--gpu", type=int, default=3)
-    parser.add_argument("--amp", action="store_true", default=False,
-                        help="ÆôÓÃAMP£¨Ä¬ÈÏ½ûÓÃ£¬DINOv2+LoRAÔÚfp16ÏÂ²»ÎÈ¶¨£¬½¨Òéfp32£©")
-    parser.add_argument("--resume", type=str, default="/add02/users/xuyh/checkpoints/lidar/checkpoints/best_full.pt")
+    parser.add_argument("--amp", action="store_true", default=False)
+    parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--tolerance", type=float, default=0.05)
-    parser.add_argument("--accum_iter", type=int, default=8,
-                        help="Ìİ¶ÈÀÛ»ı²½Êı£¨Ä¬ÈÏ8£¬µÈĞ§batch=8µ«·åÖµÏÔ´æ°´1Ëã£©")
-    parser.add_argument("--use_compile", action="store_true", default=False,
-                        help="ÆôÓÃ torch.compile (Ä¬ÈÏ½ûÓÃ£¬ÒÑÖªDDP+compile¿ÉÄÜ²»ÎÈ¶¨)")
+    parser.add_argument("--accum_iter", type=int, default=8)
+    parser.add_argument("--use_compile", action="store_true", default=False)
     parser.add_argument("--local_rank", type=int, default=-1)
-    parser.add_argument("--lora_r", type=int, default=16, help="LoRA rank")
-    parser.add_argument("--lora_alpha", type=int, default=16, help="LoRA alpha")
-    parser.add_argument("--lidar_lr_scale", type=float, default=2.0, help="LiDAR Ä£¿éÑ§Ï°ÂÊ±¶Êı (Ïà¶ÔÓÚ lr)")
-    parser.add_argument("--reset_optimizer", action="store_true", default=True,
-                        help="resumeÊ±ÖØÖÃÓÅ»¯Æ÷×´Ì¬£¨Ä¬ÈÏTrue£¬ĞŞ¸´LoRAÑµÁ·ÍÆ¼ö£©")
-    parser.add_argument("--resume_optimizer", action="store_true", default=False,
-                        help="resumeÊ±¼ÓÔØÓÅ»¯Æ÷×´Ì¬£¨Ä¬ÈÏFalse£¬±ÜÃâÀúÊ·´íÎó¶¯Á¿£©")
-    parser.add_argument("--lidar_dropout_prob", type=float, default=0.0,
-                        help="LiDARÄ£Ì¬dropout¸ÅÂÊ (Ä¬ÈÏ0.2£¬¼´20%%µÄbatchËæ»ú¶ªÆúLiDARÊäÈë)")
+    parser.add_argument("--lora_r", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lidar_lr_scale", type=float, default=0.2)
+    parser.add_argument("--use_ema", action="store_true", default=True)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
+    parser.add_argument("--lidar_dropout_prob", type=float, default=0.0)
+    
+    # ========== LiDAR Warmup æ–°å‚æ•° ==========
+    parser.add_argument("--lidar_warmup_epochs", type=int, default=2,
+                        help="??N ??epoch ??? LoRA?????? LiDAR + Heads (???: 2)")
+    parser.add_argument("--lidar_warmup_lr_scale", type=float, default=1.0,
+                        help="warmup ??? LiDAR ????????(???: 1.0)")
+    parser.add_argument("--fusion_smooth_alpha", type=float, default=0.35,
+                        help="warmup ?????fusion_module ?????? (???: 0.35)")
+    # ========================================
+    
+    # è®­ç»ƒå¼€å…³
+    parser.add_argument("--lora", action="store_true", default=True, help="å¯ç”¨ LoRA è®­ç»ƒ")
+    parser.add_argument("--no-lora", action="store_false", dest="lora", help="ç¦ç”¨ LoRA è®­ç»ƒ")
+    parser.add_argument("--lidar", action="store_true", default=True, help="å¯ç”¨ LiDAR è®­ç»ƒ")
+    parser.add_argument("--no-lidar", action="store_false", dest="lidar", help="ç¦ç”¨ LiDAR è®­ç»ƒ")
     args = parser.parse_args()
 
     rank, local_rank, world_size, is_ddp = setup_ddp()
@@ -1263,34 +1763,28 @@ def main():
         os.makedirs(checkpoint_dir, exist_ok=True)
 
     if is_main_process(rank):
-        print("¼ÓÔØÄ£ĞÍ...")
+        print("=" * 65)
+        print("MapAnything LiDAR Warmup Training")
+        print(f"LoRA: {'ON' if args.lora else 'OFF'} | LiDAR: {'ON' if args.lidar else 'OFF'}")
+        if args.lidar_warmup_epochs > 0:
+            print(f"LiDAR Warmup: å‰ {args.lidar_warmup_epochs} ä¸ª epoch å†»ç»“ LoRA")
+        print("=" * 65)
+
+    # åŠ è½½æ¨¡å‹ï¼ˆä¼ å…¥ warmup é…ç½®ï¼Œæ§åˆ¶ fusion_module åˆå§‹åŒ–ï¼‰
     model = build_model(
         args.model_dir, device, rank,
         use_compile=False,
-        lora_r=args.lora_r, lora_alpha=args.lora_alpha
+        lora_r=args.lora_r, lora_alpha=args.lora_alpha,
+        use_lora=args.lora, use_lidar=args.lidar,
+        lidar_warmup_epochs=args.lidar_warmup_epochs
     )
 
-    params_to_train = [p for p in model.parameters() if p.requires_grad]
-    if len(params_to_train) == 0:
-        if is_main_process(rank):
-            print("ÖÂÃü´íÎó: Ä£ĞÍÃ»ÓĞÈÎºÎ¿ÉÑµÁ·²ÎÊı¡£")
-        cleanup_ddp(is_ddp)
-        sys.exit(1)
-
-    if is_ddp:
-        model = torch.nn.parallel.DistributedDataParallel(
-            model, device_ids=[local_rank], output_device=local_rank,
-            find_unused_parameters=True
-        )
-
-    # ==================== [Multi-Seq] Êı¾İ¼¯¹¹½¨£ºÖ§³Öµ¥ĞòÁĞ»ò¶àĞòÁĞ ====================
-    if is_main_process(rank):
-        print(f"¹¹½¨Êı¾İ¼¯... (seq_len={args.seq_len}, accum_iter={args.accum_iter})")
-
+    # æ•°æ®é›†
     if len(args.seq_root) == 1:
         dataset = Seq1LidarDataset(
             seq_root=args.seq_root[0], seq_len=args.seq_len, stride=args.stride,
-            img_size=args.img_size, cache_dir=args.cache_dir, tolerance=args.tolerance
+            img_size=args.img_size, cache_dir=args.cache_dir, tolerance=args.tolerance,
+            use_lidar=args.lidar
         )
     else:
         datasets = []
@@ -1298,15 +1792,11 @@ def main():
             cache_subdir = os.path.join(args.cache_dir, f"seq{idx}") if args.cache_dir else None
             ds = Seq1LidarDataset(
                 seq_root=root, seq_len=args.seq_len, stride=args.stride,
-                img_size=args.img_size, cache_dir=cache_subdir, tolerance=args.tolerance
+                img_size=args.img_size, cache_dir=cache_subdir, tolerance=args.tolerance,
+                use_lidar=args.lidar
             )
             datasets.append(ds)
         dataset = ConcatDataset(datasets)
-        if is_main_process(rank):
-            total_len = sum(len(d) for d in datasets)
-            print(f"[MultiSeq] ºÏ²¢ {len(datasets)} ¸öÊı¾İ¼¯£¬×ÜÑù±¾Êı: {total_len}")
-            for i, d in enumerate(datasets):
-                print(f"  -> Seq{i}: {len(d)} ¸öÑù±¾ from {args.seq_root[i]}")
 
     sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=True
@@ -1320,170 +1810,132 @@ def main():
         prefetch_factor=4 if args.num_workers > 0 else None,
     )
 
-    lidar_params = []
-    lora_params = []
-    other_params = []
-    lidar_keywords = ('lidars_encoder', 'lidar_film', 'fusion_conv')
+    criterion = MapAnythingLoss(
+        w_depth=0.1, w_pose_trans=2.0, w_pose_rot=0.5, w_ray=0.1,
+        w_pts3d_cam=0.1, w_world_pts=0.1, w_confidence=0.1,
+        w_scale=0.1, robust_alpha=0.5, robust_c=0.05,
+        top_n_percent=5.0, use_log_depth=True, use_chordal_rot=True)
 
-    for name, param in model.named_parameters():
-        if not param.requires_grad:
-            continue
-        if 'lora_A' in name or 'lora_B' in name:
-            lora_params.append(param)
-        elif any(k in name for k in lidar_keywords):
-            lidar_params.append(param)
-        else:
-            other_params.append(param)
-
-    if is_main_process(rank):
-        print(f"ÓÅ»¯Æ÷·Ö×é: LiDAR {len(lidar_params)} ×é, LoRA {len(lora_params)} ×é, ÆäËû {len(other_params)} ×é")
-        if other_params:
-            print("¾¯¸æ: ´æÔÚÎ´·ÖÀàµÄ¿ÉÑµÁ·²ÎÊı£¬ÒÑ¹éÈë LoRA ×é")
-            lora_params.extend(other_params)
-
-    # [¶ÔÆëµÚÒ»¸ö½Å±¾] LoRA Ñ§Ï°ÂÊÂß¼­£ºÄ¬ÈÏÊ¹ÓÃ args.lr
-    lora_lr = args.lora_lr if args.lora_lr is not None else args.lr
-    param_groups = [
-        {'params': lidar_params, 'lr': args.lr * args.lidar_lr_scale, 'weight_decay': args.weight_decay},
-        {'params': lora_params, 'lr': lora_lr, 'weight_decay': args.weight_decay},
-    ]
-    optimizer = AdamW(param_groups, betas=(0.9, 0.999))
-
-    steps_per_epoch = len(dataloader) // args.accum_iter
-    total_steps = args.epochs * steps_per_epoch
-    warmup_steps = min(args.warmup_steps, total_steps // 2)
-    cosine_steps = max(1, total_steps - warmup_steps)
-
-    warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
-    cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=args.lr * 0.01)
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_steps]
-    )
-
-    if is_main_process(rank):
-        print(f"ÑµÁ·×Ü²½Êı: {total_steps}, warmup: {warmup_steps}, cosine: {cosine_steps}")
-        print(f"LoRAÑ§Ï°ÂÊ: {lora_lr:.2e}, LiDARÑ§Ï°ÂÊ: {args.lr * args.lidar_lr_scale:.2e}")
-
-    # [¶ÔÆëµÚÒ»¸ö½Å±¾] Ê¹ÓÃÓëµÚÒ»¸ö½Å±¾ÍêÈ«ÏàÍ¬µÄËğÊ§È¨ÖØ
-    criterion = MapAnythingLoss(w_depth=1.0, w_pose_trans=3.0, w_pose_rot=1.0, w_ray=0.5, w_pts3d_cam=1.0)
-    if args.amp and is_main_process(rank):
-        print("[¾¯¸æ] AMPÒÑÆôÓÃ¡£Èç¹ûÑµÁ·²»ÎÈ¶¨£¬½¨Òé½ûÓÃAMPÊ¹ÓÃfp32¡£")
     scaler = GradScaler(enabled=args.amp)
 
-    start_epoch = 0; best_loss = float('inf')
-    if args.resume and os.path.exists(args.resume):
-        if is_main_process(rank):
-            print(f"»Ö¸´ÑµÁ·: {args.resume} (CPU ¼ÓÔØ + ÇåÀí)")
+    if is_ddp:
+        model = torch.nn.parallel.DistributedDataParallel(
+            model, device_ids=[local_rank], output_device=local_rank,
+            find_unused_parameters=True, gradient_as_bucket_view=True
+        )
 
-        ckpt = torch.load(args.resume, map_location='cpu')
+    # æ ¹æ®é˜¶æ®µæ„å»ºåˆå§‹ä¼˜åŒ–å™¨
+    steps_per_epoch = len(dataloader) // args.accum_iter
+    
+    if args.lidar_warmup_epochs > 0:
+        current_phase = 'warmup'
+        set_lidar_warmup_phase(model, enable_warmup=True, args=args, rank=rank)
+    else:
+        current_phase = 'joint'
+        set_lidar_warmup_phase(model, enable_warmup=False, args=args, rank=rank)
+    
+    optimizer = build_optimizer_for_phase(model, args, rank, phase=current_phase)
+    scheduler, warmup_steps = build_scheduler(optimizer, args, steps_per_epoch)
 
-        # [¶ÔÆëµÚÒ»¸ö½Å±¾] ÓÅÏÈ¼ì²â LoRA-only checkpoint
-        if 'lora_state_dict' in ckpt:
-            state_dict = ckpt['lora_state_dict']
-            if is_main_process(rank):
-                print(f"  -> ¼ì²âµ½ LoRA-only checkpoint ({len(state_dict)} ¸ö²ÎÊı)")
-        else:
-            state_dict = ckpt['model_state_dict']
-            if is_main_process(rank):
-                print("  -> ¼ì²âµ½ÍêÕûÄ£ĞÍÈ¨ÖØ (¾É°æ¼æÈİ)")
+    # EMA
+    ema = None
+    if args.use_ema and is_main_process(rank):
+        target_model = model.module if is_ddp else model
+        ema = ModelEMA(target_model, decay=args.ema_decay)
 
-        start_epoch = ckpt.get('epoch', 0) + 1
-        best_loss = ckpt.get('best_loss', float('inf'))
-
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(device)
-
-        if is_ddp:
-            model.module.load_state_dict(state_dict, strict=False)
-        else:
-            model.load_state_dict(state_dict, strict=False)
-
-        # [¶ÔÆëµÚÒ»¸ö½Å±¾] resume ºó´òÓ¡ LoRA ·¶ÊıÕï¶Ï
-        if is_main_process(rank):
-            target_model = model.module if is_ddp else model
-            lora_state_loaded = get_lora_state_dict(target_model)
-
-            a_norms = [v.norm().item() for k, v in lora_state_loaded.items() if 'lora_A' in k]
-            b_norms = [v.norm().item() for k, v in lora_state_loaded.items() if 'lora_B' in k]
-
-            if a_norms:
-                print(f"  -> LoRA_A Æ½¾ù·¶Êı: {sum(a_norms)/len(a_norms):.4f} "
-                      f"(³õÊ¼»¯¡Ö0.02£¬ÑµÁ·ºóÓ¦»ºÂıÔö³¤)")
-                print(f"  -> LoRA_B Æ½¾ù·¶Êı: {sum(b_norms)/len(b_norms):.4f} "
-                      f"(³õÊ¼¡Ö0.0£¬ÑµÁ·ºóÓ¦>0)")
-
-                sample_items = list(lora_state_loaded.items())[:6]
-                for k, v in sample_items:
-                    print(f"     {k}: {v.norm():.4f}")
+    # æ¢å¤è®­ç»ƒ
+    start_epoch = 0
+    best_loss = float('inf')
+    resumed_phase = current_phase
+    
+    if args.resume:
+        target_model = model.module if is_ddp else model
+        start_epoch, best_loss = smart_resume(
+            target_model, optimizer, scheduler, scaler, ema,
+            args.resume, rank, device
+        )
+        
+        # æ ¹æ®æ¢å¤çš„ epoch åˆ¤æ–­å½“å‰åº”è¯¥å¤„äºå“ªä¸ªé˜¶æ®µ
+        if args.lidar_warmup_epochs > 0:
+            if start_epoch < args.lidar_warmup_epochs:
+                resumed_phase = 'warmup'
+                set_lidar_warmup_phase(model, enable_warmup=True, args=args, rank=rank)
             else:
-                print("  -> ¾¯¸æ: Î´¼ì²âµ½ÈÎºÎ LoRA ²ÎÊı£¬Çë¼ì²éÄ£¿éÃûÆ¥Åä£¡")
+                resumed_phase = 'joint'
+                set_lidar_warmup_phase(model, enable_warmup=False, args=args, rank=rank)
+            
+            # æ¢å¤åé‡æ–°æ„å»ºä¼˜åŒ–å™¨ä»¥åŒ¹é…å½“å‰å‚æ•°å†»ç»“çŠ¶æ€
+            optimizer = build_optimizer_for_phase(model, args, rank, phase=resumed_phase)
+            scheduler, warmup_steps = build_scheduler(optimizer, args, steps_per_epoch)
+        
+        if is_main_process(rank):
+            print(f"[Resume] ä» epoch {start_epoch + 1} ç»§ç»­è®­ç»ƒ | phase={resumed_phase}")
 
-            print(f"  -> ÒÑ»Ö¸´ epoch {start_epoch-1}, best_loss={best_loss:.4f} (Ä£ĞÍÈ¨ÖØÒÑ¼ÓÔØ£¬ÓÅ»¯Æ÷ÒÑÖØÖÃ)")
-
-        del ckpt, state_dict
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(device)
-
-    for epoch in range(start_epoch, args.epochs):
+    # ========== è®­ç»ƒå¾ªç¯ï¼ˆå«é˜¶æ®µåˆ‡æ¢ï¼‰==========
+    for epoch in range(start_epoch + 1, args.epochs):
+        
+        # ---- é˜¶æ®µåˆ‡æ¢æ£€æµ‹ ----
+        if args.lidar_warmup_epochs > 0:
+            if current_phase == 'warmup' and epoch > args.lidar_warmup_epochs:
+                # Warmup ç»“æŸï¼Œåˆ‡æ¢åˆ°è”åˆè®­ç»ƒ
+                if is_main_process(rank):
+                    print(f"\n{'#'*60}")
+                    print(f"[#] Epoch {epoch}: LiDAR Warmup ç»“æŸï¼Œåˆ‡æ¢åˆ°è”åˆè®­ç»ƒ")
+                    print(f"{'#'*60}")
+                
+                # 1. è§£å†» LoRA å‚æ•° + ç§»é™¤ fusion hook
+                set_lidar_warmup_phase(model, enable_warmup=False, args=args, rank=rank)
+                
+                # 2. é‡ç½® fusion_moduleï¼ˆhook ç§»é™¤åæ‰èƒ½æ›´æ–°ï¼‰
+                reinitialize_fusion_module_for_joint_training(model, rank, smooth_alpha=args.fusion_smooth_alpha)
+                
+                # 3. é‡æ–°æ„å»ºä¼˜åŒ–å™¨ï¼ˆæ–°å‚æ•°éœ€è¦æ–°çš„ optimizer stateï¼‰
+                optimizer = build_optimizer_for_phase(model, args, rank, phase='joint')
+                scheduler, warmup_steps = build_scheduler(optimizer, args, steps_per_epoch)
+                
+                # 4. é‡æ–°åˆå§‹åŒ– EMA
+                if ema is not None:
+                    target_model = model.module if is_ddp else model
+                    ema = ModelEMA(target_model, decay=args.ema_decay)
+                
+                current_phase = 'joint'
+                
+                if is_ddp:
+                    torch.distributed.barrier()
+        
         if sampler is not None:
             sampler.set_epoch(epoch)
+        
         epoch_start = time.time()
-        avg_loss = train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epoch, args, rank, scheduler)
+        avg_loss = train_one_epoch(
+            model, dataloader, optimizer, scaler, criterion,
+            device, epoch, args, rank, scheduler, ema, phase=current_phase
+        )
         epoch_time = time.time() - epoch_start
 
         if is_main_process(rank):
-            print(f"Epoch {epoch} Íê³É | Æ½¾ùËğÊ§: {avg_loss:.4f} | ×ÜºÄÊ±: {epoch_time:.1f}s")
+            phase_tag = "WARM" if current_phase == 'warmup' else "JOINT"
+            print(f"Epoch {epoch} [{phase_tag}] å®Œæˆ | å¹³å‡æŸå¤±: {avg_loss:.4f} | è€—æ—¶: {epoch_time:.1f}s")
+            
             if (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1:
                 ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
                 torch.cuda.empty_cache()
                 save_model = model.module if is_ddp else model
-                # [¶ÔÆëµÚÒ»¸ö½Å±¾] Í¬Ê±±£´æ LoRA-only checkpoint
-                save_checkpoint_lora(save_model, optimizer, scheduler, scaler, epoch, best_loss, ckpt_path, is_main_process(rank))
-
-                # ¶îÍâ±£´æÍêÕûÄ£ĞÍ£¨ÓÃÓÚ LiDAR ÑµÁ·Á¬ĞøĞÔ£©
-                cpu_state = {k: v.cpu() for k, v in save_model.state_dict().items()}
-                full_path = ckpt_path.replace(".pt", "_full.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': cpu_state,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
-                    'best_loss': best_loss,
-                }, full_path)
-                del cpu_state
-                torch.cuda.empty_cache()
-                print(f"  -> ±£´æÍêÕûÄ£ĞÍ: {full_path}")
+                save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, ckpt_path, True, ema)
 
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 best_path = os.path.join(checkpoint_dir, "best.pt")
                 torch.cuda.empty_cache()
                 save_model = model.module if is_ddp else model
-                save_checkpoint_lora(save_model, optimizer, scheduler, scaler, epoch, best_loss, best_path, is_main_process(rank))
-
-                # ¶îÍâ±£´æÍêÕû best Ä£ĞÍ
-                cpu_state = {k: v.cpu() for k, v in save_model.state_dict().items()}
-                best_full_path = os.path.join(checkpoint_dir, "best_full.pt")
-                torch.save({
-                    'epoch': epoch,
-                    'model_state_dict': cpu_state,
-                    'optimizer_state_dict': optimizer.state_dict(),
-                    'scheduler_state_dict': scheduler.state_dict(),
-                    'scaler_state_dict': scaler.state_dict(),
-                    'best_loss': best_loss,
-                }, best_full_path)
-                del cpu_state
-                torch.cuda.empty_cache()
-                print(f"  -> ±£´æ×î¼ÑÄ£ĞÍ (loss={best_loss:.4f}): {best_path} (LoRA) / {best_full_path} (Full)")
+                save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, best_path, True, ema)
+                print(f"  -> æœ€ä½³æ¨¡å‹ (loss={best_loss:.4f}): {best_path}")
+        
         torch.cuda.empty_cache()
         torch.cuda.synchronize(device)
 
     if is_main_process(rank):
-        print("ÑµÁ·Íê³É!")
+        print("è®­ç»ƒå®Œæˆ!")
     cleanup_ddp(is_ddp)
 
 

@@ -1,14 +1,19 @@
 #!/usr/bin/env python3
-#coding=gbk
+# coding: utf-8
 """
 MapAnything LoRA Evaluation Script (Fixed)
 ==========================================
-¹Ø¼üĞŞ¸´£º
-  1. Í¼ÏñÔ¤´¦ÀíÓëÑµÁ·½Å±¾ÍêÈ«Ò»ÖÂ£¨PIL + /255 + bilinear resize£©£¬
-     ±ÜÃâ load_images ÄÚÖÃ tvf.Normalize µ¼ÖÂµÄ¶ş´Î¹éÒ»»¯¡£
-  2. LoRA È¨ÖØ¼ÓÔØ¼æÈİ lora_state_dict / model_state_dict¡£
-  3. data_norm_type Í³Ò»Îª list ¸ñÊ½¡£
-  4. Ö§³Ö --use_load_images ¿ª¹ØÓÃÓÚ¶Ô±ÈÊµÑé¡£
+å…³é”®ä¿®å¤ï¼š
+  1. å›¾åƒé¢„å¤„ç†ä¸è®­ç»ƒè„šæœ¬å®Œå…¨ä¸€è‡´ï¼ˆPIL + /255 + bilinear resizeï¼‰ï¼Œ
+     é¿å… load_images å†…ç½® tvf.Normalize å¯¼è‡´çš„äºŒæ¬¡å½’ä¸€åŒ–ã€‚
+  2. LoRA æƒé‡åŠ è½½å…¼å®¹ lora_state_dict / model_state_dictã€‚
+  3. data_norm_type ç»Ÿä¸€ä¸º list æ ¼å¼ã€‚
+  4. æ”¯æŒ --use_load_images å¼€å…³ç”¨äºå¯¹æ¯”å®éªŒã€‚
+  5. uses_torch_hub=Falseï¼ˆä¸è®­ç»ƒä¸€è‡´ï¼‰ã€‚
+  6. lora_alpha é»˜è®¤ 32.0ï¼ˆä¸è®­ç»ƒä¸€è‡´ï¼‰ã€‚
+  7. cap å»æ‰ *255 ç¼©æ”¾ï¼ˆä¸è®­ç»ƒä¸€è‡´ï¼Œå€¼åŸŸ [0,1]ï¼‰ã€‚
+  8. pcd shape ä¿®æ­£ä¸º [B, H, W, 7]ï¼ˆä¸è®­ç»ƒä¸€è‡´ï¼Œchannel-lastï¼‰ã€‚
+  9. åŠ  fusion_module æƒé‡è¯Šæ–­ã€‚
 """
 
 import os
@@ -42,7 +47,7 @@ try:
     HAS_OPENPYXL = True
 except ImportError:
     HAS_OPENPYXL = False
-    print("[¾¯¸æ] Î´°²×° openpyxl£¬xlsx µ¼³ö½«²»¿ÉÓÃ¡£ÇëÖ´ĞĞ: pip install openpyxl")
+    print("[è­¦å‘Š] æœªå®‰è£… openpyxlï¼Œxlsx å¯¼å‡ºå°†ä¸å¯ç”¨ã€‚è¯·æ‰§è¡Œ: pip install openpyxl")
 
 from mapanything.models import MapAnything
 from mapanything.utils.image import load_images
@@ -50,7 +55,7 @@ from safetensors.torch import load_file
 
 warnings.filterwarnings('ignore')
 
-# ========================= È·¶¨ĞÔÉèÖÃ =========================
+# ========================= ç¡®å®šæ€§è®¾ç½® =========================
 def setup_deterministic(seed=42):
     import random
     random.seed(seed)
@@ -59,18 +64,16 @@ def setup_deterministic(seed=42):
     torch.cuda.manual_seed_all(seed)
     torch.backends.cudnn.deterministic = True
     torch.backends.cudnn.benchmark = False
-    torch.use_deterministic_algorithms(True)
-    os.environ["CUBLAS_WORKSPACE_CONFIG"] = ":4096:8"
 
 setup_deterministic(42)
 
-# ========================= »·¾³ÉèÖÃ =========================
+# ========================= ç¯å¢ƒè®¾ç½® =========================
 os.environ["PYTORCH_CUDA_ALLOC_CONF"] = "expandable_segments:True"
 os.environ["HF_HOME"] = "/tmp/hf_cache"
 
-# ========================= LoRA (ÓëÑµÁ·½Å±¾ÖğĞĞÒ»ÖÂ) =========================
+# ========================= LoRA (ä¸è®­ç»ƒè„šæœ¬é€è¡Œä¸€è‡´) =========================
 class LinearWithLoRA(nn.Module):
-    def __init__(self, linear: nn.Linear, r: int = 8, lora_alpha: float = 2.0):
+    def __init__(self, linear: nn.Linear, r: int = 8, lora_alpha: float = 32.0):
         super().__init__()
         self.linear = linear
         self.scaling = lora_alpha / r
@@ -89,7 +92,7 @@ class LinearWithLoRA(nn.Module):
         return out.add_(lora, alpha=self.scaling)
 
 
-def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: float = 2.0):
+def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: float = 32.0):
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
             setattr(module, name, LinearWithLoRA(child, r, lora_alpha))
@@ -97,7 +100,7 @@ def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: float = 2.0
             inject_lora_to_module(child, r, lora_alpha)
 
 
-# ========================= LiDAR Ô¤´¦Àí (Óë pcd.py ÖğĞĞÒ»ÖÂ) =========================
+# ========================= LiDAR é¢„å¤„ç† (ä¸ pcd.py é€è¡Œä¸€è‡´) =========================
 def rotation_matrix_from_lookat(direction, up=np.array([0, 0, 1])):
     z_cam = direction / np.linalg.norm(direction)
     x_cam = np.cross(up, z_cam)
@@ -126,13 +129,13 @@ def compute_features_for_indices(pcd, indices, radius=0.1, max_nn=30):
         centroid = np.mean(neighbors, axis=0)
         cov = np.cov((neighbors - centroid).T)
         eigenvalues, eigenvectors = np.linalg.eigh(cov)
-        ¦Ë1, ¦Ë2, ¦Ë3 = eigenvalues
+        Î»1, Î»2, Î»3 = eigenvalues
         normals[i] = eigenvectors[:, 0]
-        total = ¦Ë1 + ¦Ë2 + ¦Ë3
-        curv[i] = ¦Ë1 / total if total > 1e-12 else 0.0
-        if ¦Ë3 > 1e-12:
-            aniso[i] = (¦Ë3 - ¦Ë2) / ¦Ë3
-            plan[i] = (¦Ë2 - ¦Ë1) / ¦Ë3
+        total = Î»1 + Î»2 + Î»3
+        curv[i] = Î»1 / total if total > 1e-12 else 0.0
+        if Î»3 > 1e-12:
+            aniso[i] = (Î»3 - Î»2) / Î»3
+            plan[i] = (Î»2 - Î»1) / Î»3
         else:
             aniso[i] = 0.0; plan[i] = 0.0
     return normals, curv, aniso, plan
@@ -229,8 +232,11 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
     else:
         depth_img[~finite] = 0.0
 
+    # ========== ä¿®å¤ï¼šå»æ‰ *255ï¼Œä¸è®­ç»ƒä¸€è‡´ï¼ˆå€¼åŸŸ [0,1]ï¼‰==========
     cap_np = np.stack([curv_img, aniso_img, plan_img], axis=-1)
-    cap_np = np.clip(cap_np * 255, 0, 255).astype(np.uint8)
+    cap_np = np.clip(cap_np, 0.0, 1.0).astype(np.float32)
+    # ============================================================
+
     depth_np = depth_img.astype(np.float32)
     normal_np = normal_img.astype(np.float32)
 
@@ -243,7 +249,7 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
         pcd_cache[pcd_idx] = result
     return result
 
-# ========================= ½¡×³ÄÚ²Î½âÎö =========================
+# ========================= å¥å£®å†…å‚è§£æ =========================
 def _parse_yaml_intrinsics(file_path):
     try:
         with open(file_path, 'r') as f:
@@ -263,7 +269,7 @@ def _parse_yaml_intrinsics(file_path):
         if len(numbers) >= 9:
             return np.array([float(num) for num in numbers[:9]]).reshape(3, 3)
     except Exception as e:
-        print(f"½âÎöYAMLÄÚ²ÎÎÄ¼şÊ§°Ü {file_path}: {e}")
+        print(f"è§£æYAMLå†…å‚æ–‡ä»¶å¤±è´¥ {file_path}: {e}")
     return None
 
 def _load_intrinsics_file(file_path):
@@ -293,11 +299,11 @@ def _load_intrinsics_file(file_path):
         return np.array(numbers[:9]).reshape(3, 3)
     return None
 
-# ========================= Ä£ĞÍ¼ÓÔØ (±£Áô FiLM/LoRA Ö§³Ö) =========================
+# ========================= æ¨¡å‹åŠ è½½ (ä¿ç•™ FiLM/LoRA æ”¯æŒ) =========================
 def build_model_for_eval(model_dir: str, device: str,
                          trained_ckpt_path: str = None,
                          use_lora: bool = False,
-                         lora_r: int = 8, lora_alpha: float = 2.0):
+                         lora_r: int = 8, lora_alpha: float = 32.0):
     config_path = os.path.join(model_dir, "config.json")
     weights_path = os.path.join(model_dir, "model.safetensors")
     with open(config_path, 'r') as f:
@@ -306,7 +312,9 @@ def build_model_for_eval(model_dir: str, device: str,
     encoder_config = config.get("encoder_config", {}).copy()
     encoder_config.pop("pretrained", None)
     encoder_config.pop("weights", None)
-    encoder_config["uses_torch_hub"] = True
+    # ========== ä¿®å¤ï¼šuses_torch_hub = Falseï¼ˆä¸è®­ç»ƒä¸€è‡´ï¼‰==========
+    encoder_config["uses_torch_hub"] = False
+    # =============================================================
 
     model = MapAnything(
         name=config.get("name", "mapanything"),
@@ -320,14 +328,14 @@ def build_model_for_eval(model_dir: str, device: str,
     )
 
     if os.path.exists(weights_path):
-        print(f"[Model] ¼ÓÔØÔ¤ÑµÁ·È¨ÖØ: {weights_path}")
+        print(f"[Model] åŠ è½½é¢„è®­ç»ƒæƒé‡: {weights_path}")
         state_dict = load_file(weights_path)
         model.load_state_dict(state_dict, strict=False)
     else:
-        print("[Model] ¾¯¸æ: Î´ÕÒµ½Ô¤ÑµÁ·È¨ÖØ")
+        print("[Model] è­¦å‘Š: æœªæ‰¾åˆ°é¢„è®­ç»ƒæƒé‡")
 
     if use_lora:
-        print(f"[Model] Ó¦ÓÃ LoRA (rank={lora_r}, alpha={lora_alpha})...")
+        print(f"[Model] åº”ç”¨ LoRA (rank={lora_r}, alpha={lora_alpha})...")
         lora_targets = []
         if hasattr(model, 'encoder') and model.encoder is not None:
             lora_targets.append(model.encoder)
@@ -344,23 +352,23 @@ def build_model_for_eval(model_dir: str, device: str,
             inject_lora_to_module(target, r=lora_r, lora_alpha=lora_alpha)
 
         lora_layer_count = sum(1 for _ in model.modules() if isinstance(_, LinearWithLoRA))
-        print(f"  -> ÒÑ×¢Èë LoRA: {lora_layer_count} ¸ö Linear ²ã (r={lora_r}, alpha={lora_alpha})")
+        print(f"  -> å·²æ³¨å…¥ LoRA: {lora_layer_count} ä¸ª Linear å±‚ (r={lora_r}, alpha={lora_alpha})")
 
         model = model.to(device)
         if trained_ckpt_path and os.path.exists(trained_ckpt_path):
-            print(f"[Model] ¼ÓÔØÑµÁ·È¨ÖØ: {trained_ckpt_path}")
+            print(f"[Model] åŠ è½½è®­ç»ƒæƒé‡: {trained_ckpt_path}")
             ckpt = torch.load(trained_ckpt_path, map_location='cpu')
-            
+
             if 'lora_state_dict' in ckpt:
                 state_dict = ckpt['lora_state_dict']
-                print(f"[Model] ¼ì²âµ½ LoRA-only checkpoint ({len(state_dict)} ¸ö²ÎÊı)")
+                print(f"[Model] æ£€æµ‹åˆ° LoRA-only checkpoint ({len(state_dict)} ä¸ªå‚æ•°)")
             elif 'model_state_dict' in ckpt:
                 state_dict = ckpt['model_state_dict']
-                print("[Model] ¼ì²âµ½ÍêÕûÄ£ĞÍ checkpoint")
+                print("[Model] æ£€æµ‹åˆ°å®Œæ•´æ¨¡å‹ checkpoint")
             else:
                 state_dict = ckpt
-                print("[Model] ¾¯¸æ: Î´Ê¶±ğ±ê×¼ key£¬³¢ÊÔÖ±½Ó¼ÓÔØÕû¸ö checkpoint")
-            
+                print("[Model] è­¦å‘Š: æœªè¯†åˆ«æ ‡å‡† keyï¼Œå°è¯•ç›´æ¥åŠ è½½æ•´ä¸ª checkpoint")
+
             new_state_dict = {}
             for k, v in state_dict.items():
                 new_k = k.replace('module.', '')
@@ -370,45 +378,62 @@ def build_model_for_eval(model_dir: str, device: str,
             ckpt_keys = set(new_state_dict.keys())
             common_keys = model_keys & ckpt_keys
             lora_common = [k for k in common_keys if 'lora_' in k]
-            print(f"[LoRA-Diag] Ä£ĞÍ LoRA ²ÎÊı×ÜÊı: {sum(1 for k in model_keys if 'lora_' in k)}")
-            print(f"[LoRA-Diag] checkpoint ÖĞ LoRA ²ÎÊı×ÜÊı: {sum(1 for k in ckpt_keys if 'lora_' in k)}")
-            print(f"[LoRA-Diag] ³É¹¦Æ¥ÅäµÄ LoRA ²ÎÊı: {len(lora_common)}")
-            
+            print(f"[LoRA-Diag] æ¨¡å‹ LoRA å‚æ•°æ€»æ•°: {sum(1 for k in model_keys if 'lora_' in k)}")
+            print(f"[LoRA-Diag] checkpoint ä¸­ LoRA å‚æ•°æ€»æ•°: {sum(1 for k in ckpt_keys if 'lora_' in k)}")
+            print(f"[LoRA-Diag] æˆåŠŸåŒ¹é…çš„ LoRA å‚æ•°: {len(lora_common)}")
+
             if lora_common:
                 sample_key = lora_common[0]
                 diff = torch.abs(model.state_dict()[sample_key].cpu() - new_state_dict[sample_key].cpu()).max().item()
-                print(f"[LoRA-Diag] ³éÑù {sample_key}: È¨ÖØ²îÒì max={diff:.6f}")
-                
+                print(f"[LoRA-Diag] æŠ½æ · {sample_key}: æƒé‡å·®å¼‚ max={diff:.6f}")
+
                 a_norms = [model.state_dict()[k].norm().item() for k in model_keys if 'lora_A' in k]
                 b_norms = [model.state_dict()[k].norm().item() for k in model_keys if 'lora_B' in k]
-                print(f"[LoRA-Diag] ¼ÓÔØÇ° LoRA_A Æ½¾ù·¶Êı: {sum(a_norms)/len(a_norms):.4f} (³õÊ¼»¯¡Ö0.01~0.02)")
-                print(f"[LoRA-Diag] ¼ÓÔØÇ° LoRA_B Æ½¾ù·¶Êı: {sum(b_norms)/len(b_norms):.4f} (³õÊ¼»¯¡Ö0.0)")
+                print(f"[LoRA-Diag] åŠ è½½å‰ LoRA_A å¹³å‡èŒƒæ•°: {sum(a_norms)/len(a_norms):.4f} (åˆå§‹åŒ–â‰ˆ0.01~0.02)")
+                print(f"[LoRA-Diag] åŠ è½½å‰ LoRA_B å¹³å‡èŒƒæ•°: {sum(b_norms)/len(b_norms):.4f} (åˆå§‹åŒ–â‰ˆ0.0)")
             else:
-                print("[LoRA-Diag] ¾¯¸æ: Î´Æ¥Åäµ½ÈÎºÎ LoRA ²ÎÊı£¡Çë¼ì²éÑµÁ·/²âÊÔ½Å±¾½á¹¹ÊÇ·ñÒ»ÖÂ¡£")
+                print("[LoRA-Diag] è­¦å‘Š: æœªåŒ¹é…åˆ°ä»»ä½• LoRA å‚æ•°ï¼è¯·æ£€æŸ¥è®­ç»ƒ/æµ‹è¯•è„šæœ¬ç»“æ„æ˜¯å¦ä¸€è‡´ã€‚")
 
             filtered_dict = {}
             for k in common_keys:
                 if new_state_dict[k].shape == model.state_dict()[k].shape:
                     filtered_dict[k] = new_state_dict[k]
                 else:
-                    print(f"[LoRA-Diag] ĞÎ×´²»Æ¥ÅäÌø¹ı: {k} | ckpt={tuple(new_state_dict[k].shape)} model={tuple(model.state_dict()[k].shape)}")
+                    print(f"[LoRA-Diag] å½¢çŠ¶ä¸åŒ¹é…è·³è¿‡: {k} | ckpt={tuple(new_state_dict[k].shape)} model={tuple(model.state_dict()[k].shape)}")
 
             missing, unexpected = model.load_state_dict(filtered_dict, strict=False)
             if missing:
-                print(f"[Model] È±Ê§ keys: {len(missing)} (º¬ LoRA {sum(1 for k in missing if 'lora_' in k)} ¸ö)")
+                print(f"[Model] ç¼ºå¤± keys: {len(missing)} (å« LoRA {sum(1 for k in missing if 'lora_' in k)} ä¸ª)")
             if unexpected:
-                print(f"[Model] ÒâÍâ keys: {len(unexpected)}")
-                
+                print(f"[Model] æ„å¤– keys: {len(unexpected)}")
+
             if lora_common:
                 a_norms_after = [model.state_dict()[k].norm().item() for k in model_keys if 'lora_A' in k]
                 b_norms_after = [model.state_dict()[k].norm().item() for k in model_keys if 'lora_B' in k]
-                print(f"[LoRA-Diag] ¼ÓÔØºó LoRA_A Æ½¾ù·¶Êı: {sum(a_norms_after)/len(a_norms_after):.4f}")
-                print(f"[LoRA-Diag] ¼ÓÔØºó LoRA_B Æ½¾ù·¶Êı: {sum(b_norms_after)/len(b_norms_after):.4f}")
-        else:
-            print("[Model] Î´Ìá¹©ÑµÁ·È¨ÖØ£¬½öÊ¹ÓÃÔ¤ÑµÁ·Ä£ĞÍ")
+                print(f"[LoRA-Diag] åŠ è½½å LoRA_A å¹³å‡èŒƒæ•°: {sum(a_norms_after)/len(a_norms_after):.4f}")
+                print(f"[LoRA-Diag] åŠ è½½å LoRA_B å¹³å‡èŒƒæ•°: {sum(b_norms_after)/len(b_norms_after):.4f}")
+
+            # ========== æ–°å¢ï¼šfusion_module æƒé‡è¯Šæ–­ ==========
+            # ========== fusion_module ???? ==========
+            with torch.no_grad():
+                fusion_module = getattr(model, "fusion_module", None)
+                if fusion_module is not None:
+                    gate_mlp = getattr(fusion_module, "gate_mlp", None)
+                    refine = getattr(fusion_module, "refine", None)
+                    if gate_mlp is not None and len(gate_mlp) >= 3:
+                        gate_bias = gate_mlp[-1].bias.mean().item()
+                        gate_weight_norm = gate_mlp[-1].weight.norm().item()
+                        print(f"[Fusion-Diag] gate_bias_mean={gate_bias:.3f}, gate_weight_norm={gate_weight_norm:.3f}")
+                    if refine is not None and hasattr(refine, "weight"):
+                        refine_norm = refine.weight.norm().item()
+                        print(f"[Fusion-Diag] refine_weight_norm={refine_norm:.3f}")
+                else:
+                    print("[Fusion-Diag] warning: fusion_module not found")
+            # ================================================
+            print("[Model] æœªæä¾›è®­ç»ƒæƒé‡ï¼Œä»…ä½¿ç”¨é¢„è®­ç»ƒæ¨¡å‹")
     else:
         if trained_ckpt_path and os.path.exists(trained_ckpt_path):
-            print(f"[Model] ¼ÓÔØÑµÁ·È¨ÖØ: {trained_ckpt_path}")
+            print(f"[Model] åŠ è½½è®­ç»ƒæƒé‡: {trained_ckpt_path}")
             ckpt = torch.load(trained_ckpt_path, map_location='cpu')
             state_dict = ckpt.get('model_state_dict', ckpt)
             new_state_dict = {}
@@ -421,26 +446,26 @@ def build_model_for_eval(model_dir: str, device: str,
     model.eval()
     return model
 
-# ========================= Êı¾İ¼ÓÔØ =========================
+# ========================= æ•°æ®åŠ è½½ =========================
 def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
                    max_images: int = None):
     rgb_dir = os.path.join(seq_root, "rgb")
     if not os.path.exists(rgb_dir):
-        raise ValueError(f"RGB Ä¿Â¼²»´æÔÚ: {rgb_dir}")
+        raise ValueError(f"RGB ç›®å½•ä¸å­˜åœ¨: {rgb_dir}")
 
     img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.webp')
     img_paths = sorted([os.path.join(rgb_dir, f) for f in os.listdir(rgb_dir)
                         if f.lower().endswith(img_exts)])
     if not img_paths:
-        raise ValueError("Î´ÕÒµ½Í¼Ïñ")
+        raise ValueError("æœªæ‰¾åˆ°å›¾åƒ")
     if max_images:
         img_paths = img_paths[:max_images]
-    print(f"[Data] Í¼Ïñ: {len(img_paths)} ÕÅ")
+    print(f"[Data] å›¾åƒ: {len(img_paths)} å¼ ")
 
     intrinsics_file = os.path.join(seq_root, "color_camera_intrinsics.txt")
     intrinsics = _load_intrinsics_file(intrinsics_file)
     if intrinsics is None:
-        print("[Data] ÄÚ²ÎÎŞ·¨½âÎö£¬Ê¹ÓÃµ¥Î»Õó")
+        print("[Data] å†…å‚æ— æ³•è§£æï¼Œä½¿ç”¨å•ä½é˜µ")
         intrinsics = np.eye(3, dtype=np.float32)
 
     tum_file = os.path.join(seq_root, "extrinsics.tum")
@@ -461,13 +486,13 @@ def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
                 T_w2c[:3, :3] = rot
                 T_w2c[:3, 3] = [tx, ty, tz]
                 gt_poses[ts] = np.linalg.inv(T_w2c)
-        print(f"[Data] ÕæÖµÎ»×Ë: {len(gt_poses)} Ö¡")
+        print(f"[Data] çœŸå€¼ä½å§¿: {len(gt_poses)} å¸§")
     else:
-        print("[Data] ¾¯¸æ: Î´ÕÒµ½ extrinsics.tum")
+        print("[Data] è­¦å‘Š: æœªæ‰¾åˆ° extrinsics.tum")
 
     gt_depths = {}
     is_part_dir = re.match(r'shuangchuang_seq\d+_(night|daytime)\d+th', os.path.basename(seq_root))
-    
+
     if is_part_dir:
         depth_dirs = [os.path.join(seq_root, "depth")]
     else:
@@ -481,7 +506,7 @@ def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
             ddir = os.path.join(part_path, "depth")
             if os.path.exists(ddir):
                 depth_dirs.append(ddir)
-    
+
     for depth_dir in depth_dirs:
         if not os.path.exists(depth_dir):
             continue
@@ -504,11 +529,11 @@ def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
                     d = d.mean(axis=2)
                 d = d / 1000.0
                 gt_depths[ts] = d
-    
+
     if gt_depths:
-        print(f"[Data] ÕæÖµÉî¶ÈÍ¼: {len(gt_depths)} ÕÅ (É¨ÃèÁË {len(depth_dirs)} ¸ö depth Ä¿Â¼)")
+        print(f"[Data] çœŸå€¼æ·±åº¦å›¾: {len(gt_depths)} å¼  (æ‰«æäº† {len(depth_dirs)} ä¸ª depth ç›®å½•)")
     else:
-        print("[Data] ¾¯¸æ: Î´ÕÒµ½ÕæÖµÉî¶ÈÍ¼£¬Éî¶ÈÆÀ²â½«Ìø¹ı")
+        print("[Data] è­¦å‘Š: æœªæ‰¾åˆ°çœŸå€¼æ·±åº¦å›¾ï¼Œæ·±åº¦è¯„æµ‹å°†è·³è¿‡")
 
     pcd_file_list = []
     pcd_timestamps = []
@@ -525,28 +550,28 @@ def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
                 else:
                     ts = int(os.path.getmtime(os.path.join(lidar_dir, f)) * 1e9)
                     pcd_timestamps.append(ts)
-            print(f"[Data] LiDAR PCD: {len(pcd_file_list)} ¸ö")
+            print(f"[Data] LiDAR PCD: {len(pcd_file_list)} ä¸ª")
         else:
-            print("[Data] ¾¯¸æ: ÆôÓÃ LiDAR µ«Î´ÕÒµ½ lidar Ä¿Â¼")
+            print("[Data] è­¦å‘Š: å¯ç”¨ LiDAR ä½†æœªæ‰¾åˆ° lidar ç›®å½•")
 
     return img_paths, intrinsics, gt_poses, gt_depths, pcd_file_list, pcd_timestamps
 
-# ========================= ¹Ø¼üĞŞ¸´£ºÊÖ¶¯Í¼Ïñ¼ÓÔØ£¨ÓëÑµÁ·Ò»ÖÂ£© =========================
+# ========================= å…³é”®ä¿®å¤ï¼šæ‰‹åŠ¨å›¾åƒåŠ è½½ï¼ˆä¸è®­ç»ƒä¸€è‡´ï¼‰ =========================
 def load_images_manual(image_paths, img_size=448, device='cuda'):
     """
-    ÓëÑµÁ·½Å±¾ SeqRGBDataset.__getitem__ ÖğĞĞÒ»ÖÂµÄÍ¼Ïñ¼ÓÔØ¡£
-    Êä³öÍ¼Ïñ·¶Î§ [0, 1]£¬ÓÉÄ£ĞÍÄÚ²¿¸ù¾İ data_norm_type='dinov2' ×ö¹éÒ»»¯¡£
+    ä¸è®­ç»ƒè„šæœ¬ SeqRGBDataset.__getitem__ é€è¡Œä¸€è‡´çš„å›¾åƒåŠ è½½ã€‚
+    è¾“å‡ºå›¾åƒèŒƒå›´ [0, 1]ï¼Œç”±æ¨¡å‹å†…éƒ¨æ ¹æ® data_norm_type='dinov2' åšå½’ä¸€åŒ–ã€‚
     """
     views = []
     for img_path in image_paths:
         img = Image.open(img_path).convert('RGB')
         img_np_color = np.array(img)
-        
-        # ÓëÑµÁ·Ò»ÖÂ£ºtranspose + /255
+
+        # ä¸è®­ç»ƒä¸€è‡´ï¼štranspose + /255
         img_np = img_np_color.transpose(2, 0, 1).astype(np.float32) / 255.0
         img_tensor = torch.from_numpy(img_np)
-        
-        # resize µ½ img_size£¨ÓëÑµÁ·Ò»ÖÂ£©
+
+        # resize åˆ° img_sizeï¼ˆä¸è®­ç»ƒä¸€è‡´ï¼‰
         if img_tensor.shape[1] != img_size or img_tensor.shape[2] != img_size:
             img_tensor = F.interpolate(
                 img_tensor.unsqueeze(0),
@@ -554,48 +579,48 @@ def load_images_manual(image_paths, img_size=448, device='cuda'):
                 mode='bilinear',
                 align_corners=False
             ).squeeze(0)
-        
-        # confidence ¼ÆËãÓëÑµÁ·Ò»ÖÂ
+
+        # confidence è®¡ç®—ä¸è®­ç»ƒä¸€è‡´
         img_gray = img_np_color.astype(np.float32).mean(axis=2) / 255.0
         mean = np.mean(img_gray)
         rms = np.sqrt(np.mean((img_gray - mean) ** 2))
         confidence = float(rms) if not np.isnan(rms) else 0.5
-        
+
         views.append({
             'img': img_tensor.unsqueeze(0).to(device),
-            'data_norm_type': ['dinov2'],  # ±ØĞëÊÇ list£¬ÓëÑµÁ·Ò»ÖÂ
+            'data_norm_type': ['dinov2'],  # å¿…é¡»æ˜¯ listï¼Œä¸è®­ç»ƒä¸€è‡´
             'confidence': torch.tensor(confidence, dtype=torch.float32, device=device),
         })
     return views
 
-# ========================= ÍÆÀí£¨Ë«Â·¾¶£ºÊÖ¶¯ / load_images£© =========================
+# ========================= æ¨ç†ï¼ˆåŒè·¯å¾„ï¼šæ‰‹åŠ¨ / load_imagesï¼‰ =========================
 def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pcd_timestamps,
                         img_size=448, view_pcd_indices=None, pcd_cache=None,
                         use_load_images=False):
     """
-    Ö§³ÖÁ½ÖÖÍ¼Ïñ¼ÓÔØÄ£Ê½£º
-      - use_load_images=False£¨Ä¬ÈÏ£©£ºÊÖ¶¯ PIL ¼ÓÔØ£¬ÓëÑµÁ·Ô¤´¦ÀíÍêÈ«Ò»ÖÂ¡£
-      - use_load_images=True£ºÊ¹ÓÃÔ­Ê¼ load_images£¨ÈôĞè¶Ô±È»ùÏß behavior£©¡£
+    æ”¯æŒä¸¤ç§å›¾åƒåŠ è½½æ¨¡å¼ï¼š
+      - use_load_images=Falseï¼ˆé»˜è®¤ï¼‰ï¼šæ‰‹åŠ¨ PIL åŠ è½½ï¼Œä¸è®­ç»ƒé¢„å¤„ç†å®Œå…¨ä¸€è‡´ã€‚
+      - use_load_images=Trueï¼šä½¿ç”¨åŸå§‹ load_imagesï¼ˆè‹¥éœ€å¯¹æ¯”åŸºçº¿ behaviorï¼‰ã€‚
     """
     target_h, target_w = img_size, img_size
-    
+
     if use_load_images:
-        # Ô­Ê¼Â·¾¶£¨±£ÁôÓÃÓÚ¶Ô±ÈÊµÑé£©
+        # åŸå§‹è·¯å¾„ï¼ˆä¿ç•™ç”¨äºå¯¹æ¯”å®éªŒï¼‰
         views = load_images(
             image_paths,
             norm_type="dinov2",
             resolution_set=518,
             patch_size=14
         )
-        # È·±£ data_norm_type Îª list
+        # ç¡®ä¿ data_norm_type ä¸º list
         for view in views:
             dnt = view.get('data_norm_type')
             if isinstance(dnt, str):
                 view['data_norm_type'] = [dnt]
             elif dnt is None:
                 view['data_norm_type'] = ['dinov2']
-        
-        # Ç¿ÖÆ resize µ½ 448
+
+        # å¼ºåˆ¶ resize åˆ° 448
         orig_h, orig_w = views[0]['img'].shape[2:4]
         if orig_h != target_h or orig_w != target_w:
             for view in views:
@@ -604,12 +629,12 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
                     mode='bilinear', align_corners=False
                 )
     else:
-        # ĞŞ¸´Â·¾¶£ºÓëÑµÁ·Ò»ÖÂ
+        # ä¿®å¤è·¯å¾„ï¼šä¸è®­ç»ƒä¸€è‡´
         views = load_images_manual(image_paths, img_size=img_size, device=device)
-    
+
     B = views[0]['img'].shape[0]
-    
-    # confidence ²¹³ä£¨ÊÖ¶¯¼ÓÔØÊ±ÒÑ¼ÆËã£¬load_images Ä£Ê½Ğè²¹³ä£©
+
+    # confidence è¡¥å……ï¼ˆæ‰‹åŠ¨åŠ è½½æ—¶å·²è®¡ç®—ï¼Œload_images æ¨¡å¼éœ€è¡¥å……ï¼‰
     for i, view in enumerate(views):
         if 'confidence' not in view:
             try:
@@ -624,8 +649,8 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
             except Exception:
                 confidence = 0.5
             view['confidence'] = torch.tensor(confidence, dtype=torch.float32, device=device)
-    
-    # ´¦Àí¼¤¹âÀ×´ïÊı¾İ£¨Èç¹ûÆôÓÃ£©
+
+    # å¤„ç†æ¿€å…‰é›·è¾¾æ•°æ®ï¼ˆå¦‚æœå¯ç”¨ï¼‰
     if use_lidar:
         needed_pcd_idxs = set(view_pcd_indices)
         pcd_features = {}
@@ -634,50 +659,31 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
             feat_dict = get_pcd_features(pcd_file_list[idx], device=device,
                                          pcd_cache=pcd_cache, pcd_idx=idx)
 
-            cap = feat_dict['cap'].to(dtype=torch.float32)
-            if cap.dim() == 3 and cap.shape[-1] == 3:
-                cap = cap.permute(2, 0, 1)
-            elif cap.dim() == 3 and cap.shape[0] == 3:
-                pass
-            else:
-                raise ValueError(f"Unexpected cap shape: {cap.shape} for idx {idx}")
-            cap_resized = F.interpolate(
-                cap.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False
-            ).squeeze(0)
+            # ========== ä¿®å¤ï¼šå…ˆ cat ä¸º (H,W,7)ï¼Œå†ç»Ÿä¸€ resizeï¼Œä¸è®­ç»ƒä¸€è‡´ ==========
+            cap = feat_dict['cap'].to(dtype=torch.float32)       # (H, W, 3)
+            depth = feat_dict['depth'].to(dtype=torch.float32)   # (H, W)
+            normal = feat_dict['normal'].to(dtype=torch.float32) # (H, W, 3)
 
-            depth = feat_dict['depth'].to(dtype=torch.float32)
-            if depth.dim() == 2:
-                depth = depth.unsqueeze(0)
-            elif depth.dim() == 3 and depth.shape[-1] == 1:
-                depth = depth.squeeze(-1).unsqueeze(0)
-            elif depth.dim() == 3 and depth.shape[0] == 1:
-                pass
-            else:
-                raise ValueError(f"Unexpected depth shape: {depth.shape} for idx {idx}")
-            depth_resized = F.interpolate(
-                depth.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False
-            ).squeeze(0)
+            depth = depth.unsqueeze(-1)                           # (H, W, 1)
+            pcd_7ch = torch.cat([cap, depth, normal], dim=-1)     # (H, W, 7)
 
-            normal = feat_dict['normal'].to(dtype=torch.float32)
-            if normal.dim() == 3 and normal.shape[-1] == 3:
-                normal = normal.permute(2, 0, 1)
-            elif normal.dim() == 3 and normal.shape[0] == 3:
-                pass
-            else:
-                raise ValueError(f"Unexpected normal shape: {normal.shape} for idx {idx}")
-            normal_resized = F.interpolate(
-                normal.unsqueeze(0), size=(target_h, target_w), mode='bilinear', align_corners=False
-            ).squeeze(0)
-
-            pcd_7ch = torch.cat([cap_resized, depth_resized, normal_resized], dim=0)
-            pcd_features[idx] = pcd_7ch.unsqueeze(0)
+            # resizeï¼šå…ˆè½¬æˆ (1,7,H,W) ä»¥ä¾¿ interpolateï¼Œå†è½¬å› (H,W,7)
+            pcd_7ch = pcd_7ch.permute(2, 0, 1).unsqueeze(0)       # (1, 7, H, W)
+            pcd_7ch = F.interpolate(
+                pcd_7ch, size=(target_h, target_w),
+                mode='bilinear', align_corners=False
+            )
+            pcd_7ch = pcd_7ch.squeeze(0).permute(1, 2, 0)         # (H, W, 7)
+            pcd_features[idx] = pcd_7ch.unsqueeze(0)              # (1, H, W, 7)
+            # =====================================================================
 
         for view, pcd_idx in zip(views, view_pcd_indices):
             if pcd_idx not in pcd_features:
                 raise KeyError(f"PCD index {pcd_idx} not found in pcd_features")
+            # æ‰©å±• batch ç»´åº¦ï¼Œæœ€ç»ˆ shape (B, H, W, 7)
             view['pcd'] = pcd_features[pcd_idx].expand(B, -1, -1, -1).contiguous()
 
-    # Í³Ò»ËùÓĞÕÅÁ¿µ½Í¬Ò»Éè±¸
+    # ç»Ÿä¸€æ‰€æœ‰å¼ é‡åˆ°åŒä¸€è®¾å¤‡
     dev = torch.device(device)
     for view in views:
         for key, value in list(view.items()):
@@ -686,14 +692,17 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
             elif isinstance(value, (list, tuple)) and any(isinstance(v, torch.Tensor) for v in value):
                 view[key] = [v.to(dev, dtype=torch.float32) if isinstance(v, torch.Tensor) else v for v in value]
 
-    # µ÷ÊÔ´òÓ¡£¨Ê×´Î batch Ê±£©
+    # è°ƒè¯•æ‰“å°ï¼ˆé¦–æ¬¡ batch æ—¶ï¼‰
     if not hasattr(run_inference_batch, '_printed'):
         img = views[0]['img']
         print(f"[Debug-Input] img shape: {img.shape}, "
               f"min={img.min():.3f}, max={img.max():.3f}, mean={img.mean():.3f}, "
               f"data_norm_type: {views[0].get('data_norm_type')}")
+        if 'pcd' in views[0]:
+            print(f"[Debug-Input] pcd shape: {views[0]['pcd'].shape}, "
+                  f"min={views[0]['pcd'].min():.3f}, max={views[0]['pcd'].max():.3f}")
         run_inference_batch._printed = True
-    
+
     try:
         with torch.no_grad():
             predictions = model.infer(
@@ -709,10 +718,12 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
             )
         return predictions, views
     except Exception as e:
-        print(f"Åú´Î´¦ÀíÊ§°Ü: {e}")
+        print(f"æ‰¹æ¬¡å¤„ç†å¤±è´¥: {e}")
+        import traceback
+        traceback.print_exc()
         return None, None
 
-# ========================= Êä³öÌáÈ¡ =========================
+# ========================= è¾“å‡ºæå– =========================
 def extract_batch_outputs(predictions, image_paths, views):
     if predictions is None:
         return []
@@ -739,7 +750,7 @@ def extract_batch_outputs(predictions, image_paths, views):
         batch_outputs.append(output)
     return batch_outputs
 
-# ========================= È«¾Ö SE(3) ¶ÔÆë¹¤¾ß =========================
+# ========================= å…¨å±€ SE(3) å¯¹é½å·¥å…· =========================
 def align_trajectory_SE3(pred_poses, gt_poses):
     pred_trans = np.array([p[:3, 3] for p in pred_poses])
     gt_trans = np.array([p[:3, 3] for p in gt_poses])
@@ -768,11 +779,11 @@ def align_trajectory_SE3(pred_poses, gt_poses):
 
     return aligned_poses
 
-# ========================= ÆÀ²â =========================
+# ========================= è¯„æµ‹ =========================
 def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics, output_dir,
                                  use_lora, use_lidar, dataset_id):
     if not predictions or not gt_poses:
-        print("[Eval] ÎŞÔ¤²â½á¹û»òÕæÖµ£¬Ìø¹ıÆÀ²â")
+        print("[Eval] æ— é¢„æµ‹ç»“æœæˆ–çœŸå€¼ï¼Œè·³è¿‡è¯„æµ‹")
         return None
 
     def ts_from_file(f):
@@ -815,17 +826,17 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         })
 
     if len(matched_frames) < 2:
-        print("[Eval] ÓĞĞ§Ö¡²»×ã 2£¬ÎŞ·¨¼ÆËã RPE/ATE")
+        print("[Eval] æœ‰æ•ˆå¸§ä¸è¶³ 2ï¼Œæ— æ³•è®¡ç®— RPE/ATE")
         return None
 
-    print(f"[Eval] ÕÒµ½ {len(matched_frames)} Ö¡ÓÃÓÚÆÀ²â")
+    print(f"[Eval] æ‰¾åˆ° {len(matched_frames)} å¸§ç”¨äºè¯„æµ‹")
     matched_frames.sort(key=lambda x: x['pred_ts'])
 
     pred_poses_raw = [m['pred_pose'] for m in matched_frames]
     gt_poses_raw = [m['gt_pose'] for m in matched_frames]
 
-    print(f"[Eval-Diag] µÚÒ»Ö¡ GT Î»×ËÆ½ÒÆ: {gt_poses_raw[0][:3, 3]}, Ğı×ªĞĞÁĞÊ½: {np.linalg.det(gt_poses_raw[0][:3, :3]):.3f}")
-    print(f"[Eval-Diag] µÚÒ»Ö¡ Pred Î»×ËÆ½ÒÆ: {pred_poses_raw[0][:3, 3]}, Ğı×ªĞĞÁĞÊ½: {np.linalg.det(pred_poses_raw[0][:3, :3]):.3f}")
+    print(f"[Eval-Diag] ç¬¬ä¸€å¸§ GT ä½å§¿å¹³ç§»: {gt_poses_raw[0][:3, 3]}, æ—‹è½¬è¡Œåˆ—å¼: {np.linalg.det(gt_poses_raw[0][:3, :3]):.3f}")
+    print(f"[Eval-Diag] ç¬¬ä¸€å¸§ Pred ä½å§¿å¹³ç§»: {pred_poses_raw[0][:3, 3]}, æ—‹è½¬è¡Œåˆ—å¼: {np.linalg.det(pred_poses_raw[0][:3, :3]):.3f}")
 
     pred_poses_aligned = align_trajectory_SE3(pred_poses_raw, gt_poses_raw)
 
@@ -855,7 +866,7 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
     for i in range(len(pred_poses_aligned) - 1):
         pred_rel = np.linalg.inv(pred_poses_aligned[i]) @ pred_poses_aligned[i + 1]
         gt_rel = np.linalg.inv(gt_poses_raw[i]) @ gt_poses_raw[i + 1]
-        
+
         trans_err = np.linalg.norm(pred_rel[:3, 3] - gt_rel[:3, 3])
         rpe_trans_errors.append(trans_err)
 
@@ -867,11 +878,13 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         rot_err = np.arccos(cos_angle) * 180 / np.pi
         rpe_rot_errors.append(rot_err)
 
+    # ========== RRA æŒ‡æ ‡ï¼ˆä¸æ—§ç‰ˆå®Œå…¨ä¸€è‡´ï¼Œå¸¦ deg åç¼€ï¼‰==========
     rra_thresholds = [0.5, 1.0, 1.5]
     rra_results = {}
     for tau in rra_thresholds:
         rra = np.mean(np.array(rpe_rot_errors) < tau) * 100
         rra_results[tau] = rra
+    # ==========================================================
 
     rta_thresholds = [0.1, 0.2, 0.3, 0.5]
     rta_results = {}
@@ -884,29 +897,29 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
     depth_match_count = 0
     if gt_depths and gt_intrinsics is not None:
         depth_timestamps = np.array(sorted(gt_depths.keys()), dtype=np.int64)
-        
+
         for m in matched_frames:
             pred_d = m.get('depth_z')
             if pred_d is None:
                 continue
-            
+
             img_ts_raw = int(round(m['pred_ts'] * 1e9))
-            
+
             if len(depth_timestamps) == 0:
                 continue
-            
+
             idx = np.argmin(np.abs(depth_timestamps - img_ts_raw))
             best_ts = int(depth_timestamps[idx])
             diff = abs(best_ts - img_ts_raw)
-            
+
             tolerance_ns = 5e7
-            
+
             if diff > tolerance_ns:
                 continue
-            
+
             gt_d = gt_depths[best_ts]
             depth_match_count += 1
-            
+
             if pred_d.shape[:2] != gt_d.shape[:2]:
                 import cv2
                 pred_d = cv2.resize(pred_d, (gt_d.shape[1], gt_d.shape[0]),
@@ -920,7 +933,7 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
             depth_rels.append(np.mean(rel_valid))
             depth_taus.append(np.mean(rel_valid < 0.0103) * 100)
 
-        print(f"[Eval] Éî¶ÈÍ¼Æ¥Åä³É¹¦: {depth_match_count} / {len(matched_frames)} Ö¡")
+        print(f"[Eval] æ·±åº¦å›¾åŒ¹é…æˆåŠŸ: {depth_match_count} / {len(matched_frames)} å¸§")
 
     ray_errs = []
     for m in matched_frames:
@@ -941,6 +954,7 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         angle = np.arccos(dot) * 180 / np.pi
         ray_errs.append(np.mean(angle))
 
+    # ========== stats dict key ä¸æ—§ç‰ˆå®Œå…¨ä¸€è‡´ï¼ˆå¸¦ deg åç¼€ï¼‰==========
     stats = {
         'num_frames': len(matched_frames),
         'ate_rmse': float(ate),
@@ -966,55 +980,58 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         'ray_error_mean': float(np.mean(ray_errs)) if ray_errs else None,
         'ray_error_std': float(np.std(ray_errs)) if ray_errs else None,
     }
+    # =================================================================
 
-    print("\nÂÛÎÄÆÀ²â½á¹û:")
-    print(f"  ATE RMSE (È«¾Ö¶ÔÆë): {stats['ate_rmse']:.4f} m")
-    print(f"  RRA@0.5¡ã (RPE-based): {stats['rra_0.5deg']:.2f} %")
-    print(f"  RRA@1.0¡ã (RPE-based): {stats['rra_1.0deg']:.2f} %")
-    print(f"  RRA@1.5¡ã (RPE-based): {stats['rra_1.5deg']:.2f} %")
+    # ========== æ‰“å°è¾“å‡ºä¸æ—§ç‰ˆå®Œå…¨ä¸€è‡´ï¼ˆå¸¦ Â° ç¬¦å·ï¼‰==========
+    print("\nè®ºæ–‡è¯„æµ‹ç»“æœ:")
+    print(f"  ATE RMSE (å…¨å±€å¯¹é½): {stats['ate_rmse']:.4f} m")
+    print(f"  RRA@0.5Â° (RPE-based): {stats['rra_0.5deg']:.2f} %")
+    print(f"  RRA@1.0Â° (RPE-based): {stats['rra_1.0deg']:.2f} %")
+    print(f"  RRA@1.5Â° (RPE-based): {stats['rra_1.5deg']:.2f} %")
     print(f"  RTA@0.1m (RPE-based): {stats['rta_0.1m']:.2f} %")
     print(f"  RTA@0.2m (RPE-based): {stats['rta_0.2m']:.2f} %")
     print(f"  RTA@0.3m (RPE-based): {stats['rta_0.3m']:.2f} %")
     print(f"  RTA@0.5m (RPE-based): {stats['rta_0.5m']:.2f} %")
-    print(f"  ¾ø¶ÔĞı×ªÎó²î (²Î¿¼): ¾ùÖµ = {stats['abs_rot_error_mean']:.2f}¡ã, ±ê×¼²î = {stats['abs_rot_error_std']:.2f}¡ã")
-    print(f"  ¾ø¶ÔÆ½ÒÆÎó²î (²Î¿¼): ¾ùÖµ = {stats['abs_trans_error_mean']:.4f} m, ±ê×¼²î = {stats['abs_trans_error_std']:.4f} m")
+    print(f"  ç»å¯¹æ—‹è½¬è¯¯å·® (å‚è€ƒ): å‡å€¼ = {stats['abs_rot_error_mean']:.2f}Â°, æ ‡å‡†å·® = {stats['abs_rot_error_std']:.2f}Â°")
+    print(f"  ç»å¯¹å¹³ç§»è¯¯å·® (å‚è€ƒ): å‡å€¼ = {stats['abs_trans_error_mean']:.4f} m, æ ‡å‡†å·® = {stats['abs_trans_error_std']:.4f} m")
     if rpe_trans_errors:
-        print(f"  RPE trans: ¾ùÖµ = {stats['rpe_trans_mean']:.4f} m, ±ê×¼²î = {stats['rpe_trans_std']:.4f} m")
-        print(f"  RPE rot: ¾ùÖµ = {stats['rpe_rot_mean']:.2f}¡ã, ±ê×¼²î = {stats['rpe_rot_std']:.2f}¡ã")
+        print(f"  RPE trans: å‡å€¼ = {stats['rpe_trans_mean']:.4f} m, æ ‡å‡†å·® = {stats['rpe_trans_std']:.4f} m")
+        print(f"  RPE rot: å‡å€¼ = {stats['rpe_rot_mean']:.2f}Â°, æ ‡å‡†å·® = {stats['rpe_rot_std']:.2f}Â°")
     if depth_rels:
-        print(f"  Depth rel: {stats['depth_rel_mean']:.4f} ¡À {stats['depth_rel_std']:.4f}")
-        print(f"  Depth ¦Ó: {stats['depth_tau_mean']:.2f} ¡À {stats['depth_tau_std']:.2f} %")
+        print(f"  Depth rel: {stats['depth_rel_mean']:.4f} Â± {stats['depth_rel_std']:.4f}")
+        print(f"  Depth Ï„: {stats['depth_tau_mean']:.2f} Â± {stats['depth_tau_std']:.2f} %")
     else:
-        print(f"  Depth: Î´¼ÆËã£¨Æ¥ÅäÊ§°Ü 0 Ö¡£¬¼ì²éÊ±¼ä´Áµ¥Î»£©")
+        print(f"  Depth: æœªè®¡ç®—ï¼ˆåŒ¹é…å¤±è´¥ 0 å¸§ï¼Œæ£€æŸ¥æ—¶é—´æˆ³å•ä½ï¼‰")
     if ray_errs:
-        print(f"  Ray error: {stats['ray_error_mean']:.2f} ¡À {stats['ray_error_std']:.2f} deg")
+        print(f"  Ray error: {stats['ray_error_mean']:.2f} Â± {stats['ray_error_std']:.2f} deg")
+    # =========================================================
 
     os.makedirs(output_dir, exist_ok=True)
     result_path = os.path.join(output_dir, f"{use_lora}_{use_lidar}_{dataset_id}_evaluation_results.json")
     with open(result_path, 'w') as f:
         json.dump(stats, f, indent=2)
-    print(f"[Eval] ½á¹ûÒÑ±£´æ: {result_path}")
+    print(f"[Eval] ç»“æœå·²ä¿å­˜: {result_path}")
     return stats
 
-# ========================= Êı¾İ¼¯ ID ½âÎö =========================
+# ========================= æ•°æ®é›† ID è§£æ =========================
 def parse_dataset_id(seq_root: str) -> str:
     basename = os.path.basename(seq_root)
     m = re.search(r'seq(\d+)_(?:night|daytime)(\d+)th', basename)
     if m:
         return f"{m.group(1)}_{m.group(2)}"
-    
+
     parent = os.path.basename(os.path.dirname(seq_root))
     m2 = re.search(r'seq(\d+)', parent)
     m3 = re.search(r'(?:night|daytime)(\d+)th', basename)
     if m2 and m3:
         return f"{m2.group(1)}_{m3.group(2)}"
-    
+
     return "unknown"
 
-# ========================= xlsx µ¼³ö =========================
+# ========================= xlsx å¯¼å‡º =========================
 def save_results_to_xlsx(stats: dict, output_dir: str, use_lora: int, use_lidar: int, dataset_id: str):
     if not HAS_OPENPYXL:
-        print("[xlsx] openpyxl Î´°²×°£¬Ìø¹ı xlsx µ¼³ö")
+        print("[xlsx] openpyxl æœªå®‰è£…ï¼Œè·³è¿‡ xlsx å¯¼å‡º")
         return
 
     filename = f"{use_lora}_{use_lidar}_{dataset_id}.xlsx"
@@ -1036,31 +1053,33 @@ def save_results_to_xlsx(stats: dict, output_dir: str, use_lora: int, use_lidar:
         cell.fill = header_fill
         cell.alignment = header_align
 
+    # ========== æŒ‡æ ‡åç§°ä¸æ—§ç‰ˆå®Œå…¨ä¸€è‡´ï¼ˆå¸¦ deg åç¼€ï¼‰==========
     rows = [
-        ("ATE_RMSE", stats.get('ate_rmse'), "m", "È«¾Ö SE(3) ¶ÔÆëºóµÄ¹ì¼£ RMSE"),
-        ("RRA@0.5¡ã", stats.get('rra_0.5deg'), "%", "RPE Ïà¶ÔĞı×ªÎó²î < 0.5¡ã µÄ±ÈÀı"),
-        ("RRA@1.0¡ã", stats.get('rra_1.0deg'), "%", "RPE Ïà¶ÔĞı×ªÎó²î < 1.0¡ã µÄ±ÈÀı"),
-        ("RRA@1.5¡ã", stats.get('rra_1.5deg'), "%", "RPE Ïà¶ÔĞı×ªÎó²î < 1.5¡ã µÄ±ÈÀı"),
-        ("RTA@0.1m", stats.get('rta_0.1m'), "%", "RPE Ïà¶ÔÆ½ÒÆÎó²î < 0.1m µÄ±ÈÀı"),
-        ("RTA@0.2m", stats.get('rta_0.2m'), "%", "RPE Ïà¶ÔÆ½ÒÆÎó²î < 0.2m µÄ±ÈÀı"),
-        ("RTA@0.3m", stats.get('rta_0.3m'), "%", "RPE Ïà¶ÔÆ½ÒÆÎó²î < 0.3m µÄ±ÈÀı"),
-        ("RTA@0.5m", stats.get('rta_0.5m'), "%", "RPE Ïà¶ÔÆ½ÒÆÎó²î < 0.5m µÄ±ÈÀı"),
-        ("Abs_Rot_Mean", stats.get('abs_rot_error_mean'), "deg", "¾ø¶ÔĞı×ªÎó²î¾ùÖµ£¨²Î¿¼£©"),
-        ("Abs_Rot_Std", stats.get('abs_rot_error_std'), "deg", "¾ø¶ÔĞı×ªÎó²î±ê×¼²î"),
-        ("Abs_Trans_Mean", stats.get('abs_trans_error_mean'), "m", "¾ø¶ÔÆ½ÒÆÎó²î¾ùÖµ"),
-        ("Abs_Trans_Std", stats.get('abs_trans_error_std'), "m", "¾ø¶ÔÆ½ÒÆÎó²î±ê×¼²î"),
-        ("RPE_Trans_Mean", stats.get('rpe_trans_mean'), "m", "RPE Æ½ÒÆÎó²î¾ùÖµ"),
-        ("RPE_Trans_Std", stats.get('rpe_trans_std'), "m", "RPE Æ½ÒÆÎó²î±ê×¼²î"),
-        ("RPE_Rot_Mean", stats.get('rpe_rot_mean'), "deg", "RPE Ğı×ªÎó²î¾ùÖµ"),
-        ("RPE_Rot_Std", stats.get('rpe_rot_std'), "deg", "RPE Ğı×ªÎó²î±ê×¼²î"),
-        ("Depth_Rel_Mean", stats.get('depth_rel_mean'), "-", "Ïà¶ÔÉî¶ÈÎó²î¾ùÖµ"),
-        ("Depth_Rel_Std", stats.get('depth_rel_std'), "-", "Ïà¶ÔÉî¶ÈÎó²î±ê×¼²î"),
-        ("Depth_Tau_Mean", stats.get('depth_tau_mean'), "%", "Éî¶È ¦Ó ãĞÖµÍ¨¹ıÂÊ"),
-        ("Depth_Tau_Std", stats.get('depth_tau_std'), "%", "Éî¶È ¦Ó ãĞÖµÍ¨¹ıÂÊ±ê×¼²î"),
-        ("Ray_Error_Mean", stats.get('ray_error_mean'), "deg", "ÉäÏß·½ÏòÎó²î¾ùÖµ"),
-        ("Ray_Error_Std", stats.get('ray_error_std'), "deg", "ÉäÏß·½ÏòÎó²î±ê×¼²î"),
-        ("Num_Frames", stats.get('num_frames'), "-", "²ÎÓëÆÀ²âµÄÓĞĞ§Ö¡Êı"),
+        ("ATE_RMSE", stats.get('ate_rmse'), "m", "å…¨å±€ SE(3) å¯¹é½åçš„è½¨è¿¹ RMSE"),
+        ("RRA@0.5Â°", stats.get('rra_0.5deg'), "%", "RPE ç›¸å¯¹æ—‹è½¬è¯¯å·® < 0.5Â° çš„æ¯”ä¾‹"),
+        ("RRA@1.0Â°", stats.get('rra_1.0deg'), "%", "RPE ç›¸å¯¹æ—‹è½¬è¯¯å·® < 1.0Â° çš„æ¯”ä¾‹"),
+        ("RRA@1.5Â°", stats.get('rra_1.5deg'), "%", "RPE ç›¸å¯¹æ—‹è½¬è¯¯å·® < 1.5Â° çš„æ¯”ä¾‹"),
+        ("RTA@0.1m", stats.get('rta_0.1m'), "%", "RPE ç›¸å¯¹å¹³ç§»è¯¯å·® < 0.1m çš„æ¯”ä¾‹"),
+        ("RTA@0.2m", stats.get('rta_0.2m'), "%", "RPE ç›¸å¯¹å¹³ç§»è¯¯å·® < 0.2m çš„æ¯”ä¾‹"),
+        ("RTA@0.3m", stats.get('rta_0.3m'), "%", "RPE ç›¸å¯¹å¹³ç§»è¯¯å·® < 0.3m çš„æ¯”ä¾‹"),
+        ("RTA@0.5m", stats.get('rta_0.5m'), "%", "RPE ç›¸å¯¹å¹³ç§»è¯¯å·® < 0.5m çš„æ¯”ä¾‹"),
+        ("Abs_Rot_Mean", stats.get('abs_rot_error_mean'), "deg", "ç»å¯¹æ—‹è½¬è¯¯å·®å‡å€¼ï¼ˆå‚è€ƒï¼‰"),
+        ("Abs_Rot_Std", stats.get('abs_rot_error_std'), "deg", "ç»å¯¹æ—‹è½¬è¯¯å·®æ ‡å‡†å·®"),
+        ("Abs_Trans_Mean", stats.get('abs_trans_error_mean'), "m", "ç»å¯¹å¹³ç§»è¯¯å·®å‡å€¼"),
+        ("Abs_Trans_Std", stats.get('abs_trans_error_std'), "m", "ç»å¯¹å¹³ç§»è¯¯å·®æ ‡å‡†å·®"),
+        ("RPE_Trans_Mean", stats.get('rpe_trans_mean'), "m", "RPE å¹³ç§»è¯¯å·®å‡å€¼"),
+        ("RPE_Trans_Std", stats.get('rpe_trans_std'), "m", "RPE å¹³ç§»è¯¯å·®æ ‡å‡†å·®"),
+        ("RPE_Rot_Mean", stats.get('rpe_rot_mean'), "deg", "RPE æ—‹è½¬è¯¯å·®å‡å€¼"),
+        ("RPE_Rot_Std", stats.get('rpe_rot_std'), "deg", "RPE æ—‹è½¬è¯¯å·®æ ‡å‡†å·®"),
+        ("Depth_Rel_Mean", stats.get('depth_rel_mean'), "-", "ç›¸å¯¹æ·±åº¦è¯¯å·®å‡å€¼"),
+        ("Depth_Rel_Std", stats.get('depth_rel_std'), "-", "ç›¸å¯¹æ·±åº¦è¯¯å·®æ ‡å‡†å·®"),
+        ("Depth_Tau_Mean", stats.get('depth_tau_mean'), "%", "æ·±åº¦ Ï„ é˜ˆå€¼é€šè¿‡ç‡"),
+        ("Depth_Tau_Std", stats.get('depth_tau_std'), "%", "æ·±åº¦ Ï„ é˜ˆå€¼é€šè¿‡ç‡æ ‡å‡†å·®"),
+        ("Ray_Error_Mean", stats.get('ray_error_mean'), "deg", "å°„çº¿æ–¹å‘è¯¯å·®å‡å€¼"),
+        ("Ray_Error_Std", stats.get('ray_error_std'), "deg", "å°„çº¿æ–¹å‘è¯¯å·®æ ‡å‡†å·®"),
+        ("Num_Frames", stats.get('num_frames'), "-", "å‚ä¸è¯„æµ‹çš„æœ‰æ•ˆå¸§æ•°"),
     ]
+    # ==========================================================
 
     for metric, value, unit, desc in rows:
         if value is None:
@@ -1083,26 +1102,26 @@ def save_results_to_xlsx(stats: dict, output_dir: str, use_lora: int, use_lidar:
     ws.freeze_panes = 'A2'
 
     wb.save(filepath)
-    print(f"[xlsx] ½á¹ûÒÑ±£´æ: {filepath}")
+    print(f"[xlsx] ç»“æœå·²ä¿å­˜: {filepath}")
 
-# ========================= Ö÷º¯Êı =========================
+# ========================= ä¸»å‡½æ•° =========================
 def main():
     parser = argparse.ArgumentParser(description="MapAnything LoRA Evaluation (Fixed)")
-    parser.add_argument("--seq_root", type=str, default="/add02/users/xuyh/seq1/shuangchuang_seq1_night2th")
+    parser.add_argument("--seq_root", type=str, default="/add02/users/xuyh/seq2/shuangchuang_seq2_night1th")
     parser.add_argument("--model_dir", type=str, default="/home/xuyh/mapanything/")
-    parser.add_argument("--trained_ckpt", type=str, default="/add02/users/xuyh/checkpoints/lora/checkpoints/best.pt")
-    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/mapanything/final_output/")
-    parser.add_argument("--use_lidar", type=int, default=0)
-    parser.add_argument("--use_lora", type=int, default=0)
-    parser.add_argument("--lora_r", type=int, default=16)
-    parser.add_argument("--lora_alpha", type=float, default=16.0)
+    parser.add_argument("--trained_ckpt", type=str, default="/add02/users/xuyh/checkpoints/32_lora_lidar/checkpoints/epoch_009_full.pt")
+    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/mapanything/output/")
+    parser.add_argument("--use_lidar", type=int, default=1)
+    parser.add_argument("--use_lora", type=int, default=1)
+    parser.add_argument("--lora_r", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=float, default=32.0)
     parser.add_argument("--batch_size", type=int, default=4, 
-                        help="²âÊÔÊ±Ã¿´ÎÊäÈëÄ£ĞÍµÄÊÓÍ¼Êı¡£×¢Òâ£ºÈô use_lora=1 ÇÒ info_sharing ±» LoRA£¬½¨ÒéÉèÎªÑµÁ·Ê±µÄ seq_len(4)")
+                        help="æµ‹è¯•æ—¶æ¯æ¬¡è¾“å…¥æ¨¡å‹çš„è§†å›¾æ•°ã€‚æ³¨æ„ï¼šè‹¥ use_lora=1 ä¸” info_sharing è¢« LoRAï¼Œå»ºè®®è®¾ä¸ºè®­ç»ƒæ—¶çš„ seq_len(4)")
     parser.add_argument("--img_size", type=int, default=448)
     parser.add_argument("--max_images", type=int, default=None)
-    parser.add_argument("--gpu", type=int, default=5)
+    parser.add_argument("--gpu", type=int, default=3)
     parser.add_argument("--use_load_images", action="store_true", default=False,
-                        help="Ê¹ÓÃÔ­Ê¼ load_images£¨»áÏÈ×ö DINOv2 ¹éÒ»»¯£©¡£Ä¬ÈÏÊ¹ÓÃÊÖ¶¯¼ÓÔØ£¨ÓëÑµÁ·Ò»ÖÂ£©¡£")
+                        help="ä½¿ç”¨åŸå§‹ load_imagesï¼ˆä¼šå…ˆåš DINOv2 å½’ä¸€åŒ–ï¼‰ã€‚é»˜è®¤ä½¿ç”¨æ‰‹åŠ¨åŠ è½½ï¼ˆä¸è®­ç»ƒä¸€è‡´ï¼‰ã€‚")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -1110,10 +1129,10 @@ def main():
     torch.backends.cudnn.benchmark = False
 
     dataset_id = parse_dataset_id(args.seq_root)
-    print(f"[Info] Êı¾İ¼¯±êÊ¶: {dataset_id}")
-    print(f"[Info] Í¼Ïñ¼ÓÔØÄ£Ê½: {'load_images (Ô­Ê¼)' if args.use_load_images else 'manual (ÓëÑµÁ·Ò»ÖÂ)'}")
+    print(f"[Info] æ•°æ®é›†æ ‡è¯†: {dataset_id}")
+    print(f"[Info] å›¾åƒåŠ è½½æ¨¡å¼: {'load_images (åŸå§‹)' if args.use_load_images else 'manual (ä¸è®­ç»ƒä¸€è‡´)'}")
 
-    print("\n[1/4] ¼ÓÔØÄ£ĞÍ...")
+    print("\n[1/4] åŠ è½½æ¨¡å‹...")
     model = build_model_for_eval(
         args.model_dir, device,
         trained_ckpt_path=args.trained_ckpt if args.trained_ckpt else None,
@@ -1122,14 +1141,14 @@ def main():
         lora_alpha=args.lora_alpha
     )
 
-    print("\n[2/4] ¼ÓÔØÊı¾İ...")
+    print("\n[2/4] åŠ è½½æ•°æ®...")
     img_paths, intrinsics, gt_poses, gt_depths, pcd_file_list, pcd_timestamps = load_eval_data(
         args.seq_root, img_size=args.img_size,
         use_lidar=bool(args.use_lidar),
         max_images=args.max_images
     )
 
-    print("\n[3/4] ¿ªÊ¼ÍÆÀí...")
+    print("\n[3/4] å¼€å§‹æ¨ç†...")
     t0 = time.time()
     all_predictions = []
     num_batches = (len(img_paths) + args.batch_size - 1) // args.batch_size
@@ -1138,7 +1157,7 @@ def main():
 
     for b in range(num_batches):
         batch_paths = img_paths[b * args.batch_size:(b + 1) * args.batch_size]
-        print(f"[Infer] Batch {b+1}/{num_batches}: {len(batch_paths)} ÕÅÍ¼Ïñ")
+        print(f"[Infer] Batch {b+1}/{num_batches}: {len(batch_paths)} å¼ å›¾åƒ")
 
         view_pcd_indices = []
         if args.use_lidar and len(pcd_file_list) > 0:
@@ -1165,9 +1184,8 @@ def main():
         )
 
         if predictions is None:
-            print(f"[Infer] Batch {b+1} ÍÆÀíÊ§°Ü, Ìø¹ı")
+            print(f"[Infer] Batch {b+1} æ¨ç†å¤±è´¥, è·³è¿‡")
             torch.cuda.empty_cache()
-            pcd_cache.clear()
             continue
 
         batch_outputs = extract_batch_outputs(predictions, batch_paths, views)
@@ -1176,14 +1194,11 @@ def main():
         del predictions
         if views is not None:
             del views
-        if 'batch_outputs' in locals():
-            del batch_outputs
         torch.cuda.empty_cache()
-        pcd_cache.clear()
 
-    print(f"[3/4] ÍÆÀíÍê³É: {len(all_predictions)} Ö¡, ºÄÊ± {time.time()-t0:.1f}s")
+    print(f"[3/4] æ¨ç†å®Œæˆ: {len(all_predictions)} å¸§, è€—æ—¶ {time.time()-t0:.1f}s")
 
-    print("\n[4/4] ¿ªÊ¼ÆÀ²â...")
+    print("\n[4/4] å¼€å§‹è¯„æµ‹...")
     stats = run_comprehensive_validation(
         all_predictions, gt_poses, gt_depths, intrinsics, args.output_dir,
         use_lora=args.use_lora, use_lidar=args.use_lidar, dataset_id=dataset_id
@@ -1198,7 +1213,7 @@ def main():
             dataset_id=dataset_id
         )
 
-    print("\nÈ«²¿Íê³É!")
+    print("\nå…¨éƒ¨å®Œæˆ!")
 
 if __name__ == "__main__":
     main()

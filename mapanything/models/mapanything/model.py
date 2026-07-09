@@ -11,6 +11,7 @@ from typing import Any, Callable, Dict, List, Tuple, Type, Union
 
 import torch
 import torch.nn as nn
+import torch.nn.functional as F
 from huggingface_hub import PyTorchModelHubMixin
 
 from mapanything.utils.geometry import (
@@ -110,6 +111,50 @@ class LidarScaleFiLM(nn.Module):
         beta  = beta.view(-1, feat.size(1), 1, 1)       # (B, C, 1, 1)
         return feat * (1 + gamma) + beta
 # ========================================================================
+
+
+class GatedMultimodalFusion(nn.Module):
+    """
+    Lightweight RGB-LiDAR fusion inspired by gated multimodal units and
+    squeeze-excitation style channel gating used in multimodal systems.
+
+    Instead of concatenating 2C channels and projecting them back to C at every
+    spatial location, the gate is predicted from pooled RGB/LiDAR context and
+    used to blend both modalities directly in C channels.
+    """
+
+    def __init__(self, feat_dim: int, reduction: int = 4):
+        super().__init__()
+        hidden_dim = max(feat_dim // reduction, 32)
+        self.gate_mlp = nn.Sequential(
+            nn.Linear(2 * feat_dim, hidden_dim),
+            nn.GELU(),
+            nn.Linear(hidden_dim, feat_dim),
+        )
+        self.refine = nn.Conv2d(
+            feat_dim,
+            feat_dim,
+            kernel_size=3,
+            padding=1,
+            groups=feat_dim,
+            bias=False,
+        )
+
+        # Start close to the RGB branch and let training gradually open the
+        # LiDAR contribution where it is helpful.
+        nn.init.zeros_(self.gate_mlp[-1].weight)
+        nn.init.constant_(self.gate_mlp[-1].bias, -2.0)
+        nn.init.zeros_(self.refine.weight)
+
+    def forward(self, rgb_feat: torch.Tensor, lidar_feat: torch.Tensor) -> torch.Tensor:
+        rgb_context = F.adaptive_avg_pool2d(rgb_feat, output_size=1).flatten(1)
+        lidar_context = F.adaptive_avg_pool2d(lidar_feat, output_size=1).flatten(1)
+        gate = torch.sigmoid(
+            self.gate_mlp(torch.cat([rgb_context, lidar_context], dim=1))
+        ).view(rgb_feat.shape[0], rgb_feat.shape[1], 1, 1)
+
+        fused = rgb_feat + gate * (lidar_feat - rgb_feat)
+        return fused + self.refine(fused)
 
 
 class MapAnything(nn.Module, PyTorchModelHubMixin):
@@ -241,12 +286,16 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         cam_trans_scale_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
         self.cam_trans_scale_encoder = encoder_factory(**cam_trans_scale_encoder_config)
 
-        # NOTICE
-        # Added fusion conv layer
+        # Use a lightweight gated fusion block instead of a spatial 2C -> C
+        # projection so RGB/LiDAR fusion stays channel-aware with lower cost.
+        self.fusion_module = GatedMultimodalFusion(self.encoder.enc_embed_dim)
+        # Backward-compatibility shim for training scripts that still expect a
+        # 1x1 fusion convolution with a 2C -> C weight layout.
         self.fusion_conv = nn.Conv2d(
             2 * self.encoder.enc_embed_dim,
             self.encoder.enc_embed_dim,
-            kernel_size=1
+            kernel_size=1,
+            bias=True,
         )
 
         # Initialize the fusion norm layer
@@ -1488,10 +1537,10 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             all_encoder_features_across_views = all_encoder_features_across_views * conf_RGB
             lidars_features_across_views = lidars_features_across_views * conf_Lidar
 
-            # Concatenate along channel dim
-            combined = torch.cat([all_encoder_features_across_views, lidars_features_across_views], dim=1)  # (B*V, 3072, H_img, W_img)
-        
-            all_encoder_features_across_views = self.fusion_conv(combined)   # (B*V, 1536, H_img, W_img)                           
+            all_encoder_features_across_views = self.fusion_module(
+                all_encoder_features_across_views,
+                lidars_features_across_views,
+            )
 
             # print("Lidar In")
     

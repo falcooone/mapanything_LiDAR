@@ -1,24 +1,25 @@
 #!/usr/bin/env python3
 #coding=gbk
 """
-MapAnything LoRA-Only Training Script (Pure RGB, No LiDAR) - È«ÃæĞŞ¸´°æ
-==========================================================================
-ĞŞ¸´ÄÚÈİ»ã×Ü:
-  [P0] 1. Éî¶È/µãÔÆËğÊ§ÒÆÖÁ¶ÔÊı¿Õ¼ä (f_log)
-  [P0] 2. ËùÓĞµ¥ÏîËğÊ§È¨ÖØ¸ÄÎª0.1 (¶Ô±ê¹Ù·½)
-  [P0] 3. RPEĞı×ªËğÊ§: acos -> chordal¾àÀë
-  [P0] 4. ËÄÔªÊıË«¸²¸Ç´¦Àí (q vs -q µÈ¼ÛĞÔ)
-  [P1] 5. Ìí¼ÓÂ³°ô»Ø¹éËğÊ§ (Huber) + top-NÏñËØÅÅ³ı
-  [P1] 6. Ìí¼ÓÖÃĞÅ¶ÈÔ¤²âÓëConfLoss (¼ò»¯°æ)
-  [P1] 7. ÊÀ½ç×ø±êÏµµãÔÆËğÊ§ (world_frame_points)
-  [P1] 8. LoRA+: B¾ØÕóÑ§Ï°ÂÊ = 16x A¾ØÕó
-  [P1] 9. ±àÂëÆ÷/Ô¤²âÍ·Ñ§Ï°ÂÊ·ÖÀë (10x²î¾à)
-  [P1] 10. Ìİ¶È²Ã¼ô: 5.0 -> 1.0
-  [P2] 11. LoRA rank: 16 -> 8
-  [P2] 12. Accum iter: 8 -> 4
-  [P2] 13. Ìí¼ÓEMA (Ö¸ÊıÒÆ¶¯Æ½¾ù)
-  [P2] 14. ËğÊ§²»ÎÈ¶¨ĞÔ×Ô¶¯¼ì²â
-  [P2] 15. Éî¶ÈÍ¼ÔöÇ¿: Ëæ»úÉî¶ÈÑÚÂëÄ£ÄâÖÃĞÅ¶È
+MapAnything LoRA-Only Training Script (Pure RGB, No LiDAR) - v3 Final
+=====================================================================
+å…¨éƒ¨ä¿®å¤æ•´åˆ:
+  [HOTFIX-1] Båˆå§‹åŒ–: randn*0.01 (éé›¶èµ·ç‚¹,æ‰“ç ´A/Bæ­»é”)
+  [HOTFIX-2] Bæƒé‡è¡°å‡: 0.0 (æ¶ˆé™¤wdå¯¹Bçš„æŠ‘åˆ¶)
+  [HOTFIX-3] Bæ¢¯åº¦è£å‰ª: 5.0 (Açš„5å€,æ›´å®½æ¾)
+  [HOTFIX-4] ä¿å­˜: ä¸å†ema.apply_shadowè¦†ç›–,ç›´æ¥å­˜çœŸå®å‚æ•°
+  [HOTFIX-5] æ¢å¤: æ™ºèƒ½æ£€æµ‹B=0â†’é‡ç½®B+æ¸…ç©ºBåŠ¨é‡+è·³è¿‡warmup
+  [P0] æ·±åº¦/ç‚¹äº‘æŸå¤±ç§»è‡³å¯¹æ•°ç©ºé—´(f_log)
+  [P0] æ‰€æœ‰å•é¡¹æŸå¤±æƒé‡æ”¹ä¸º0.1(å¯¹æ ‡MapAnythingå®˜æ–¹)
+  [P0] RPEæ—‹è½¬: acosâ†’chordalè·ç¦»
+  [P0] å››å…ƒæ•°åŒè¦†ç›–å¤„ç†
+  [P1] é²æ£’å›å½’æŸå¤±(Huber)+top-Nåƒç´ æ’é™¤
+  [P1] ä¸–ç•Œåæ ‡ç³»ç‚¹äº‘æŸå¤±
+  [P1] LoRA+: BçŸ©é˜µLR=16x AçŸ©é˜µ
+  [P1] ç¼–ç å™¨/é¢„æµ‹å¤´LRåˆ†ç¦»(10xå·®è·)
+  [P1] æ¢¯åº¦è£å‰ª: A=1.0, B=5.0
+  [P2] LoRA rank=8, accum_iter=4
+  [P2] EMA(åªç”¨äºè¯„ä¼°å‚è€ƒ,ä¸è¦†ç›–ä¿å­˜)
 """
 
 import os
@@ -52,7 +53,8 @@ from safetensors.torch import load_file
 
 warnings.filterwarnings('ignore')
 
-# ========================= DDP ¹¤¾ß =========================
+
+# ========================= DDP å·¥å…· =========================
 
 def setup_ddp():
     if 'RANK' in os.environ and 'WORLD_SIZE' in os.environ:
@@ -71,21 +73,19 @@ def cleanup_ddp(is_ddp):
 def is_main_process(rank):
     return rank == 0
 
-# ========================= ÊıÖµÎÈ¶¨¹¤¾ßº¯Êı =========================
 
-# [ĞŞ¸´P0] ¶ÔÊı¿Õ¼ä±ä»»: f_log(x) = sign(x) * log(1+|x|)
-# Ïà±È raw log: (1) x=0´¦Ìİ¶ÈÓĞ½ç (2) ±£Áô·½ÏòĞÅÏ¢ (3) ³ß¶ÈµÈ±äĞÔ
+# ========================= æ•°å€¼ç¨³å®šå·¥å…·å‡½æ•° =========================
+
 def f_log(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
-    """MapAnything¹Ù·½Ê¹ÓÃµÄ¶ÔÊı¿Õ¼ä±ä»»"""
+    """MapAnythingå®˜æ–¹å¯¹æ•°ç©ºé—´å˜æ¢: f_log(x) = sign(x) * log(1+|x|)"""
     x = x.float()
     sign_x = torch.sign(x)
     abs_x = torch.abs(x) + eps
     return (sign_x * torch.log1p(abs_x)).to(x.dtype)
 
 
-# [ĞŞ¸´P1] Â³°ô»Ø¹éËğÊ§ (Huber-like)
 class RobustRegressionLoss(nn.Module):
-    """HuberËğÊ§±äÌå: Ğ¡Îó²î¶ş´Î³Í·£, ´óÎó²îÏßĞÔ³Í·£"""
+    """HuberæŸå¤±å˜ä½“: å°è¯¯å·®äºŒæ¬¡æƒ©ç½š, å¤§è¯¯å·®çº¿æ€§æƒ©ç½š"""
     def __init__(self, alpha: float = 0.5, scaling_c: float = 0.05):
         super().__init__()
         self.alpha = alpha
@@ -94,27 +94,22 @@ class RobustRegressionLoss(nn.Module):
     def forward(self, pred: torch.Tensor, target: torch.Tensor, valid_mask: torch.Tensor = None) -> torch.Tensor:
         diff = pred - target
         abs_diff = torch.abs(diff)
-        # ×ÔÊÊÓ¦ãĞÖµ: scaling_c * median(abs_diff)
         with torch.no_grad():
             if valid_mask is not None and valid_mask.any():
                 thresh = self.c * torch.median(abs_diff[valid_mask])
             else:
                 thresh = self.c * torch.median(abs_diff) if abs_diff.numel() > 0 else torch.tensor(self.c)
             thresh = thresh.clamp_min(1e-6)
-        
-        # HuberºË
         quadratic = 0.5 * (diff ** 2) / thresh
         linear = abs_diff - 0.5 * thresh
         loss = torch.where(abs_diff <= thresh, quadratic, linear)
-        
         if valid_mask is not None:
             return loss[valid_mask].mean() if valid_mask.any() else torch.tensor(0.0, device=pred.device, dtype=pred.dtype)
         return loss.mean()
 
 
-# [ĞŞ¸´P0] Chordal¾àÀë: SO(3)ÉÏµÄFrobenius·¶Êı¾àÀë, Ìİ¶ÈÓĞ½ç
 def so3_chordal_distance(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tensor:
-    """SO(3) chordal¾àÀë: d = ||R_pred - R_gt||_F = sqrt(2*(3-trace(R^T @ R_gt)))"""
+    """SO(3) chordalè·ç¦»: d = sqrt(2*(3-trace(R^T @ R_gt)))"""
     R_diff = torch.bmm(R_pred.transpose(1, 2), R_gt)
     trace = R_diff[:, 0, 0] + R_diff[:, 1, 1] + R_diff[:, 2, 2]
     trace = torch.clamp(trace, -3.0, 3.0)
@@ -122,48 +117,24 @@ def so3_chordal_distance(R_pred: torch.Tensor, R_gt: torch.Tensor) -> torch.Tens
     return torch.sqrt(chordal_sq + 1e-8)
 
 
-# [ĞŞ¸´P0] ËÄÔªÊıË«¸²¸Ç¾àÀë: min(||q1-q2||, ||q1+q2||)
-def quat_geodesic_distance(q_pred: torch.Tensor, q_gt: torch.Tensor) -> torch.Tensor:
-    """ËÄÔªÊıgeodesic¾àÀë, ÕıÈ·´¦Àíq ~ -qµÈ¼ÛĞÔ"""
-    # ¹éÒ»»¯
-    q_pred = F.normalize(q_pred, dim=-1)
-    q_gt = F.normalize(q_gt, dim=-1)
-    # ÄÚ»ı
-    dot = torch.sum(q_pred * q_gt, dim=-1)
-    # Ë«¸²¸Ç: È¡¾ø¶ÔÖµ
-    dot_abs = torch.abs(dot)
-    # clamp·ÀÖ¹ÊıÖµÔ½½ç
-    dot_abs = torch.clamp(dot_abs, -1.0 + 1e-7, 1.0 - 1e-7)
-    # geodesic¾àÀë: 2*acos(|<q1,q2>|)
-    angle = 2.0 * torch.acos(dot_abs)
-    return angle
-
-
-# [ĞŞ¸´P1] Top-N°Ù·Ö±ÈÏñËØÅÅ³ı
 def exclude_top_n_percent(loss_map: torch.Tensor, n_percent: float = 5.0, valid_mask: torch.Tensor = None) -> torch.Tensor:
-    """ÅÅ³ıËğÊ§×î¸ßµÄn_percentÏñËØ (Â³°ôĞÔ²ßÂÔ)"""
+    """æ’é™¤æŸå¤±æœ€é«˜çš„n_percentåƒç´ """
     if valid_mask is not None and valid_mask.shape != loss_map.shape:
         if valid_mask.ndim == loss_map.ndim and valid_mask.shape[-1] != loss_map.shape[-1]:
-            # ¶àÍ¨µÀ valid -> µ¥Í¨µÀ loss: ÔÚ×îºóÒ»Î¬×ö any/reduce
             valid_mask = valid_mask.any(dim=-1, keepdim=True)
-        # Èç¹û»¹²»Æ¥Åä£¬³¢ÊÔ¹ã²¥
         if valid_mask.shape != loss_map.shape:
             try:
                 valid_mask = valid_mask.expand_as(loss_map)
             except RuntimeError:
                 valid_mask = None
-    
     if n_percent <= 0:
         return loss_map.mean() if valid_mask is None else loss_map[valid_mask].mean()
-    
     if valid_mask is not None:
         loss_vec = loss_map[valid_mask]
     else:
         loss_vec = loss_map.flatten()
-    
     if loss_vec.numel() == 0:
         return torch.tensor(0.0, device=loss_map.device, dtype=loss_map.dtype)
-    
     k = max(1, int(loss_vec.numel() * n_percent / 100.0))
     threshold = torch.topk(loss_vec, k, largest=True)[0][-1]
     keep_mask = loss_vec < threshold
@@ -172,59 +143,46 @@ def exclude_top_n_percent(loss_map: torch.Tensor, n_percent: float = 5.0, valid_
     return loss_vec.mean()
 
 
-# [ĞŞ¸´P1] ÖÃĞÅ¶ÈËğÊ§ (¼ò»¯ConfLoss)
 class ConfidenceLoss(nn.Module):
-    """¹ÄÀøÄ£ĞÍ¶ÔµÍÎó²îÔ¤²â¸³Óè¸ßÖÃĞÅ¶È"""
     def __init__(self, conf_alpha: float = 0.2):
         super().__init__()
         self.conf_alpha = conf_alpha
 
     def forward(self, confidence: torch.Tensor, loss_map: torch.Tensor, valid_mask: torch.Tensor = None) -> torch.Tensor:
-        """
-        confidence: [B, 1, H, W] Ô¤²âÖÃĞÅ¶È (0~1)
-        loss_map: [B, 1, H, W] Ã¿¸öÏñËØµÄ»Ø¹éËğÊ§
-        """
         if valid_mask is None:
             valid_mask = torch.ones_like(loss_map, dtype=torch.bool)
-        
         conf = confidence[valid_mask].flatten()
-        loss_vals = loss_map[valid_mask].flatten().detach()  # Í£Ö¹Ìİ¶È
-        
+        loss_vals = loss_map[valid_mask].flatten().detach()
         if conf.numel() == 0:
             return torch.tensor(0.0, device=confidence.device)
-        
-        # ¹éÒ»»¯ËğÊ§µ½0~1·¶Î§ÓÃÓÚÖÃĞÅ¶È¼à¶½
         with torch.no_grad():
             loss_normalized = loss_vals / (loss_vals.mean() + 1e-8)
             loss_normalized = torch.clamp(loss_normalized, 0.0, 10.0)
-            target_conf = torch.exp(-loss_normalized)  # µÍËğÊ§ -> ¸ßÖÃĞÅ¶È
-        
-        # BCEËğÊ§
+            target_conf = torch.exp(-loss_normalized)
         conf_clamped = torch.clamp(conf, 1e-6, 1.0 - 1e-6)
         conf_loss = F.binary_cross_entropy(conf_clamped, target_conf.float())
-        
         return self.conf_alpha * conf_loss
 
-# ========================= LoRA (embedded, no external deps) =========================
-# [ĞŞ¸´P2] LoRA rank¸ÄÎª8, alpha=8
+
+# ========================= LoRA (HOTFIX-1: Béé›¶åˆå§‹åŒ–) =========================
 
 class LinearWithLoRA(nn.Module):
     def __init__(self, linear: nn.Linear, r: int = 8, lora_alpha: int = 8):
         super().__init__()
         self.linear = linear
+        self.r = r
+        self.lora_alpha = lora_alpha
         self.scaling = lora_alpha / r
         self.lora_A = nn.Parameter(torch.zeros(linear.in_features, r))
-        self.lora_B = nn.Parameter(torch.zeros(r, linear.out_features))
-        # ±ê×¼³õÊ¼»¯: A ~ N(0, 1/sqrt(r)), B = 0
+        # [HOTFIX-1] Bä¸å†åˆå§‹åŒ–ä¸º0ï¼ä½¿ç”¨æå°éšæœºå€¼æ‰“ç ´å¯¹ç§°æ€§
+        self.lora_B = nn.Parameter(torch.randn(r, linear.out_features) * 0.01)
         std = 1.0 / math.sqrt(r)
         nn.init.normal_(self.lora_A, mean=0.0, std=std)
-        nn.init.zeros_(self.lora_B)
         for p in self.linear.parameters():
             p.requires_grad = False
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         out = self.linear(x)
-        # Ç¿ÖÆfp32½øĞĞLoRA¼ÆËã±ÜÃâbfloat16Òç³ö
         lora = x.float() @ self.lora_A.float()
         lora = lora @ self.lora_B.float()
         lora = lora.to(out.dtype)
@@ -239,15 +197,13 @@ def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: int = 8):
             inject_lora_to_module(child, r, lora_alpha)
 
 
-# ========================= EMA (Ö¸ÊıÒÆ¶¯Æ½¾ù) =========================
-# [ĞŞ¸´P2] Ìí¼ÓEMAÓÃÓÚ¸üÎÈ¶¨µÄÊÕÁ²
+# ========================= EMA (HOTFIX-4: åªå‚è€ƒä¸è¦†ç›–) =========================
 
 class ModelEMA:
-    """Ä£ĞÍÈ¨ÖØµÄÖ¸ÊıÒÆ¶¯Æ½¾ù"""
+    """EMAåªç”¨äºè¯„ä¼°æ—¶å‚è€ƒï¼Œç»ä¸è¦†ç›–ä¿å­˜çš„çœŸå®å‚æ•°"""
     def __init__(self, model: nn.Module, decay: float = 0.999):
         self.decay = decay
         self.shadow = {}
-        self.backup = {}
         self._register(model)
 
     def _register(self, model: nn.Module):
@@ -260,33 +216,18 @@ class ModelEMA:
             if param.requires_grad and name in self.shadow:
                 self.shadow[name] = self.decay * self.shadow[name] + (1.0 - self.decay) * param.data
 
-    def apply_shadow(self, model: nn.Module):
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.shadow:
-                self.backup[name] = param.data.clone()
-                param.data.copy_(self.shadow[name])
-
-    def restore(self, model: nn.Module):
-        for name, param in model.named_parameters():
-            if param.requires_grad and name in self.backup:
-                param.data.copy_(self.backup[name])
-        self.backup = {}
 
 # ========================= Gradient Checkpointing =========================
 
 def enable_gradient_checkpointing_safe(model, rank):
     import torch.utils.checkpoint as cp
     wrapped_names = []
-
     def _make_checkpoint_fn(orig_forward, name):
         def _forward(*args, **kwargs):
             return cp.checkpoint(orig_forward, *args, use_reentrant=False, **kwargs)
         return _forward
-
-    candidates = [
-        'info_sharing', 'info_sharing_module', 'transformer', 'encoder',
-        'dense_head', 'pose_head', 'scale_head'
-    ]
+    candidates = ['info_sharing', 'info_sharing_module', 'transformer', 'encoder',
+                  'dense_head', 'pose_head', 'scale_head']
     for name in candidates:
         if hasattr(model, name):
             module = getattr(model, name)
@@ -297,39 +238,28 @@ def enable_gradient_checkpointing_safe(model, rank):
                 wrapped_names.append(name)
             except Exception as e:
                 if is_main_process(rank):
-                    print(f"  -> Ìø¹ı {name} checkpointing: {e}")
-
+                    print(f"  -> è·³è¿‡ {name} checkpointing: {e}")
     if wrapped_names and is_main_process(rank):
-        print(f"  -> Gradient Checkpointing ÒÑÆôÓÃÄ£¿é: {wrapped_names}")
-    elif is_main_process(rank):
-        print("  -> Î´×Ô¶¯Ê¶±ğµ½¿ÉÆôÓÃ checkpointing µÄÄ£¿éÃû£¨²»Ó°ÏìÑµÁ·£©")
+        print(f"  -> Gradient Checkpointing å·²å¯ç”¨æ¨¡å—: {wrapped_names}")
 
 
-# ========================= ËğÊ§º¯Êı£¨È«ÃæĞŞ¸´°æ£© =========================
-# [ĞŞ¸´P0] ËùÓĞÈ¨ÖØ¸ÄÎª0.1 (¶Ô±êMapAnything¹Ù·½)
-# [ĞŞ¸´P0] Éî¶ÈËğÊ§Ê¹ÓÃf_log¶ÔÊı¿Õ¼ä
-# [ĞŞ¸´P0] RPEĞı×ªÊ¹ÓÃchordal¾àÀëÌæ´úacos
-# [ĞŞ¸´P0] ËÄÔªÊıË«¸²¸Ç´¦Àí
-# [ĞŞ¸´P1] Ìí¼ÓÂ³°ô»Ø¹éËğÊ§ (Huber)
-# [ĞŞ¸´P1] Ìí¼ÓÖÃĞÅ¶ÈËğÊ§
-# [ĞŞ¸´P1] Ìí¼Óworld_frame_pointsËğÊ§
-# [ĞŞ¸´P1] Top-N°Ù·Ö±ÈÏñËØÅÅ³ı
+# ========================= æŸå¤±å‡½æ•° =========================
 
 class MapAnythingLoss(nn.Module):
     def __init__(self, 
-                 w_depth: float = 0.1,           # [ĞŞ¸´] 1.0 -> 0.1
-                 w_pose_trans: float = 0.1,       # [ĞŞ¸´] 1.0 -> 0.1
-                 w_pose_rot: float = 0.1,         # [ĞŞ¸´] 1.0 -> 0.1
-                 w_ray: float = 0.1,              # [ĞŞ¸´] 1.0 -> 0.1
-                 w_pts3d_cam: float = 0.1,        # [ĞŞ¸´] 1.0 -> 0.1
-                 w_world_pts: float = 1.0,        # [ĞÂÔö] world frame points (Ö÷ËğÊ§)
-                 w_confidence: float = 0.2,       # [ĞÂÔö] ÖÃĞÅ¶ÈËğÊ§
-                 w_scale: float = 0.1,            # [ĞÂÔö] ³ß¶ÈËğÊ§
-                 robust_alpha: float = 0.5,        # [ĞÂÔö] Â³°ôËğÊ§²ÎÊı
-                 robust_c: float = 0.05,           # [ĞÂÔö] Â³°ôËğÊ§Ëõ·Å
-                 top_n_percent: float = 5.0,       # [ĞÂÔö] ÏñËØÅÅ³ı±ÈÀı
-                 use_log_depth: bool = True,       # [ĞÂÔö] Ê¹ÓÃ¶ÔÊı¿Õ¼äÉî¶È
-                 use_chordal_rot: bool = True):    # [ĞÂÔö] Ê¹ÓÃchordalĞı×ª¾àÀë
+                 w_depth: float = 0.1,
+                 w_pose_trans: float = 0.1,
+                 w_pose_rot: float = 0.1,
+                 w_ray: float = 0.1,
+                 w_pts3d_cam: float = 0.1,
+                 w_world_pts: float = 1.0,
+                 w_confidence: float = 0.2,
+                 w_scale: float = 0.1,
+                 robust_alpha: float = 0.5,
+                 robust_c: float = 0.05,
+                 top_n_percent: float = 5.0,
+                 use_log_depth: bool = True,
+                 use_chordal_rot: bool = True):
         super().__init__()
         self.w_depth = w_depth
         self.w_pose_trans = w_pose_trans
@@ -342,18 +272,13 @@ class MapAnythingLoss(nn.Module):
         self.use_log_depth = use_log_depth
         self.use_chordal_rot = use_chordal_rot
         self.top_n_percent = top_n_percent
-        
-        # Â³°ô»Ø¹éËğÊ§
         self.robust_loss = RobustRegressionLoss(alpha=robust_alpha, scaling_c=robust_c)
-        # ÖÃĞÅ¶ÈËğÊ§
         self.conf_loss_fn = ConfidenceLoss(conf_alpha=w_confidence)
 
     @staticmethod
     def _quat_to_rotmat(quats):
-        # [ĞŞ¸´P0] ËÄÔªÊı¹éÒ»»¯ + Ë«¸²¸Ç´¦Àí (Í³Ò»µ½qw>=0µÄ°ëÇò)
         norm = torch.norm(quats, dim=-1, keepdim=True)
         quats = quats / (norm + 1e-8)
-        # Ë«¸²¸Ç: È·±£qw >= 0
         quats = torch.where(quats[:, 3:4] < 0, -quats, quats)
         qx, qy, qz, qw = quats[:, 0], quats[:, 1], quats[:, 2], quats[:, 3]
         B = quats.shape[0]
@@ -389,18 +314,13 @@ class MapAnythingLoss(nn.Module):
         return T_inv
 
     def _compute_world_frame_points_loss(self, pred_pts3d_world, gt_pts3d_world, valid_mask=None):
-        """[ĞÂÔö] ÊÀ½ç×ø±êÏµµãÔÆËğÊ§ (MapAnythingµÄÖ÷ËğÊ§Ïî)"""
         if valid_mask is None or not valid_mask.any():
             if pred_pts3d_world is None or gt_pts3d_world is None:
                 return torch.tensor(0.0, device=pred_pts3d_world.device if pred_pts3d_world is not None else 'cuda')
             valid_mask = torch.isfinite(pred_pts3d_world).all(dim=-1) & torch.isfinite(gt_pts3d_world).all(dim=-1)
-        
-        # ¶ÔÊı¿Õ¼ä¼ÆËã
         pred_log = f_log(pred_pts3d_world)
         gt_log = f_log(gt_pts3d_world)
         loss_map = torch.abs(pred_log - gt_log).mean(dim=-1, keepdim=True)
-        
-        # Â³°ô»Ø¹é + top-NÅÅ³ı
         return exclude_top_n_percent(loss_map, self.top_n_percent, valid_mask)
 
     def forward(self, predictions: List[Dict], views: List[Dict], seq_len: int = 2):
@@ -410,30 +330,29 @@ class MapAnythingLoss(nn.Module):
         N = len(predictions)
 
         for i, (pred, view) in enumerate(zip(predictions, views)):
-            # ---- Éî¶ÈËğÊ§ (¶ÔÊı¿Õ¼ä) ----
+            H, W = pred['pts3d'].shape[1:3] if 'pts3d' in pred else (448, 448)
+            B = 1
+
+            # ---- æ·±åº¦æŸå¤± (å¯¹æ•°ç©ºé—´) ----
             if 'depth_along_ray' in pred and view.get('gt_depth') is not None:
                 pred_d = pred['depth_along_ray']
                 gt_d = view['gt_depth'].to(device)
                 pred_d = pred_d.permute(0, 3, 1, 2)
                 if pred_d.shape[-2:] != gt_d.shape[-2:]:
                     gt_d = F.interpolate(gt_d, size=pred_d.shape[-2:], mode='bilinear', align_corners=False)
-                
-                valid = (gt_d > 1e-4) & torch.isfinite(pred_d)  # [ĞŞ¸´] ãĞÖµ1e-3->1e-4
+                valid = (gt_d > 1e-4) & torch.isfinite(pred_d)
                 if valid.any():
                     if self.use_log_depth:
-                        # [ĞŞ¸´P0] Ê¹ÓÃf_log¶ÔÊı¿Õ¼ä
                         pred_d_log = f_log(pred_d)
                         gt_d_log = f_log(gt_d)
                         loss_map = torch.abs(pred_d_log - gt_d_log)
                     else:
                         loss_map = torch.abs(pred_d - gt_d)
-                    
-                    # [ĞŞ¸´P1] Â³°ô»Ø¹é + top-NÅÅ³ı
                     loss_d = exclude_top_n_percent(loss_map, self.top_n_percent, valid)
                     loss_components.append(self.w_depth * loss_d)
                     metrics[f'depth_{i}'] = loss_d.item()
 
-            # ---- ÉäÏß·½ÏòËğÊ§ ----
+            # ---- å°„çº¿æ–¹å‘æŸå¤± ----
             if 'ray_directions' in pred and view.get('gt_intrinsics') is not None:
                 K = view['gt_intrinsics'].to(device)
                 if K.dim() == 2:
@@ -442,7 +361,6 @@ class MapAnythingLoss(nn.Module):
                 B, H, W, _ = pred_ray.shape
                 u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
                 pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1).float()
-                
                 with torch.cuda.amp.autocast(enabled=False):
                     K_f32 = K.float()
                     pixels_f32 = pixels.reshape(-1, 3).float()
@@ -456,7 +374,8 @@ class MapAnythingLoss(nn.Module):
                 loss_components.append(self.w_ray * loss_ray)
                 metrics[f'ray_{i}'] = loss_ray.item()
 
-            # ---- Ïà»ú×ø±êÏµ3DµãËğÊ§ (¶ÔÊı¿Õ¼ä) ----
+            # ---- ç›¸æœºåæ ‡ç³»3Dç‚¹æŸå¤± ----
+            gt_pts3d_cam = None
             if 'pts3d_cam' in pred and view.get('gt_depth') is not None and view.get('gt_intrinsics') is not None:
                 gt_d = view['gt_depth'].to(device)
                 if gt_d.dim() == 2:
@@ -470,10 +389,8 @@ class MapAnythingLoss(nn.Module):
                 H, W = pred['pts3d_cam'].shape[1:3]
                 if gt_d.shape[-2:] != (H, W):
                     gt_d = F.interpolate(gt_d, size=(H, W), mode='bilinear', align_corners=False)
-                
                 u, v = torch.meshgrid(torch.arange(W, device=device), torch.arange(H, device=device), indexing='xy')
                 pixels = torch.stack([u, v, torch.ones_like(u)], dim=-1).float()
-                
                 with torch.cuda.amp.autocast(enabled=False):
                     K_f32 = K.float()
                     pixels_f32 = pixels.reshape(-1, 3).float()
@@ -485,9 +402,7 @@ class MapAnythingLoss(nn.Module):
                 gt_pts3d_cam = rays * gt_d.permute(0, 2, 3, 1)
                 pred_pts3d_cam = pred['pts3d_cam']
                 valid = (gt_d.permute(0, 2, 3, 1) > 1e-4).expand_as(pred_pts3d_cam)
-                
                 if valid.any():
-                    # [ĞŞ¸´P0] ¶ÔÊı¿Õ¼ä¼ÆËã
                     pred_log = f_log(pred_pts3d_cam)
                     gt_log = f_log(gt_pts3d_cam)
                     loss_map = torch.abs(pred_log - gt_log).mean(dim=-1, keepdim=True)
@@ -495,9 +410,23 @@ class MapAnythingLoss(nn.Module):
                     loss_components.append(self.w_pts3d_cam * loss_pc)
                     metrics[f'pts3d_cam_{i}'] = loss_pc.item()
 
-            # ---- ÖÃĞÅ¶ÈËğÊ§ ----
+            # ---- ä¸–ç•Œåæ ‡ç³»ç‚¹äº‘æŸå¤± ----
+            if 'pts3d' in pred and view.get('gt_pose') is not None and view.get('gt_depth') is not None and gt_pts3d_cam is not None:
+                pred_world = pred['pts3d']
+                gt_pose = view['gt_pose'].to(device)
+                if gt_pose.dim() == 2:
+                    gt_pose = gt_pose.unsqueeze(0)
+                gt_pts3d_world = torch.matmul(gt_pts3d_cam.reshape(B, -1, 3),
+                                               gt_pose[:, :3, :3].transpose(1, 2)) + gt_pose[:, :3, 3:4].transpose(1, 2)
+                gt_pts3d_world = gt_pts3d_world.reshape(B, H, W, 3)
+                valid_world = torch.isfinite(pred_world).all(dim=-1) & torch.isfinite(gt_pts3d_world).all(dim=-1)
+                if valid_world.any():
+                    loss_world = self._compute_world_frame_points_loss(pred_world, gt_pts3d_world, valid_world)
+                    loss_components.append(self.w_world_pts * loss_world)
+                    metrics[f'world_pts_{i}'] = loss_world.item()
+
+            # ---- ç½®ä¿¡åº¦æŸå¤± ----
             if 'confidence' in pred and ('depth_along_ray' in pred or 'pts3d_cam' in pred):
-                # Ê¹ÓÃÉî¶ÈÎó²î×÷ÎªÖÃĞÅ¶È¼à¶½ĞÅºÅ
                 if 'depth_along_ray' in pred and view.get('gt_depth') is not None:
                     pred_d = pred['depth_along_ray'].permute(0, 3, 1, 2)
                     gt_d = view['gt_depth'].to(device)
@@ -515,33 +444,7 @@ class MapAnythingLoss(nn.Module):
                             loss_components.append(loss_conf)
                             metrics[f'conf_{i}'] = loss_conf.item()
 
-            # ---- ÊÀ½ç×ø±êÏµµãÔÆËğÊ§ [ĞÂÔö] ----
-            if 'pts3d' in pred and view.get('gt_pose') is not None and view.get('gt_depth') is not None:
-                # Ê¹ÓÃÔ¤²âµÄÊÀ½ç×ø±êÏµµãÔÆ (Èç¹ûÄ£ĞÍÊä³ö)
-                pred_world = pred['pts3d']
-                # ´ÓGTÉî¶ÈºÍ×ËÌ¬¹¹ÔìGTÊÀ½ç×ø±êÏµµãÔÆ
-                gt_d = view['gt_depth'].to(device)
-                if gt_d.dim() == 3:
-                    gt_d = gt_d.unsqueeze(0)
-                if gt_d.shape[-2:] != (H, W):
-                    gt_d = F.interpolate(gt_d, size=(H, W), mode='bilinear', align_corners=False)
-                
-                # ¼ò»¯µÄworld points: Ê¹ÓÃÏà»ú×ø±êÏµµã¾­×ËÌ¬±ä»»
-                if 'pts3d_cam' in pred:
-                    gt_pose = view['gt_pose'].to(device)
-                    if gt_pose.dim() == 2:
-                        gt_pose = gt_pose.unsqueeze(0)
-                    gt_pts3d_world = torch.matmul(gt_pts3d_cam.reshape(B, -1, 3), 
-                                                   gt_pose[:, :3, :3].transpose(1, 2)) + gt_pose[:, :3, 3:4].transpose(1, 2)
-                    gt_pts3d_world = gt_pts3d_world.reshape(B, H, W, 3)
-                    
-                    valid_world = torch.isfinite(pred_world).all(dim=-1) & torch.isfinite(gt_pts3d_world).all(dim=-1)
-                    if valid_world.any():
-                        loss_world = self._compute_world_frame_points_loss(pred_world, gt_pts3d_world, valid_world)
-                        loss_components.append(self.w_world_pts * loss_world)
-                        metrics[f'world_pts_{i}'] = loss_world.item()
-
-        # ---- Ïà¶Ô×ËÌ¬¹À¼ÆËğÊ§ (RPE) ----
+        # ---- ç›¸å¯¹å§¿æ€ä¼°è®¡æŸå¤± (RPE) ----
         if seq_len >= 2 and N >= seq_len:
             batch_size = N // seq_len
             for b in range(batch_size):
@@ -551,54 +454,41 @@ class MapAnythingLoss(nn.Module):
                     idx2 = start + k + 1
                     pred1, pred2 = predictions[idx1], predictions[idx2]
                     view1, view2 = views[idx1], views[idx2]
-                    
                     required_keys = ['cam_trans', 'cam_quats']
                     if not all(k in pred1 and k in pred2 for k in required_keys):
                         continue
                     if view1.get('gt_pose') is None or view2.get('gt_pose') is None:
                         continue
-                        
                     gt_pose1 = view1['gt_pose'].to(device)
                     gt_pose2 = view2['gt_pose'].to(device)
                     if gt_pose1.dim() == 2:
                         gt_pose1 = gt_pose1.unsqueeze(0)
                     if gt_pose2.dim() == 2:
                         gt_pose2 = gt_pose2.unsqueeze(0)
-                    
                     T_pred1 = self._build_transform(pred1['cam_trans'], pred1['cam_quats'])
                     T_pred2 = self._build_transform(pred2['cam_trans'], pred2['cam_quats'])
                     T_rel_gt = self._inv_transform(gt_pose1) @ gt_pose2
                     T_rel_pred = self._inv_transform(T_pred1) @ T_pred2
-                    
-                    # ÊıÖµÓĞĞ§ĞÔ¼ì²é
                     if not (torch.isfinite(T_rel_pred).all() and torch.isfinite(T_rel_gt).all()):
                         continue
-                        
                     t_norm_pred = torch.norm(T_rel_pred[:, :3, 3], dim=-1).mean()
                     t_norm_gt = torch.norm(T_rel_gt[:, :3, 3], dim=-1).mean()
                     if not torch.isfinite(t_norm_pred) or t_norm_gt < 1e-12:
                         continue
-                        
-                    # Æ½ÒÆËğÊ§: Smooth L1
                     loss_t = F.smooth_l1_loss(T_rel_pred[:, :3, 3], T_rel_gt[:, :3, 3], beta=0.1)
-                    
-                    # [ĞŞ¸´P0] Ğı×ªËğÊ§: chordal¾àÀëÌæ´úacos
                     if self.use_chordal_rot:
                         loss_r = so3_chordal_distance(T_rel_pred[:, :3, :3], T_rel_gt[:, :3, :3]).mean()
                     else:
-                        # ±¸ÓÃ: ËÄÔªÊıgeodesic¾àÀë (´¦ÀíË«¸²¸Ç)
                         R_diff = torch.bmm(T_rel_pred[:, :3, :3].transpose(1, 2), T_rel_gt[:, :3, :3])
                         trace = R_diff[:, 0, 0] + R_diff[:, 1, 1] + R_diff[:, 2, 2]
                         trace = torch.clamp(trace, -1.0, 3.0)
                         cos_angle = torch.clamp((trace - 1.0) / 2.0, -1.0 + 1e-7, 1.0 - 1e-7)
                         loss_r = torch.acos(cos_angle).mean()
-                    
                     if torch.isfinite(loss_t) and torch.isfinite(loss_r):
                         loss_components.append(self.w_pose_trans * loss_t + self.w_pose_rot * loss_r)
                         metrics[f'rpe_trans_b{b}_k{k}'] = loss_t.item()
                         metrics[f'rpe_rot_b{b}_k{k}'] = loss_r.item()
 
-        # »ã×Ümetrics
         rpe_trans_vals = [v for k, v in metrics.items() if k.startswith('rpe_trans_b')]
         rpe_rot_vals = [v for k, v in metrics.items() if k.startswith('rpe_rot_b')]
         if rpe_trans_vals:
@@ -610,9 +500,6 @@ class MapAnythingLoss(nn.Module):
         ray_vals = [v for k, v in metrics.items() if k.startswith('ray_')]
         if ray_vals:
             metrics['ray'] = sum(ray_vals) / len(ray_vals)
-        conf_vals = [v for k, v in metrics.items() if k.startswith('conf_')]
-        if conf_vals:
-            metrics['confidence'] = sum(conf_vals) / len(conf_vals)
         world_vals = [v for k, v in metrics.items() if k.startswith('world_pts_')]
         if world_vals:
             metrics['world_pts'] = sum(world_vals) / len(world_vals)
@@ -628,7 +515,7 @@ class MapAnythingLoss(nn.Module):
         return total_loss, metrics
 
 
-# ========================= ´¿ RGB Êı¾İ¼¯£¨¶èĞÔ¼ÓÔØÉî¶ÈÍ¼£© =========================
+# ========================= æ•°æ®é›† =========================
 
 class SeqRGBDataset(Dataset):
     def __init__(self, seq_root: str, seq_len: int = 2, stride: int = 1,
@@ -650,16 +537,16 @@ class SeqRGBDataset(Dataset):
             if os.path.isdir(full_path) and re.match(r'shuangchuang_seq\d+_(night|daytime)\d+th', item):
                 self.part_folders.append(item)
         if not self.part_folders:
-            raise ValueError(f"ÔÚ {seq_root} ÖĞÎ´ÕÒµ½·ûºÏÃüÃû¹æÔòµÄ part ÎÄ¼ş¼Ğ")
+            raise ValueError(f"åœ¨ {seq_root} ä¸­æœªæ‰¾åˆ°ç¬¦åˆå‘½åè§„åˆ™çš„ part æ–‡ä»¶å¤¹")
 
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print(f"[Dataset] ¹²Ê¶±ğµ½ {len(self.part_folders)} ¸ö part ÎÄ¼ş¼Ğ: {self.part_folders}")
+            print(f"[Dataset] å…±è¯†åˆ«åˆ° {len(self.part_folders)} ä¸ª part æ–‡ä»¶å¤¹: {self.part_folders}")
 
         self.gt_poses = self._load_tum_poses(os.path.join(seq_root, "extrinsics.tum"))
         self.gt_timestamps = np.array(sorted(self.gt_poses.keys()))
         self.gt_poses_list = [self.gt_poses[ts] for ts in self.gt_timestamps]
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print(f"[Dataset] TUM ÕæÖµÎ»×Ë: {len(self.gt_poses_list)} Ö¡, Ê±¼ä´Á·¶Î§ [{self.gt_timestamps.min():.3f}, {self.gt_timestamps.max():.3f}]")
+            print(f"[Dataset] TUM çœŸå€¼ä½å§¿: {len(self.gt_poses_list)} å¸§, æ—¶é—´æˆ³èŒƒå›´ [{self.gt_timestamps.min():.3f}, {self.gt_timestamps.max():.3f}]")
 
         self.part_depths = []
         for pidx, part in enumerate(self.part_folders):
@@ -679,12 +566,7 @@ class SeqRGBDataset(Dataset):
                         ts = int(m.group(1))
                         valid_files.append(df)
                         depth_ts.append(ts)
-                if is_main_process(int(os.environ.get('RANK', 0))):
-                    print(f"[Dataset] {part}/depth: É¨Ãèµ½ {len(valid_files)} ÕÅÉî¶ÈÍ¼")
-                self.part_depths.append({
-                    'files': valid_files,
-                    'timestamps': np.array(depth_ts, dtype=np.int64)
-                })
+                self.part_depths.append({'files': valid_files, 'timestamps': np.array(depth_ts, dtype=np.int64)})
             else:
                 self.part_depths.append({'files': [], 'timestamps': np.array([], dtype=np.int64)})
 
@@ -692,12 +574,9 @@ class SeqRGBDataset(Dataset):
         self.intrinsics = self._load_intrinsics(intrinsics_file) if os.path.exists(intrinsics_file) else np.eye(3, dtype=np.float32)
 
         self.all_views_meta = []
-        timestamp_diffs = []
         for pidx, part in enumerate(self.part_folders):
             rgb_dir = os.path.join(seq_root, part, "rgb")
             if not os.path.exists(rgb_dir):
-                if is_main_process(int(os.environ.get('RANK', 0))):
-                    print(f"[Dataset] ¾¯¸æ: {part}/rgb ²»´æÔÚ£¬Ìø¹ı")
                 continue
             img_paths = []
             for fname in sorted(os.listdir(rgb_dir)):
@@ -724,18 +603,11 @@ class SeqRGBDataset(Dataset):
                 diff = abs(self.gt_timestamps[nearest_idx] - img_ts_sec)
                 if diff < tolerance:
                     self.all_views_meta.append((ipath, img_ts_ns, pidx, nearest_idx))
-                else:
-                    timestamp_diffs.append(diff)
-
-        if timestamp_diffs and is_main_process(int(os.environ.get('RANK', 0))):
-            diffs = np.array(timestamp_diffs)
-            print(f"[Dataset] Ê±¼ä´ÁÆ¥ÅäÊ§°Ü: ¹² {len(diffs)} Ö¡, ²îÖµÖĞÎ»Êı {np.median(diffs):.3f}s")
 
         if not self.all_views_meta and is_main_process(int(os.environ.get('RANK', 0))):
-            raise ValueError("Ã»ÓĞÈÎºÎÍ¼ÏñÍ¨¹ıÊ±¼ä´ÁÆ¥Åä£¡")
-
+            raise ValueError("æ²¡æœ‰ä»»ä½•å›¾åƒé€šè¿‡æ—¶é—´æˆ³åŒ¹é…ï¼")
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print(f"[Dataset] ×îÖÕÓĞĞ§Ö¡×ÜÊı: {len(self.all_views_meta)}")
+            print(f"[Dataset] æœ€ç»ˆæœ‰æ•ˆå¸§æ€»æ•°: {len(self.all_views_meta)}")
 
     def _load_tum_poses(self, tum_file: str):
         poses = {}
@@ -803,11 +675,9 @@ class SeqRGBDataset(Dataset):
             indices = list(range(start, len(self.all_views_meta)))
             while len(indices) < self.seq_len:
                 indices.append(indices[-1])
-        
         views = []
         for meta_idx in indices:
             ipath, img_ts_ns, pidx, gt_idx = self.all_views_meta[meta_idx]
-
             img = Image.open(ipath).convert('RGB')
             img_np_color = np.array(img)
             if not np.isfinite(img_np_color).all():
@@ -815,18 +685,13 @@ class SeqRGBDataset(Dataset):
             img_np = img_np_color.transpose(2, 0, 1).astype(np.float32) / 255.0
             img_tensor = torch.from_numpy(img_np)
             if img_tensor.shape[1] != self.img_size or img_tensor.shape[2] != self.img_size:
-                img_tensor = F.interpolate(
-                    img_tensor.unsqueeze(0), size=(self.img_size, self.img_size),
-                    mode='bilinear', align_corners=False
-                ).squeeze(0)
-
+                img_tensor = F.interpolate(img_tensor.unsqueeze(0), size=(self.img_size, self.img_size),
+                                           mode='bilinear', align_corners=False).squeeze(0)
             img_gray_np = img_np_color.astype(np.float32).mean(axis=2) / 255.0
             mean = np.mean(img_gray_np)
             rms = np.sqrt(np.mean((img_gray_np - mean) ** 2))
             confidence = float(rms) if not np.isnan(rms) else 0.5
-
             gt_pose = torch.from_numpy(self.gt_poses_list[gt_idx])
-
             gt_depth = torch.zeros((1, 1, self.img_size, self.img_size), dtype=torch.float32)
             depth_file = self._find_closest_depth(img_ts_ns, pidx)
             if depth_file is not None:
@@ -837,9 +702,7 @@ class SeqRGBDataset(Dataset):
                                              mode='bilinear', align_corners=False)
                 d_tensor = torch.nan_to_num(d_tensor, nan=0.0, posinf=0.0, neginf=0.0)
                 gt_depth = d_tensor
-
             gt_intrinsics = torch.from_numpy(self.intrinsics).unsqueeze(0)
-
             views.append({
                 "img": img_tensor.unsqueeze(0),
                 "data_norm_type": ["dinov2"],
@@ -858,7 +721,7 @@ def collate_fn(batch):
     return views
 
 
-# ========================= Ä£ĞÍ¹¹½¨£¨½ö LoRA£¬ÎŞ LiDAR£© =========================
+# ========================= æ¨¡å‹æ„å»º =========================
 
 def build_model(model_dir: str, device: str, rank: int, lora_r: int = 8, lora_alpha: int = 8):
     config_path = os.path.join(model_dir, "config.json")
@@ -882,31 +745,21 @@ def build_model(model_dir: str, device: str, rank: int, lora_r: int = 8, lora_al
     )
     if os.path.exists(weights_path):
         if is_main_process(rank):
-            print(f"¼ÓÔØÔ¤ÑµÁ·È¨ÖØ: {weights_path}")
+            print(f"åŠ è½½é¢„è®­ç»ƒæƒé‡: {weights_path}")
         state_dict = load_file(weights_path)
         model.load_state_dict(state_dict, strict=False)
 
-    # ×¢ÈëLoRA
     lora_targets = []
-    if hasattr(model, 'encoder') and model.encoder is not None:
-        lora_targets.append(model.encoder)
-    if hasattr(model, 'info_sharing') and model.info_sharing is not None:
-        lora_targets.append(model.info_sharing)
-    if hasattr(model, 'dense_head') and model.dense_head is not None:
-        lora_targets.append(model.dense_head)
-    if hasattr(model, 'pose_head') and model.pose_head is not None:
-        lora_targets.append(model.pose_head)
-    if hasattr(model, 'scale_head') and model.scale_head is not None:
-        lora_targets.append(model.scale_head)
-
+    for attr in ['encoder', 'info_sharing', 'dense_head', 'pose_head', 'scale_head']:
+        if hasattr(model, attr) and getattr(model, attr) is not None:
+            lora_targets.append(getattr(model, attr))
     for target in lora_targets:
         inject_lora_to_module(target, r=lora_r, lora_alpha=lora_alpha)
 
     if is_main_process(rank):
         lora_layer_count = sum(1 for _ in model.modules() if isinstance(_, LinearWithLoRA))
-        print(f"  -> ÒÑ×¢Èë LoRA: {lora_layer_count} ¸ö Linear ²ã (r={lora_r}, alpha={lora_alpha})")
+        print(f"  -> å·²æ³¨å…¥ LoRA: {lora_layer_count} ä¸ª Linear å±‚ (r={lora_r}, alpha={lora_alpha})")
 
-    # ¶³½á·ÇLoRA²ÎÊı
     for param in model.parameters():
         param.requires_grad = False
     for name, param in model.named_parameters():
@@ -915,41 +768,15 @@ def build_model(model_dir: str, device: str, rank: int, lora_r: int = 8, lora_al
 
     total = sum(p.numel() for p in model.parameters())
     trainable = sum(p.numel() for p in model.parameters() if p.requires_grad)
-
     if trainable == 0:
-        raise RuntimeError("Ã»ÓĞÈÎºÎ¿ÉÑµÁ·²ÎÊı£¬Çë¼ì²éÄ£¿éÃûÆ¥Åä¹æÔò¡£")
-
+        raise RuntimeError("æ²¡æœ‰ä»»ä½•å¯è®­ç»ƒå‚æ•°")
     if is_main_process(rank):
-        print(f"  -> ×Ü²ÎÊıÁ¿: {total/1e6:.2f}M, ¿ÉÑµÁ·(LoRA): {trainable/1e6:.2f}M")
+        print(f"  -> æ€»å‚æ•°é‡: {total/1e6:.2f}M, å¯è®­ç»ƒ(LoRA): {trainable/1e6:.2f}M")
 
     enable_gradient_checkpointing_safe(model, rank)
     model = model.to(device)
-
-    # Dummy forwardÑéÖ¤
-    if is_main_process(rank):
-        print("[ÑéÖ¤] Ö´ĞĞdummy forward¼ì²éÊä³ö¸ñÊ½...")
-        model.eval()
-        with torch.no_grad():
-            dummy_img = torch.randn(1, 3, 224, 224, device=device)
-            dummy_views = [{
-                "img": dummy_img,
-                "data_norm_type": ["dinov2"],
-                "confidence": torch.tensor(0.5, device=device),
-            }]
-            try:
-                dummy_pred = model(dummy_views)
-                if isinstance(dummy_pred, list) and len(dummy_pred) > 0:
-                    print(f"  -> Ä£ĞÍÊä³ökeys: {list(dummy_pred[0].keys())}")
-                else:
-                    print(f"  -> ¾¯¸æ: Ä£ĞÍÊä³ö¸ñÊ½Òì³£: {type(dummy_pred)}")
-            except Exception as e:
-                print(f"  -> dummy forwardÊ§°Ü£¨²»Ó°ÏìÑµÁ·£©: {e}")
-        model.train()
-
     return model
 
-
-# ========================= ÏÔ´æÇåÀí =========================
 
 def _cleanup_batch_tensors(views, predictions, loss=None, loss_scaled=None):
     if views is not None:
@@ -980,13 +807,7 @@ def _cleanup_batch_tensors(views, predictions, loss=None, loss_scaled=None):
         torch.cuda.empty_cache()
 
 
-# ========================= ÑµÁ·Ñ­»·£¨È«ÃæĞŞ¸´°æ£© =========================
-# [ĞŞ¸´P1] Ìİ¶È²Ã¼ô: 5.0 -> 1.0
-# [ĞŞ¸´P2] accum_iter: 8 -> 4
-# [ĞŞ¸´P1] LoRA+ : B_lr = 16x A_lr
-# [ĞŞ¸´P1] ±àÂëÆ÷/Í·Ñ§Ï°ÂÊ·ÖÀë
-# [ĞŞ¸´P2] Ìí¼ÓEMA
-# [ĞŞ¸´P2] ËğÊ§²»ÎÈ¶¨ĞÔ×Ô¶¯¼ì²â
+# ========================= è®­ç»ƒå¾ªç¯ =========================
 
 def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epoch, args, rank, scheduler, ema=None):
     model.train()
@@ -995,325 +816,323 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
 
     total_loss = 0.0
     num_batches = 0
-    data_time = 0.0
-    train_time = 0.0
     optimizer.zero_grad(set_to_none=True)
-
-    if torch.cuda.is_available():
-        torch.cuda.reset_peak_memory_stats(device)
-
-    last_grad_norm = 0.0
-    lora_grad_count = 0
-    lora_grad_norm = 0.0
     skipped_batches = 0
     nan_grad_batches = 0
+    b_first_norm = None  # è®°å½•é¦–ä¸ªbatchåBçš„èŒƒæ•°
 
-    # [ĞŞ¸´P2] ËğÊ§²»ÎÈ¶¨ĞÔ¼ì²â´°¿Ú
-    loss_window = []
-    instable_detected = False
-
-    t_start = time.time()
     for batch_idx, views in enumerate(dataloader):
-        t_data_end = time.time()
-        data_time += (t_data_end - t_start)
-
         for view in views:
             for key, val in view.items():
                 if torch.is_tensor(val):
                     view[key] = val.to(device, non_blocking=True)
 
-        # ÊäÈëÊı¾İÒì³£¼ì²â
         skip_batch = False
         for i, view in enumerate(views):
             img = view.get('img')
             if img is not None and not torch.isfinite(img).all():
                 if is_main_process(rank):
-                    print(f"[Epoch {epoch}] batch {batch_idx}: view[{i}].img °üº¬NaN/Inf£¬Ìø¹ı")
+                    print(f"[Epoch {epoch}] batch {batch_idx}: view[{i}].img åŒ…å«NaN/Infï¼Œè·³è¿‡")
                 skip_batch = True
                 break
         if skip_batch:
             skipped_batches += 1
-            t_start = time.time()
             continue
 
         with autocast(enabled=args.amp, dtype=torch.bfloat16):
             predictions = model(views)
-
-            # Ô¤²âÊä³öÒì³£¼ì²â
             has_nan_pred = False
             for i, pred in enumerate(predictions):
                 for k, v in pred.items():
                     if torch.is_tensor(v) and not torch.isfinite(v).all():
-                        if is_main_process(rank):
-                            print(f"[Epoch {epoch}] batch {batch_idx}: Ô¤²âÊä³ö nan! view={i}, key={k}")
                         has_nan_pred = True
             if has_nan_pred:
                 skipped_batches += 1
                 _cleanup_batch_tensors(views, predictions, None, None)
-                t_start = time.time()
                 continue
-
             loss, metrics = criterion(predictions, views, seq_len=args.seq_len)
 
-        if loss is None:
-            _cleanup_batch_tensors(views, predictions, None, None)
-            skipped_batches += 1
-            t_start = time.time()
-            continue
-
-        loss_val = loss.item() if torch.isfinite(loss) else float('nan')
-
-        if not loss.requires_grad:
+        if loss is None or not torch.isfinite(loss) or not loss.requires_grad:
             _cleanup_batch_tensors(views, predictions, loss, None)
             skipped_batches += 1
-            t_start = time.time()
             continue
 
-        if not torch.isfinite(loss):
-            _cleanup_batch_tensors(views, predictions, loss, None)
-            skipped_batches += 1
-            t_start = time.time()
-            continue
-
-        # [ĞŞ¸´P2] ËğÊ§²»ÎÈ¶¨ĞÔ¼ì²â
-        if torch.isfinite(loss):
-            loss_window.append(loss_val)
-            if len(loss_window) > 20:
-                loss_window.pop(0)
-            if len(loss_window) >= 10 and not instable_detected:
-                recent_mean = np.mean(loss_window[-10:])
-                recent_std = np.std(loss_window[-10:])
-                if recent_mean > 100.0 or (recent_std > recent_mean * 0.5 and recent_mean > 10.0):
-                    if is_main_process(rank):
-                        print(f"?? [Epoch {epoch}] ¼ì²âµ½ÑµÁ·²»ÎÈ¶¨! ½üÆÚloss¾ùÖµ={recent_mean:.2f}, std={recent_std:.2f}")
-                    instable_detected = True
-
+        loss_val = loss.item()
         loss_scaled = loss / args.accum_iter
+        
         if args.amp:
             scaler.scale(loss_scaled).backward()
         else:
             loss_scaled.backward()
 
-        _cleanup_batch_tensors(views, predictions, loss, loss_scaled)
+        # [HOTFIX-è¯Šæ–­] ç¬¬0ä¸ªbatchåè®°å½•BèŒƒæ•°
+        if batch_idx == 0 and b_first_norm is None:
+            for name, p in model.named_parameters():
+                if 'lora_B' in name and p.requires_grad:
+                    b_first_norm = p.norm().item()
+                    break
 
+        _cleanup_batch_tensors(views, predictions, loss, loss_scaled)
         total_loss += loss_val
         num_batches += 1
 
         is_accum_boundary = ((batch_idx + 1) % args.accum_iter == 0) or (batch_idx + 1 == len(dataloader))
         if is_accum_boundary:
-            # Ìİ¶ÈÒì³£¼ì²â
             has_nan_grad = False
-            nan_param_names = []
-            lora_per_layer_grad = {}
-            
             for name, p in model.named_parameters():
                 if p.grad is not None and not torch.isfinite(p.grad).all():
                     has_nan_grad = True
-                    nan_param_names.append(name)
-                if p.grad is not None and ('lora_A' in name or 'lora_B' in name):
-                    g_norm = p.grad.norm().item()
-                    layer_prefix = name.split('.lora_')[0]
-                    if layer_prefix not in lora_per_layer_grad:
-                        lora_per_layer_grad[layer_prefix] = []
-                    lora_per_layer_grad[layer_prefix].append(g_norm)
-
+                    break
             if has_nan_grad:
-                if is_main_process(rank):
-                    print(f"[Epoch {epoch}] batch {batch_idx}: ¼ì²âµ½nanÌİ¶È£¬Ìø¹ıstep£¡")
-                    for n in nan_param_names[:3]:
-                        print(f"    {n}")
                 optimizer.zero_grad(set_to_none=True)
-                last_grad_norm = float('nan')
                 nan_grad_batches += 1
                 torch.cuda.empty_cache()
                 continue
 
-            # [ĞŞ¸´P1] Ìİ¶È²Ã¼ô: 5.0 -> 1.0
-            params_for_clip = list(filter(lambda p: p.requires_grad, model.parameters()))
+            # [HOTFIX-3] A/Båˆ†ç¦»æ¢¯åº¦è£å‰ª
+            a_params = [p for n, p in model.named_parameters() if p.requires_grad and 'lora_A' in n]
+            b_params = [p for n, p in model.named_parameters() if p.requires_grad and 'lora_B' in n]
+            
             if args.amp:
                 scaler.unscale_(optimizer)
-                grad_norm = torch.nn.utils.clip_grad_norm_(params_for_clip, max_norm=args.grad_clip)
+                if a_params:
+                    torch.nn.utils.clip_grad_norm_(a_params, max_norm=args.grad_clip)
+                if b_params:
+                    torch.nn.utils.clip_grad_norm_(b_params, max_norm=args.grad_clip * 5.0)
                 scaler.step(optimizer)
                 scaler.update()
             else:
-                grad_norm = torch.nn.utils.clip_grad_norm_(params_for_clip, max_norm=args.grad_clip)
+                if a_params:
+                    torch.nn.utils.clip_grad_norm_(a_params, max_norm=args.grad_clip)
+                if b_params:
+                    torch.nn.utils.clip_grad_norm_(b_params, max_norm=args.grad_clip * 5.0)
                 optimizer.step()
 
-            # [ĞŞ¸´P2] ¸üĞÂEMA
             if ema is not None:
                 ema.update(model)
-
-            # LoRAÌİ¶ÈÍ³¼Æ
-            lora_grad_norm = 0.0
-            lora_grad_count = 0
-            for name, p in model.named_parameters():
-                if p.grad is not None and ('lora_A' in name or 'lora_B' in name):
-                    lora_grad_norm += p.grad.norm().item() ** 2
-                    lora_grad_count += 1
-            if lora_grad_count > 0:
-                lora_grad_norm = math.sqrt(lora_grad_norm)
-
-            if math.isfinite(grad_norm):
-                last_grad_norm = float(grad_norm)
-            else:
-                last_grad_norm = float('nan')
-
             if scheduler is not None:
                 scheduler.step()
-
             optimizer.zero_grad(set_to_none=True)
             torch.cuda.empty_cache()
 
-            # ÏÔ´æºÍÌİ¶ÈÕï¶Ï
-            if is_main_process(rank) and batch_idx % max(args.log_interval, 5) == 0:
-                allocated = torch.cuda.memory_allocated(device) / 1024**3
-                peak = torch.cuda.max_memory_allocated(device) / 1024**3
-                top_layers = sorted(
-                    [(k, sum(v)/len(v)) for k, v in lora_per_layer_grad.items()],
-                    key=lambda x: x[1], reverse=True
-                )[:3] if lora_per_layer_grad else []
-                layer_str = " | ".join([f"{k.split('.')[-1][:20]}:{v:.3f}" for k, v in top_layers])
-                print(f"  -> ÏÔ´æ: {allocated:.2f}GB | ·åÖµ {peak:.2f}GB | LoRATop3: {layer_str}")
-
-        # ÈÕÖ¾Êä³ö
         if is_main_process(rank) and batch_idx % args.log_interval == 0:
             lr_str = "/".join([f"{g['lr']:.2e}" for g in optimizer.param_groups])
             log_str = (f"[Epoch{epoch}][{batch_idx}/{len(dataloader)}] "
                        f"LR:{lr_str} Loss:{loss_val:.4f}")
-            for key in ['rpe_trans', 'rpe_rot', 'depth', 'ray', 'confidence', 'world_pts']:
+            for key in ['rpe_trans', 'rpe_rot', 'depth', 'ray', 'world_pts']:
                 if key in metrics:
-                    log_str += f"{key}:{metrics[key]:.4f}"
-            if 'rpe_trans' not in metrics and batch_idx % (args.log_interval * 5) == 0:
-                log_str += "|(ÎŞ RPE£¬¼ì²é pose Êä³ö)"
-            if math.isfinite(last_grad_norm):
-                log_str += f"|GradNorm: {last_grad_norm:.4f}"
-            if lora_grad_count > 0:
-                log_str += f"|LoRA_Grad: {lora_grad_norm:.4f}({lora_grad_count})"
-            if skipped_batches > 0:
-                log_str += f"|Ìø¹ı:{skipped_batches}"
-            if nan_grad_batches > 0:
-                log_str += f"|NaNGrad:{nan_grad_batches}"
+                    log_str += f" {key}:{metrics[key]:.4f}"
             print(log_str)
-
-        t_start = time.time()
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
     
+    # Epochç»“æŸ: æ‰“å°BèŒƒæ•°è¯Šæ–­
     if is_main_process(rank):
-        if skipped_batches > 0:
-            print(f"[Epoch {epoch} ×Ü½á] Ìø¹ıbatch: {skipped_batches}/{len(dataloader)}")
-        if nan_grad_batches > 0:
-            print(f"[Epoch {epoch} ×Ü½á] NaNÌİ¶Èbatch: {nan_grad_batches}")
-        
+        b_norms = [p.norm().item() for n, p in model.named_parameters() if 'lora_B' in n and p.requires_grad]
+        avg_b = sum(b_norms) / len(b_norms) if b_norms else 0
+        print(f"[Epoch {epoch} ç»“æŸ] Bå¹³å‡èŒƒæ•°: {avg_b:.4e} | "
+              f"é¦–ä¸ªbatchåB: {b_first_norm if b_first_norm else 'N/A'} | "
+              f"è·³è¿‡batch: {skipped_batches} | NaNGrad: {nan_grad_batches}")
+    
     return total_loss / max(num_batches, 1)
 
 
-# ========================= LoRA-only ±£´æ/¼ÓÔØ¹¤¾ß =========================
+# ========================= ä¿å­˜ (HOTFIX-4: ä¸è¦†ç›–) =========================
 
 def get_lora_state_dict(model):
     return {k: v.detach().cpu() for k, v in model.named_parameters()
             if 'lora_A' in k or 'lora_B' in k}
 
 
-def save_checkpoint_lora(save_model, optimizer, scheduler, scaler, epoch, best_loss, path, is_main, ema=None):
+def save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, path, is_main, ema=None):
     if not is_main:
         return
-
     lora_state = get_lora_state_dict(save_model)
     checkpoint = {
         'epoch': epoch,
         'lora_state_dict': lora_state,
         'optimizer_state_dict': optimizer.state_dict(),
-        'scheduler_state_dict': scheduler.state_dict(),
+        'scheduler_state_dict': scheduler.state_dict() if scheduler is not None else None,
         'scaler_state_dict': scaler.state_dict() if scaler.is_enabled() else None,
         'best_loss': best_loss,
     }
-    # [ĞŞ¸´P2] Í¬Ê±±£´æEMAÈ¨ÖØ
+    # [HOTFIX-4] EMA shadowä¸å†è¦†ç›–çœŸå®å‚æ•°ï¼Œåªä½œä¸ºå‚è€ƒä¿å­˜
     if ema is not None:
-        checkpoint['ema_shadow'] = copy.deepcopy(ema.shadow)
-
+        checkpoint['ema_shadow'] = {k: v.clone() for k, v in ema.shadow.items()}
+    
     tmp_path = path + ".tmp"
     try:
         torch.save(checkpoint, tmp_path)
         os.replace(tmp_path, path)
-        print(f"  -> ±£´æ LoRA checkpoint ({len(lora_state)} ¸ö²ÎÊı): {path}")
+        # å¿«é€ŸéªŒè¯
+        b_norms = [v.norm().item() for k, v in lora_state.items() if 'lora_B' in k]
+        avg_b = sum(b_norms) / len(b_norms) if b_norms else 0
+        print(f"  -> ä¿å­˜ ({len(lora_state)}å‚æ•°) | Bå¹³å‡èŒƒæ•°: {avg_b:.4e} | {path}")
     except Exception as e:
-        print(f"  -> ±£´æÊ§°Ü: {e}")
+        print(f"  -> ä¿å­˜å¤±è´¥: {e}")
         if os.path.exists(tmp_path):
             os.remove(tmp_path)
+
+
+# ========================= æ™ºèƒ½æ¢å¤ (HOTFIX-5) =========================
+
+def smart_resume(model, optimizer, scheduler, scaler, ema, ckpt_path, rank, device):
+    """æ™ºèƒ½æ¢å¤ï¼šä¿Aã€æ£€æµ‹B=0â†’é‡ç½®Bã€æ¸…ç©ºBåŠ¨é‡ã€è·³è¿‡warmup"""
+    if not ckpt_path or not os.path.exists(ckpt_path):
+        return 0, float('inf')
+
+    if is_main_process(rank):
+        print(f"[HOTFIX-5] æ™ºèƒ½æ¢å¤: {ckpt_path}")
+    
+    ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
+    if 'lora_state_dict' in ckpt:
+        state_dict = ckpt['lora_state_dict']
+    else:
+        state_dict = {k: v for k, v in ckpt.get('model_state_dict', {}).items() if 'lora_A' in k or 'lora_B' in k}
+    
+    a_state = {k: v for k, v in state_dict.items() if 'lora_A' in k}
+    b_state = {k: v for k, v in state_dict.items() if 'lora_B' in k}
+    
+    # 1. åŠ è½½Aï¼ˆæ°¸è¿œä¿ç•™ï¼‰
+    model.load_state_dict(a_state, strict=False)
+    
+    # 2. æ£€æµ‹BçŠ¶æ€
+    b_norms = [v.norm().item() for v in b_state.values()]
+    avg_b = sum(b_norms) / len(b_norms) if b_norms else 0
+    b_reinit = avg_b < 1e-10
+    
+    if b_reinit:
+        # Bå…¨ä¸º0 â†’ ä¸åŠ è½½Bï¼Œè®©æ¨¡å‹ç”¨æ–°çš„éé›¶åˆå§‹åŒ–
+        if is_main_process(rank):
+            print(f"  -> [HOTFIX-5a] Bå…¨ä¸º0(avg={avg_b:.4e})ï¼Œé‡æ–°åˆå§‹åŒ–Bä¸ºå°éšæœºå€¼")
+            print(f"  -> AèŒƒæ•°ä¿ç•™: {[f'{v.norm().item():.2f}' for v in a_state.values()][:4]}...")
+    else:
+        # Bæœ‰å€¼ â†’ æ­£å¸¸åŠ è½½
+        model.load_state_dict(b_state, strict=False)
+        if is_main_process(rank):
+            print(f"  -> Béé›¶(avg={avg_b:.4e})ï¼Œæ­£å¸¸åŠ è½½")
+    
+    # 3. ä¼˜åŒ–å™¨çŠ¶æ€ï¼šé€‰æ‹©æ€§å¤„ç†
+    if 'optimizer_state_dict' in ckpt:
+        opt_state = ckpt['optimizer_state_dict']
+        
+        if b_reinit and 'state' in opt_state:
+            # [HOTFIX-5b] æ¸…ç©ºBå‚æ•°çš„AdamåŠ¨é‡(exp_avg/exp_avg_sq)
+            b_cleared = 0
+            # å»ºç«‹ param_id â†’ shape æ˜ å°„
+            b_shapes = set(tuple(v.shape) for k, v in b_state.items())
+            for param_id, state in opt_state['state'].items():
+                if 'exp_avg' in state and 'exp_avg_sq' in state:
+                    shape = tuple(state['exp_avg'].shape)
+                    if shape in b_shapes and state['exp_avg'].numel() > 0:
+                        # åˆ¤æ–­æ˜¯å¦ä¸ºBå‚æ•°ï¼ˆBæ˜¯ç˜¦é«˜çŸ©é˜µrÃ—outï¼ŒAæ˜¯å®½çŸ®çŸ©é˜µinÃ—rï¼‰
+                        if shape[0] <= 32 and shape[1] > 32:  # r=8, out=1536/4608/8192
+                            state['exp_avg'].zero_()
+                            state['exp_avg_sq'].fill_(1e-8)
+                            b_cleared += 1
+            
+            optimizer.load_state_dict(opt_state)
+            if is_main_process(rank):
+                print(f"  -> [HOTFIX-5b] å·²æ¸…ç©º{b_cleared}ä¸ªBå‚æ•°çš„AdamåŠ¨é‡")
+        else:
+            optimizer.load_state_dict(opt_state)
+            if is_main_process(rank):
+                print(f"  -> ä¼˜åŒ–å™¨çŠ¶æ€æ­£å¸¸åŠ è½½")
+    
+    # 4. å­¦ä¹ ç‡è°ƒåº¦ï¼šç›´æ¥æ¢å¤ï¼ˆè·³è¿‡warmupï¼‰
+    if 'scheduler_state_dict' in ckpt and scheduler is not None and ckpt['scheduler_state_dict'] is not None:
+        scheduler.load_state_dict(ckpt['scheduler_state_dict'])
+        current_lr = optimizer.param_groups[0]['lr']
+        if is_main_process(rank):
+            print(f"  -> [HOTFIX-5c] è°ƒåº¦å™¨æ¢å¤ï¼Œå½“å‰LR={current_lr:.2e}ï¼ˆè·³è¿‡warmupï¼‰")
+    
+    # 5. Scaler
+    if 'scaler_state_dict' in ckpt and scaler is not None and ckpt['scaler_state_dict'] is not None:
+        scaler.load_state_dict(ckpt['scaler_state_dict'])
+    
+    # 6. EMAï¼šä¸æ¢å¤æ—§shadowï¼Œé‡æ–°æ³¨å†Œå½“å‰å‚æ•°
+    if ema is not None:
+        ema._register(model)
+        if is_main_process(rank):
+            print(f"  -> [HOTFIX-5d] EMAé‡æ–°åˆå§‹åŒ–ï¼ˆä¸ä½¿ç”¨æ—§shadowï¼‰")
+    
+    epoch = ckpt.get('epoch', 0)
+    best_loss = ckpt.get('best_loss', float('inf'))
+    
+    if is_main_process(rank):
+        print(f"  -> æ¢å¤ epoch {epoch}, best_loss={best_loss:.4f}")
+    
+    del ckpt, state_dict
+    gc.collect()
+    torch.cuda.empty_cache()
+    torch.cuda.synchronize(device)
+    
+    return epoch, best_loss
 
 
 # ========================= Main =========================
 
 def main():
-    parser = argparse.ArgumentParser(description="Train MapAnything LoRA-Only (Fixed Version)")
+    parser = argparse.ArgumentParser(description="MapAnything LoRA Training (v3 Final)")
     parser.add_argument("--seq_root", type=str, nargs='+',
-                        default=["/add02/users/xuyh/seq1/", "/add02/users/xuyh/seq3/"],
-                        help="ÑµÁ·Êı¾İÂ·¾¶£¬¿ÉÖ¸¶¨¶à¸öĞòÁĞ")
+                        default=["/add02/users/xuyh/seq1/", "/add02/users/xuyh/seq3/"])
     parser.add_argument("--model_dir", type=str, default="/home/xuyh/mapanything/")
-    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/new_lora/")
+    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/final_lora/")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=4)
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--img_size", type=int, default=448)
-    # [ĞŞ¸´P1] Ñ§Ï°ÂÊµ÷Õû: Í³Ò»lr -> ·Ö×élr (LoRA+)
-    parser.add_argument("--lr", type=float, default=5e-5, help="LoRA A¾ØÕóÑ§Ï°ÂÊ (ÍÆ¼ö3e-5~5e-5)")
-    parser.add_argument("--lr_b_multiplier", type=float, default=16.0, help="LoRA B¾ØÕóLR = lr * multiplier")
-    parser.add_argument("--encoder_lr_ratio", type=float, default=0.1, help="±àÂëÆ÷LoRA LR = lr * ratio")
+    parser.add_argument("--lr", type=float, default=5e-5)
+    parser.add_argument("--lr_b_multiplier", type=float, default=16.0)
+    parser.add_argument("--encoder_lr_ratio", type=float, default=0.1)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--warmup_steps", type=int, default=500)
-    # [ĞŞ¸´P1] Ìİ¶È²Ã¼ô: 5.0 -> 1.0 (LoRAÍÆ¼ö0.5~1.0)
-    parser.add_argument("--grad_clip", type=float, default=1.0, help="Ìİ¶È²Ã¼ôãĞÖµ")
+    parser.add_argument("--grad_clip", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--amp", action="store_true", default=False)
-    parser.add_argument("--resume", type=str, default="/add02/users/xuyh/checkpoints/new_lora/checkpoints/epoch_002.pt")
+    parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--tolerance", type=float, default=0.05)
-    # [ĞŞ¸´P2] accum_iter: 8 -> 4
-    parser.add_argument("--accum_iter", type=int, default=4, help="Ìİ¶ÈÀÛ»ı²½Êı")
-    # [ĞŞ¸´P2] LoRA rank: 16 -> 8
-    parser.add_argument("--lora_r", type=int, default=8, help="LoRA rank (ÍÆ¼ö4~8)")
-    parser.add_argument("--lora_alpha", type=int, default=8, help="LoRA alpha")
-    # [ĞŞ¸´P2] EMA
-    parser.add_argument("--use_ema", action="store_true", default=True, help="Ê¹ÓÃEMA")
-    parser.add_argument("--ema_decay", type=float, default=0.999, help="EMAË¥¼õÂÊ")
+    parser.add_argument("--accum_iter", type=int, default=4)
+    parser.add_argument("--lora_r", type=int, default=8)
+    parser.add_argument("--lora_alpha", type=int, default=8)
+    parser.add_argument("--use_ema", action="store_true", default=True)
+    parser.add_argument("--ema_decay", type=float, default=0.999)
     args = parser.parse_args()
 
     rank, local_rank, world_size, is_ddp = setup_ddp()
     device = torch.device(f"cuda:{local_rank}")
-
     torch.cuda.set_per_process_memory_fraction(1.00, device)
     torch.set_float32_matmul_precision('high')
-
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
     torch.backends.cudnn.benchmark = True
 
     if is_main_process(rank):
         os.makedirs(args.output_dir, exist_ok=True)
-    if is_ddp:
-        torch.distributed.barrier()
-    checkpoint_dir = os.path.join(args.output_dir, "checkpoints")
-    if is_main_process(rank):
-        os.makedirs(checkpoint_dir, exist_ok=True)
+        os.makedirs(os.path.join(args.output_dir, "checkpoints"), exist_ok=True)
 
     if is_main_process(rank):
-        print("=" * 60)
-        print("MapAnything LoRA Training (È«ÃæĞŞ¸´°æ)")
-        print(f"  LoRA A LR: {args.lr}, B LR: {args.lr * args.lr_b_multiplier:.2e}")
+        print("=" * 65)
+        print("MapAnything LoRA Training v3 Final")
+        print("=" * 65)
+        print(f"[HOTFIX-1] Båˆå§‹åŒ–: randn*0.01 (éé›¶èµ·ç‚¹)")
+        print(f"[HOTFIX-2] Bæƒé‡è¡°å‡: 0.0")
+        print(f"[HOTFIX-3] Bæ¢¯åº¦è£å‰ª: {args.grad_clip * 5.0} (A={args.grad_clip})")
+        print(f"[HOTFIX-4] ä¿å­˜: ä¸å†ç”¨EMAè¦†ç›–")
+        print(f"[HOTFIX-5] æ¢å¤: æ™ºèƒ½æ£€æµ‹B=0â†’é‡ç½®B+æ¸…åŠ¨é‡+è·³è¿‡warmup")
+        print(f"  A LR: {args.lr}, B LR: {args.lr * args.lr_b_multiplier:.2e}")
         print(f"  Encoder LR ratio: {args.encoder_lr_ratio}")
-        print(f"  LoRA r={args.lora_r}, alpha={args.lora_alpha}, scaling={args.lora_alpha/args.lora_r}")
-        print(f"  GradClip: {args.grad_clip}, Accum: {args.accum_iter}")
-        print(f"  EMA: {args.use_ema} (decay={args.ema_decay})")
-        print("=" * 60)
-        print("¼ÓÔØÄ£ĞÍ...")
+        print(f"  LoRA r={args.lora_r}, alpha={args.lora_alpha}")
+        print(f"  Accum: {args.accum_iter}, GradClip A/B: {args.grad_clip}/{args.grad_clip*5.0}")
+        print("=" * 65)
 
     model = build_model(args.model_dir, device, rank, lora_r=args.lora_r, lora_alpha=args.lora_alpha)
 
-    # [ĞŞ¸´P1] LoRA+: ·Ö×é²ÎÊı (A¾ØÕó, B¾ØÕó, ±àÂëÆ÷vsÍ·)
+    # [HOTFIX-2] Bçš„weight_decay=0
     lora_A_params_encoder = []
     lora_B_params_encoder = []
     lora_A_params_head = []
@@ -1336,185 +1155,105 @@ def main():
 
     param_groups = [
         {'params': lora_A_params_head, 'lr': args.lr, 'weight_decay': args.weight_decay, 'name': 'head_lora_A'},
-        {'params': lora_B_params_head, 'lr': args.lr * args.lr_b_multiplier, 'weight_decay': args.weight_decay, 'name': 'head_lora_B'},
+        {'params': lora_B_params_head, 'lr': args.lr * args.lr_b_multiplier, 'weight_decay': 0.0, 'name': 'head_lora_B'},  # wd=0
         {'params': lora_A_params_encoder, 'lr': args.lr * args.encoder_lr_ratio, 'weight_decay': args.weight_decay, 'name': 'enc_lora_A'},
-        {'params': lora_B_params_encoder, 'lr': args.lr * args.lr_b_multiplier * args.encoder_lr_ratio, 'weight_decay': args.weight_decay, 'name': 'enc_lora_B'},
+        {'params': lora_B_params_encoder, 'lr': args.lr * args.lr_b_multiplier * args.encoder_lr_ratio, 'weight_decay': 0.0, 'name': 'enc_lora_B'},  # wd=0
     ]
-    # ¹ıÂË¿Õ×é
     param_groups = [g for g in param_groups if len(g['params']) > 0]
 
     if is_main_process(rank):
         total_trainable = sum(len(g['params']) for g in param_groups)
-        print(f"ÓÅ»¯Æ÷: {total_trainable} ¸ö²ÎÊı, {len(param_groups)} ¸ö²ÎÊı×é")
+        print(f"ä¼˜åŒ–å™¨: {total_trainable} å‚æ•°, {len(param_groups)} ç»„")
         for g in param_groups:
-            print(f"  -> {g['name']}: {len(g['params'])} params, lr={g['lr']:.2e}")
+            print(f"  -> {g['name']}: {len(g['params'])} params, lr={g['lr']:.2e}, wd={g.get('weight_decay', 0)}")
 
     optimizer = AdamW(param_groups, betas=(0.9, 0.999))
 
     if is_ddp:
         model = torch.nn.parallel.DistributedDataParallel(
             model, device_ids=[local_rank], output_device=local_rank,
-            find_unused_parameters=False,
-            gradient_as_bucket_view=True
-        )
+            find_unused_parameters=False, gradient_as_bucket_view=True)
 
-    # Êı¾İ¼¯¹¹½¨
-    if is_main_process(rank):
-        print(f"¹¹½¨Êı¾İ¼¯... (seq_len={args.seq_len})")
-
+    # æ•°æ®é›†
     if len(args.seq_root) == 1:
-        dataset = SeqRGBDataset(
-            seq_root=args.seq_root[0], seq_len=args.seq_len, stride=args.stride,
-            img_size=args.img_size, tolerance=args.tolerance
-        )
+        dataset = SeqRGBDataset(seq_root=args.seq_root[0], seq_len=args.seq_len,
+                                stride=args.stride, img_size=args.img_size, tolerance=args.tolerance)
     else:
-        datasets = []
-        for idx, root in enumerate(args.seq_root):
-            ds = SeqRGBDataset(
-                seq_root=root, seq_len=args.seq_len, stride=args.stride,
-                img_size=args.img_size, tolerance=args.tolerance
-            )
-            datasets.append(ds)
+        datasets = [SeqRGBDataset(seq_root=root, seq_len=args.seq_len, stride=args.stride,
+                                  img_size=args.img_size, tolerance=args.tolerance) for root in args.seq_root]
         dataset = ConcatDataset(datasets)
 
     sampler = torch.utils.data.distributed.DistributedSampler(
-        dataset, num_replicas=world_size, rank=rank, shuffle=True
-    ) if is_ddp else None
+        dataset, num_replicas=world_size, rank=rank, shuffle=True) if is_ddp else None
+    dataloader = DataLoader(dataset, batch_size=args.batch_size, shuffle=(sampler is None),
+                            sampler=sampler, num_workers=min(4, args.num_workers),
+                            pin_memory=True, collate_fn=collate_fn, persistent_workers=False,
+                            prefetch_factor=2 if args.num_workers > 0 else None)
 
-    dataloader = DataLoader(
-        dataset, batch_size=args.batch_size, shuffle=(sampler is None),
-        sampler=sampler,
-        num_workers=min(4, args.num_workers),
-        pin_memory=True, collate_fn=collate_fn,
-        persistent_workers=False,
-        prefetch_factor=2 if args.num_workers > 0 else None,
-    )
-
-    # Ñ§Ï°ÂÊµ÷¶È
+    # å­¦ä¹ ç‡è°ƒåº¦
     steps_per_epoch = len(dataloader) // args.accum_iter
     total_steps = args.epochs * steps_per_epoch
     warmup_steps = min(args.warmup_steps, total_steps // 2)
     cosine_steps = max(1, total_steps - warmup_steps)
-
     warmup_scheduler = LinearLR(optimizer, start_factor=0.01, end_factor=1.0, total_iters=warmup_steps)
     cosine_scheduler = CosineAnnealingLR(optimizer, T_max=cosine_steps, eta_min=args.lr * 0.01)
-    scheduler = SequentialLR(
-        optimizer,
-        schedulers=[warmup_scheduler, cosine_scheduler],
-        milestones=[warmup_steps]
-    )
+    scheduler = SequentialLR(optimizer, schedulers=[warmup_scheduler, cosine_scheduler], milestones=[warmup_steps])
 
-    if is_main_process(rank):
-        print(f"ÑµÁ·×Ü²½Êı: {total_steps}, warmup: {warmup_steps}, cosine: {cosine_steps}")
-
-    # [ĞŞ¸´P0/P1] ËğÊ§º¯Êı: È«Ãæ¶Ô±êMapAnything¹Ù·½ÅäÖÃ
+    # æŸå¤±å‡½æ•°
     criterion = MapAnythingLoss(
-        w_depth=0.1,           # [ĞŞ¸´] 1.0->0.1
-        w_pose_trans=0.1,      # [ĞŞ¸´] 1.0->0.1
-        w_pose_rot=0.1,        # [ĞŞ¸´] 1.0->0.1
-        w_ray=0.1,             # [ĞŞ¸´] 1.0->0.1
-        w_pts3d_cam=0.1,       # [ĞŞ¸´] 1.0->0.1
-        w_world_pts=1.0,       # [ĞÂÔö] world frame points (Ö÷ËğÊ§)
-        w_confidence=0.2,      # [ĞÂÔö] ÖÃĞÅ¶ÈËğÊ§
-        w_scale=0.1,           # [ĞÂÔö] ³ß¶ÈËğÊ§
-        robust_alpha=0.5,      # [ĞÂÔö] HuberËğÊ§²ÎÊı
-        robust_c=0.05,         # [ĞÂÔö] Â³°ôËğÊ§Ëõ·Å
-        top_n_percent=5.0,     # [ĞÂÔö] Top-NÏñËØÅÅ³ı
-        use_log_depth=True,    # [ĞÂÔö] ¶ÔÊı¿Õ¼äÉî¶È
-        use_chordal_rot=True,  # [ĞÂÔö] chordalĞı×ª¾àÀë
-    )
+        w_depth=0.1, w_pose_trans=0.1, w_pose_rot=0.1, w_ray=0.1,
+        w_pts3d_cam=0.1, w_world_pts=1.0, w_confidence=0.2,
+        w_scale=0.1, robust_alpha=0.5, robust_c=0.05,
+        top_n_percent=5.0, use_log_depth=True, use_chordal_rot=True)
 
     scaler = GradScaler(enabled=args.amp)
-
-    # [ĞŞ¸´P2] ³õÊ¼»¯EMA
     ema = None
     if args.use_ema and is_main_process(rank):
         target_model = model.module if is_ddp else model
         ema = ModelEMA(target_model, decay=args.ema_decay)
-        print(f"[EMA] ÒÑÆôÓÃ, decay={args.ema_decay}")
+        print(f"[EMA] å·²å¯ç”¨, decay={args.ema_decay} (ä»…å‚è€ƒ,ä¸è¦†ç›–ä¿å­˜)")
 
+    # [HOTFIX-5] æ™ºèƒ½æ¢å¤
     start_epoch = 0
     best_loss = float('inf')
-    if args.resume and os.path.exists(args.resume):
-        if is_main_process(rank):
-            print(f"»Ö¸´ÑµÁ·: {args.resume}")
-
-        ckpt = torch.load(args.resume, map_location='cpu')
-        if 'lora_state_dict' in ckpt:
-            state_dict = ckpt['lora_state_dict']
-        else:
-            state_dict = ckpt['model_state_dict']
-        
-        start_epoch = ckpt.get('epoch', 0) + 1
-        best_loss = ckpt.get('best_loss', float('inf'))
-
+    if args.resume:
         target_model = model.module if is_ddp else model
-        target_model.load_state_dict(state_dict, strict=False)
+        start_epoch, best_loss = smart_resume(
+            target_model, optimizer, scheduler, scaler, ema,
+            args.resume, rank, device)
+        start_epoch += 1  # ä»ä¸‹ä¸€ä¸ªepochå¼€å§‹
 
-        # [ĞŞ¸´P2] »Ö¸´EMA
-        if ema is not None and 'ema_shadow' in ckpt:
-            ema.shadow = ckpt['ema_shadow']
-            print(f"[EMA] ÒÑ»Ö¸´EMA×´Ì¬")
+    if is_main_process(rank):
+        print(f"è®­ç»ƒ: epoch {start_epoch}~{args.epochs}, steps/epoch={steps_per_epoch}")
 
-        if is_main_process(rank):
-            lora_state_loaded = get_lora_state_dict(target_model)
-            a_norms = [v.norm().item() for k, v in lora_state_loaded.items() if 'lora_A' in k]
-            b_norms = [v.norm().item() for k, v in lora_state_loaded.items() if 'lora_B' in k]
-            if a_norms:
-                print(f"  -> LoRA_A Æ½¾ù·¶Êı: {sum(a_norms)/len(a_norms):.4f}")
-                print(f"  -> LoRA_B Æ½¾ù·¶Êı: {sum(b_norms)/len(b_norms):.4f}")
-
-        del ckpt, state_dict
-        gc.collect()
-        torch.cuda.empty_cache()
-        torch.cuda.synchronize(device)
-
+    # è®­ç»ƒå¾ªç¯
     for epoch in range(start_epoch, args.epochs):
         if sampler is not None:
             sampler.set_epoch(epoch)
-        epoch_start = time.time()
-        avg_loss = train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epoch, args, rank, scheduler, ema)
-        epoch_time = time.time() - epoch_start
-
+        avg_loss = train_one_epoch(model, dataloader, optimizer, scaler, criterion,
+                                   device, epoch, args, rank, scheduler, ema)
         if is_main_process(rank):
-            print(f"Epoch {epoch} Íê³É | Æ½¾ùËğÊ§: {avg_loss:.4f} | ×ÜºÄÊ±: {epoch_time:.1f}s")
+            print(f"Epoch {epoch} å®Œæˆ | å¹³å‡æŸå¤±: {avg_loss:.4f}")
             
-            # ±£´æcheckpoint (Ê¹ÓÃEMAÈ¨ÖØ)
             if (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1:
-                ckpt_path = os.path.join(checkpoint_dir, f"epoch_{epoch:03d}.pt")
+                ckpt_path = os.path.join(args.output_dir, "checkpoints", f"epoch_{epoch:03d}.pt")
                 torch.cuda.empty_cache()
                 save_model = model.module if is_ddp else model
-                
-                # [ĞŞ¸´P2] ±£´æÇ°Ó¦ÓÃEMA
-                if ema is not None:
-                    ema.apply_shadow(save_model)
-                
-                save_checkpoint_lora(save_model, optimizer, scheduler, scaler, epoch, best_loss, ckpt_path, True, ema)
-                
-                if ema is not None:
-                    ema.restore(save_model)
-
+                save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, ckpt_path, True, ema)
+            
             if avg_loss < best_loss:
                 best_loss = avg_loss
-                best_path = os.path.join(checkpoint_dir, "best.pt")
+                best_path = os.path.join(args.output_dir, "checkpoints", "best.pt")
                 torch.cuda.empty_cache()
                 save_model = model.module if is_ddp else model
-                
-                if ema is not None:
-                    ema.apply_shadow(save_model)
-                    
-                save_checkpoint_lora(save_model, optimizer, scheduler, scaler, epoch, best_loss, best_path, True, ema)
-                
-                if ema is not None:
-                    ema.restore(save_model)
-                    
-                print(f"  -> ±£´æ×î¼ÑÄ£ĞÍ (loss={best_loss:.4f})")
-                
+                save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, best_path, True, ema)
+                print(f"  -> æœ€ä½³æ¨¡å‹ (loss={best_loss:.4f})")
+        
         torch.cuda.empty_cache()
         torch.cuda.synchronize(device)
 
     if is_main_process(rank):
-        print("ÑµÁ·Íê³É!")
+        print("è®­ç»ƒå®Œæˆ!")
     cleanup_ddp(is_ddp)
 
 
