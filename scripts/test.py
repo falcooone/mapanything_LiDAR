@@ -100,6 +100,46 @@ def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: float = 32.
             inject_lora_to_module(child, r, lora_alpha)
 
 
+LEGACY_KEY_ALIASES = {
+    "fusion_gate_mlp.0.weight": "fusion_module.gate_mlp.0.weight",
+    "fusion_gate_mlp.0.bias": "fusion_module.gate_mlp.0.bias",
+    "fusion_gate_mlp.2.weight": "fusion_module.gate_mlp.2.weight",
+    "fusion_gate_mlp.2.bias": "fusion_module.gate_mlp.2.bias",
+    "fusion_refine.weight": "fusion_module.refine.weight",
+}
+
+
+def _normalize_state_dict_keys(state_dict):
+    normalized = {}
+    alias_hits = {}
+    for key, value in state_dict.items():
+        new_key = LEGACY_KEY_ALIASES.get(key, key)
+        normalized[new_key] = value
+        if new_key != key:
+            alias_hits[key] = new_key
+    return normalized, alias_hits
+
+
+LEGACY_KEY_ALIASES = {
+    "fusion_gate_mlp.0.weight": "fusion_module.gate_mlp.0.weight",
+    "fusion_gate_mlp.0.bias": "fusion_module.gate_mlp.0.bias",
+    "fusion_gate_mlp.2.weight": "fusion_module.gate_mlp.2.weight",
+    "fusion_gate_mlp.2.bias": "fusion_module.gate_mlp.2.bias",
+    "fusion_refine.weight": "fusion_module.refine.weight",
+}
+
+
+def _normalize_state_dict_keys(state_dict):
+    normalized = {}
+    alias_hits = {}
+    for key, value in state_dict.items():
+        new_key = LEGACY_KEY_ALIASES.get(key, key)
+        normalized[new_key] = value
+        if new_key != key:
+            alias_hits[key] = new_key
+    return normalized, alias_hits
+
+
 # ========================= LiDAR 预处理 (与 pcd.py 逐行一致) =========================
 def rotation_matrix_from_lookat(direction, up=np.array([0, 0, 1])):
     z_cam = direction / np.linalg.norm(direction)
@@ -374,10 +414,17 @@ def build_model_for_eval(model_dir: str, device: str,
                 new_k = k.replace('module.', '')
                 new_state_dict[new_k] = v
 
+            new_state_dict, alias_hits = _normalize_state_dict_keys(new_state_dict)
+
             model_keys = set(model.state_dict().keys())
             ckpt_keys = set(new_state_dict.keys())
             common_keys = model_keys & ckpt_keys
             lora_common = [k for k in common_keys if 'lora_' in k]
+            fusion_common = [k for k in common_keys if k.startswith('fusion_module.')]
+            if alias_hits:
+                print("[Fusion-Diag] legacy fusion key aliases detected:")
+                for old_k, new_k in alias_hits.items():
+                    print(f"  - {old_k} -> {new_k}")
             print(f"[LoRA-Diag] 模型 LoRA 参数总数: {sum(1 for k in model_keys if 'lora_' in k)}")
             print(f"[LoRA-Diag] checkpoint 中 LoRA 参数总数: {sum(1 for k in ckpt_keys if 'lora_' in k)}")
             print(f"[LoRA-Diag] 成功匹配的 LoRA 参数: {len(lora_common)}")
@@ -423,10 +470,23 @@ def build_model_for_eval(model_dir: str, device: str,
                     if gate_mlp is not None and len(gate_mlp) >= 3:
                         gate_bias = gate_mlp[-1].bias.mean().item()
                         gate_weight_norm = gate_mlp[-1].weight.norm().item()
-                        print(f"[Fusion-Diag] gate_bias_mean={gate_bias:.3f}, gate_weight_norm={gate_weight_norm:.3f}")
+                        gate_weight_abs_mean = gate_mlp[-1].weight.abs().mean().item()
+                        gate_sigmoid = torch.sigmoid(gate_mlp[-1].bias.mean()).item()
+                        print(
+                            f"[Fusion-Diag] gate_bias_mean={gate_bias:.6f}, "
+                            f"gate_weight_norm={gate_weight_norm:.6e}, "
+                            f"gate_weight_abs_mean={gate_weight_abs_mean:.6e}, "
+                            f"gate_sigmoid(mean_bias)={gate_sigmoid:.6f}"
+                        )
                     if refine is not None and hasattr(refine, "weight"):
                         refine_norm = refine.weight.norm().item()
-                        print(f"[Fusion-Diag] refine_weight_norm={refine_norm:.3f}")
+                        refine_abs_mean = refine.weight.abs().mean().item()
+                        print(
+                            f"[Fusion-Diag] refine_weight_norm={refine_norm:.6e}, "
+                            f"refine_weight_abs_mean={refine_abs_mean:.6e}"
+                        )
+                    if fusion_common:
+                        print(f"[Fusion-Diag] loaded fusion keys: {len(fusion_common)}")
                 else:
                     print("[Fusion-Diag] warning: fusion_module not found")
             # ================================================
