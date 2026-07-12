@@ -1310,24 +1310,25 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
     param_groups = []
     
     if phase == 'warmup':
+        warmup_lr_scale = args.lidar_warmup_lr_scale
         if lidar_params:
             param_groups.append({
                 'params': lidar_params,
-                'lr': args.lr * args.lidar_lr_scale,
+                'lr': args.lr * args.lidar_lr_scale * warmup_lr_scale,
                 'weight_decay': args.weight_decay,
                 'name': 'lidar_warmup'
             })
         if shared_params:
             param_groups.append({
                 'params': shared_params,
-                'lr': args.lr * 0.5,  # shared 层用较低学习率
+                'lr': args.lr * 0.5 * warmup_lr_scale,
                 'weight_decay': args.weight_decay,
                 'name': 'shared_proj'
             })
         if head_base_params:
             param_groups.append({
                 'params': head_base_params,
-                'lr': args.lr,
+                'lr': args.lr * warmup_lr_scale,
                 'weight_decay': args.weight_decay,
                 'name': 'head_base'
             })
@@ -1740,8 +1741,8 @@ def main():
     # ========== LiDAR Warmup 新参数 ==========
     parser.add_argument("--lidar_warmup_epochs", type=int, default=2,
                         help="??N ??epoch ??? LoRA?????? LiDAR + Heads (???: 2)")
-    parser.add_argument("--lidar_warmup_lr_scale", type=float, default=1.0,
-                        help="warmup ??? LiDAR ????????(???: 1.0)")
+    parser.add_argument("--lidar_warmup_lr_scale", type=float, default=0.5,
+                        help="warmup 阶段的整体 LR 缩放系数，默认 0.5 更稳")
     parser.add_argument("--fusion_smooth_alpha", type=float, default=0.30,
                         help="joint phase fusion gate bias target (default: 0.30)")
     # ========================================
