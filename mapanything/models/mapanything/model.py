@@ -143,7 +143,7 @@ class GatedMultimodalFusion(nn.Module):
         # Start close to the RGB branch and let training gradually open the
         # LiDAR contribution where it is helpful.
         nn.init.zeros_(self.gate_mlp[-1].weight)
-        nn.init.constant_(self.gate_mlp[-1].bias, -2.0)
+        nn.init.constant_(self.gate_mlp[-1].bias, 0.0)
         nn.init.zeros_(self.refine.weight)
 
     def forward(self, rgb_feat: torch.Tensor, lidar_feat: torch.Tensor) -> torch.Tensor:
@@ -297,6 +297,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             kernel_size=1,
             bias=True,
         )
+        nn.init.zeros_(self.fusion_conv.weight)
+        nn.init.zeros_(self.fusion_conv.bias)
 
         # Initialize the fusion norm layer
         self.fusion_norm_layer = fusion_norm_layer(self.encoder.enc_embed_dim)
@@ -1541,6 +1543,13 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 all_encoder_features_across_views,
                 lidars_features_across_views,
             )
+            fusion_pair = torch.cat(
+                [all_encoder_features_across_views, lidars_features_across_views],
+                dim=1,
+            )
+            # Keep a direct fusion residual path so the trained fusion_conv
+            # meaningfully contributes instead of remaining a dead parameter.
+            all_encoder_features_across_views = all_encoder_features_across_views + 0.25 * self.fusion_conv(fusion_pair)
 
             # print("Lidar In")
     

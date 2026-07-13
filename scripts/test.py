@@ -366,6 +366,12 @@ def build_model_for_eval(model_dir: str, device: str,
         torch_hub_force_reload=False,
         info_sharing_mlp_layer_str="swiglufused"
     )
+    fusion_conv = getattr(model, "fusion_conv", None)
+    if fusion_conv is not None and hasattr(fusion_conv, "weight"):
+        with torch.no_grad():
+            fusion_conv.weight.zero_()
+            if fusion_conv.bias is not None:
+                fusion_conv.bias.zero_()
 
     if os.path.exists(weights_path):
         print(f"[Model] 加载预训练权重: {weights_path}")
