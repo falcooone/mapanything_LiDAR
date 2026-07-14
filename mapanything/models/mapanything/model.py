@@ -245,6 +245,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         
         # Initialize the encoder for lidars
         lidars_encoder_config = self.geometric_input_config["lidars_encoder_config"]
+        self.lidar_in_chans = int(lidars_encoder_config.get("in_chans", 7))
         lidars_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
         lidars_encoder_config["patch_size"] = self.encoder.patch_size
         self.lidars_encoder = encoder_factory(**lidars_encoder_config)
@@ -1292,7 +1293,7 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 ]
             )
             lidars_for_curr_view = torch.zeros(
-                (batch_size_per_view, height, width, 7),
+                (batch_size_per_view, height, width, self.lidar_in_chans),
                 dtype=all_encoder_features_across_views.dtype,
                 device=all_encoder_features_across_views.device,
             )
@@ -1314,8 +1315,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             lidars_list.append(lidars_for_curr_view)
 
         # Stack the lidars for all the views and permute to (B * V, C, H, W)
-        lidars = torch.cat(lidars_list, dim=0)  # (B * V, H, W, 7)
-        lidars = lidars.permute(0, 3, 1, 2).contiguous()  # (B * V, 7, H, W)
+        lidars = torch.cat(lidars_list, dim=0)
+        lidars = lidars.permute(0, 3, 1, 2).contiguous()
 
         # Encode the lidar
         lidars_features_across_views = self.lidars_encoder(

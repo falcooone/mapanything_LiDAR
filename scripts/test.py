@@ -12,7 +12,7 @@ MapAnything LoRA Evaluation Script (Fixed)
   5. uses_torch_hub=False（与训练一致）。
   6. lora_alpha 默认 32.0（与训练一致）。
   7. cap 去掉 *255 缩放（与训练一致，值域 [0,1]）。
-  8. pcd shape 修正为 [B, H, W, 7]（与训练一致，channel-last）。
+  8. pcd shape 修正为 [B, H, W, 9]（与训练一致，channel-last）。
   9. 加 fusion_module 权重诊断。
 """
 
@@ -24,6 +24,7 @@ import argparse
 import glob
 import re
 import math
+import copy
 import warnings
 from typing import List, Dict
 
@@ -120,6 +121,41 @@ def _normalize_state_dict_keys(state_dict):
     return normalized, alias_hits
 
 
+GLOBAL_DEPTH_MAX = 40.0
+LIDAR_NUM_CHANNELS = 9
+
+
+def _empty_pcd_feature_dict(H, W, device):
+    depth = torch.zeros((H, W), dtype=torch.float32, device=device)
+    normal = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
+    cap = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
+    valid = torch.zeros((H, W), dtype=torch.float32, device=device)
+    edge = torch.zeros((H, W), dtype=torch.float32, device=device)
+    return {'cap': cap, 'depth': depth, 'normal': normal, 'valid': valid, 'edge': edge}
+
+
+def _compute_sparse_depth_edge(depth_rel, valid_mask):
+    edge = np.zeros_like(depth_rel, dtype=np.float32)
+
+    dx = np.abs(depth_rel[:, 1:] - depth_rel[:, :-1])
+    valid_x = valid_mask[:, 1:] & valid_mask[:, :-1]
+    dx = np.where(valid_x, dx, 0.0)
+    edge[:, 1:] = np.maximum(edge[:, 1:], dx)
+    edge[:, :-1] = np.maximum(edge[:, :-1], dx)
+
+    dy = np.abs(depth_rel[1:, :] - depth_rel[:-1, :])
+    valid_y = valid_mask[1:, :] & valid_mask[:-1, :]
+    dy = np.where(valid_y, dy, 0.0)
+    edge[1:, :] = np.maximum(edge[1:, :], dy)
+    edge[:-1, :] = np.maximum(edge[:-1, :], dy)
+
+    positive = edge[edge > 0]
+    if positive.size > 0:
+        scale = float(np.percentile(positive, 95))
+        edge = edge / max(scale, 1e-6)
+    return np.clip(edge, 0.0, 1.0).astype(np.float32)
+
+
 LEGACY_KEY_ALIASES = {
     "fusion_gate_mlp.0.weight": "fusion_module.gate_mlp.0.weight",
     "fusion_gate_mlp.0.bias": "fusion_module.gate_mlp.0.bias",
@@ -196,10 +232,7 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
     R = rotation_matrix_from_lookat(direction)
 
     if len(points) == 0:
-        depth = torch.zeros((H, W), dtype=torch.float32, device=device)
-        normal = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
-        cap = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
-        result = {'cap': cap, 'depth': depth, 'normal': normal}
+        result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
             pcd_cache[pcd_idx] = result
         return result
@@ -208,10 +241,7 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
     x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
     valid_mask = z > 0
     if not np.any(valid_mask):
-        depth = torch.zeros((H, W), dtype=torch.float32, device=device)
-        normal = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
-        cap = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
-        result = {'cap': cap, 'depth': depth, 'normal': normal}
+        result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
             pcd_cache[pcd_idx] = result
         return result
@@ -221,10 +251,7 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
     v = (f * y / z) + cy
     in_image = (u >= 0) & (u < img_size[0]) & (v >= 0) & (v < img_size[1])
     if not np.any(in_image):
-        depth = torch.zeros((H, W), dtype=torch.float32, device=device)
-        normal = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
-        cap = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
-        result = {'cap': cap, 'depth': depth, 'normal': normal}
+        result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
             pcd_cache[pcd_idx] = result
         return result
@@ -237,10 +264,7 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
     normals, curv, aniso, plan = compute_features_for_indices(pcd, valid_indices, radius=0.1, max_nn=30)
     good_mask = ~np.isnan(curv)
     if not np.any(good_mask):
-        depth = torch.zeros((H, W), dtype=torch.float32, device=device)
-        normal = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
-        cap = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
-        result = {'cap': cap, 'depth': depth, 'normal': normal}
+        result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
             pcd_cache[pcd_idx] = result
         return result
@@ -266,25 +290,35 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
             aniso_img[vi, ui] = aniso[i]
             plan_img[vi, ui] = plan[i]
 
-    finite = np.isfinite(depth_img)
-    if not np.any(finite):
+    valid_img = np.isfinite(depth_img)
+    if not np.any(valid_img):
         depth_img = np.zeros((H, W), dtype=np.float32)
     else:
-        depth_img[~finite] = 0.0
+        depth_img[~valid_img] = 0.0
 
     # ========== 修复：去掉 *255，与训练一致（值域 [0,1]）==========
     cap_np = np.stack([curv_img, aniso_img, plan_img], axis=-1)
     cap_np = np.clip(cap_np, 0.0, 1.0).astype(np.float32)
     # ============================================================
 
-    depth_np = depth_img.astype(np.float32)
+    depth_np = np.clip(depth_img / GLOBAL_DEPTH_MAX, 0.0, 1.0).astype(np.float32)
+    valid_np = valid_img.astype(np.float32)
+    edge_np = _compute_sparse_depth_edge(depth_np, valid_img)
     normal_np = normal_img.astype(np.float32)
 
     cap_tensor = torch.from_numpy(cap_np).to(device)
     depth_tensor = torch.from_numpy(depth_np).to(device)
     normal_tensor = torch.from_numpy(normal_np).to(device)
+    valid_tensor = torch.from_numpy(valid_np).to(device)
+    edge_tensor = torch.from_numpy(edge_np).to(device)
 
-    result = {'cap': cap_tensor, 'depth': depth_tensor, 'normal': normal_tensor}
+    result = {
+        'cap': cap_tensor,
+        'depth': depth_tensor,
+        'normal': normal_tensor,
+        'valid': valid_tensor,
+        'edge': edge_tensor,
+    }
     if pcd_cache is not None and pcd_idx is not None:
         pcd_cache[pcd_idx] = result
     return result
@@ -355,13 +389,20 @@ def build_model_for_eval(model_dir: str, device: str,
     # ========== 修复：uses_torch_hub = False（与训练一致）==========
     encoder_config["uses_torch_hub"] = False
     # =============================================================
+    geometric_input_config = copy.deepcopy(config.get("geometric_input_config", {}))
+    lidar_encoder_config = geometric_input_config.get("lidars_encoder_config", {})
+    lidar_encoder_config["in_chans"] = LIDAR_NUM_CHANNELS
+    lidar_encoder_config["uses_torch_hub"] = False
+    lidar_encoder_config.pop("pretrained", None)
+    lidar_encoder_config.pop("weights", None)
+    geometric_input_config["lidars_encoder_config"] = lidar_encoder_config
 
     model = MapAnything(
         name=config.get("name", "mapanything"),
         encoder_config=encoder_config,
         info_sharing_config=config.get("info_sharing_config", {}),
         pred_head_config=config.get("pred_head_config", {}),
-        geometric_input_config=config.get("geometric_input_config", {}),
+        geometric_input_config=geometric_input_config,
         pretrained_checkpoint_path=None,
         torch_hub_force_reload=False,
         info_sharing_mlp_layer_str="swiglufused"
@@ -376,7 +417,15 @@ def build_model_for_eval(model_dir: str, device: str,
     if os.path.exists(weights_path):
         print(f"[Model] 加载预训练权重: {weights_path}")
         state_dict = load_file(weights_path)
-        model.load_state_dict(state_dict, strict=False)
+        model_state = model.state_dict()
+        filtered_state = {
+            k: v for k, v in state_dict.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        skipped = len(state_dict) - len(filtered_state)
+        if skipped:
+            print(f"[Model] skipped pretrained keys with incompatible shape: {skipped}")
+        model.load_state_dict(filtered_state, strict=False)
     else:
         print("[Model] 警告: 未找到预训练权重")
 
@@ -426,7 +475,7 @@ def build_model_for_eval(model_dir: str, device: str,
             ckpt_keys = set(new_state_dict.keys())
             common_keys = model_keys & ckpt_keys
             lora_common = [k for k in common_keys if 'lora_' in k]
-            fusion_common = [k for k in common_keys if k.startswith('fusion_module.')]
+            fusion_common = [k for k in common_keys if k.startswith(('fusion_module.', 'fusion_conv.'))]
             if alias_hits:
                 print("[Fusion-Diag] legacy fusion key aliases detected:")
                 for old_k, new_k in alias_hits.items():
@@ -493,10 +542,17 @@ def build_model_for_eval(model_dir: str, device: str,
                         )
                     if fusion_common:
                         print(f"[Fusion-Diag] loaded fusion keys: {len(fusion_common)}")
+                    fusion_conv = getattr(model, "fusion_conv", None)
+                    if fusion_conv is not None and hasattr(fusion_conv, "weight"):
+                        conv_norm = fusion_conv.weight.norm().item()
+                        conv_abs_mean = fusion_conv.weight.abs().mean().item()
+                        print(
+                            f"[Fusion-Diag] fusion_conv_weight_norm={conv_norm:.6e}, "
+                            f"fusion_conv_weight_abs_mean={conv_abs_mean:.6e}"
+                        )
                 else:
                     print("[Fusion-Diag] warning: fusion_module not found")
             # ================================================
-            print("[Model] 未提供训练权重，仅使用预训练模型")
     else:
         if trained_ckpt_path and os.path.exists(trained_ckpt_path):
             print(f"[Model] 加载训练权重: {trained_ckpt_path}")
@@ -506,7 +562,29 @@ def build_model_for_eval(model_dir: str, device: str,
             for k, v in state_dict.items():
                 new_k = k.replace('module.', '')
                 new_state_dict[new_k] = v
-            model.load_state_dict(new_state_dict, strict=False)
+            new_state_dict, alias_hits = _normalize_state_dict_keys(new_state_dict)
+            model_keys = set(model.state_dict().keys())
+            common_keys = model_keys & set(new_state_dict.keys())
+            filtered_dict = {}
+            for k in common_keys:
+                if new_state_dict[k].shape == model.state_dict()[k].shape:
+                    filtered_dict[k] = new_state_dict[k]
+            missing, unexpected = model.load_state_dict(filtered_dict, strict=False)
+            fusion_common = [
+                k for k in filtered_dict
+                if k.startswith(('lidars_encoder.', 'lidar_film.', 'fusion_module.', 'fusion_conv.'))
+            ]
+            print(f"[Model] loaded non-LoRA checkpoint keys: {len(filtered_dict)}")
+            print(f"[Model] loaded LiDAR/Fusion keys without LoRA: {len(fusion_common)}")
+            if alias_hits:
+                print(f"[Fusion-Diag] legacy fusion aliases: {len(alias_hits)}")
+            if missing:
+                print(f"[Model] missing keys without LoRA: {len(missing)}")
+            if unexpected:
+                print(f"[Model] unexpected keys without LoRA: {len(unexpected)}")
+            fusion_conv = getattr(model, "fusion_conv", None)
+            if fusion_conv is not None and hasattr(fusion_conv, "weight"):
+                print(f"[Fusion-Diag] fusion_conv_weight_norm={fusion_conv.weight.norm().item():.6e}")
 
     model = model.to(device)
     model.eval()
@@ -725,28 +803,32 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
             feat_dict = get_pcd_features(pcd_file_list[idx], device=device,
                                          pcd_cache=pcd_cache, pcd_idx=idx)
 
-            # ========== 修复：先 cat 为 (H,W,7)，再统一 resize，与训练一致 ==========
+            # Build LiDAR feature map as (H, W, 9), then resize once.
             cap = feat_dict['cap'].to(dtype=torch.float32)       # (H, W, 3)
             depth = feat_dict['depth'].to(dtype=torch.float32)   # (H, W)
             normal = feat_dict['normal'].to(dtype=torch.float32) # (H, W, 3)
+            valid = feat_dict['valid'].to(dtype=torch.float32)   # (H, W)
+            edge = feat_dict['edge'].to(dtype=torch.float32)     # (H, W)
 
             depth = depth.unsqueeze(-1)                           # (H, W, 1)
-            pcd_7ch = torch.cat([cap, depth, normal], dim=-1)     # (H, W, 7)
+            valid = valid.unsqueeze(-1)                           # (H, W, 1)
+            edge = edge.unsqueeze(-1)                             # (H, W, 1)
+            pcd_lidar = torch.cat([cap, depth, normal, valid, edge], dim=-1)
 
-            # resize：先转成 (1,7,H,W) 以便 interpolate，再转回 (H,W,7)
-            pcd_7ch = pcd_7ch.permute(2, 0, 1).unsqueeze(0)       # (1, 7, H, W)
-            pcd_7ch = F.interpolate(
-                pcd_7ch, size=(target_h, target_w),
+            # Resize through channel-first layout, then convert back to channel-last.
+            pcd_lidar = pcd_lidar.permute(2, 0, 1).unsqueeze(0)
+            pcd_lidar = F.interpolate(
+                pcd_lidar, size=(target_h, target_w),
                 mode='bilinear', align_corners=False
             )
-            pcd_7ch = pcd_7ch.squeeze(0).permute(1, 2, 0)         # (H, W, 7)
-            pcd_features[idx] = pcd_7ch.unsqueeze(0)              # (1, H, W, 7)
+            pcd_lidar = pcd_lidar.squeeze(0).permute(1, 2, 0)
+            pcd_features[idx] = pcd_lidar.unsqueeze(0)
             # =====================================================================
 
         for view, pcd_idx in zip(views, view_pcd_indices):
             if pcd_idx not in pcd_features:
                 raise KeyError(f"PCD index {pcd_idx} not found in pcd_features")
-            # 扩展 batch 维度，最终 shape (B, H, W, 7)
+            # Expand batch dimension: final shape is (B, H, W, LIDAR_NUM_CHANNELS).
             view['pcd'] = pcd_features[pcd_idx].expand(B, -1, -1, -1).contiguous()
 
     # 统一所有张量到同一设备

@@ -284,13 +284,40 @@ def compute_features_for_indices(pcd, indices, radius=0.1, max_nn=30):
 
 # ========================= 全局深度归一化 =========================
 GLOBAL_DEPTH_MAX = 40.0
+LIDAR_NUM_CHANNELS = 9
 
 
-def generate_pcd_7channel(pcd_path: str, gen_size: int = 224) -> Tuple[np.ndarray, float]:
+def _empty_lidar_feature(gen_size: int) -> np.ndarray:
+    return np.zeros((LIDAR_NUM_CHANNELS, gen_size, gen_size), dtype=np.float32)
+
+
+def _compute_sparse_depth_edge(depth_rel: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
+    edge = np.zeros_like(depth_rel, dtype=np.float32)
+
+    dx = np.abs(depth_rel[:, 1:] - depth_rel[:, :-1])
+    valid_x = valid_mask[:, 1:] & valid_mask[:, :-1]
+    dx = np.where(valid_x, dx, 0.0)
+    edge[:, 1:] = np.maximum(edge[:, 1:], dx)
+    edge[:, :-1] = np.maximum(edge[:, :-1], dx)
+
+    dy = np.abs(depth_rel[1:, :] - depth_rel[:-1, :])
+    valid_y = valid_mask[1:, :] & valid_mask[:-1, :]
+    dy = np.where(valid_y, dy, 0.0)
+    edge[1:, :] = np.maximum(edge[1:, :], dy)
+    edge[:-1, :] = np.maximum(edge[:-1, :], dy)
+
+    positive = edge[edge > 0]
+    if positive.size > 0:
+        scale = float(np.percentile(positive, 95))
+        edge = edge / max(scale, 1e-6)
+    return np.clip(edge, 0.0, 1.0).astype(np.float32)
+
+
+def generate_pcd_lidar_feature(pcd_path: str, gen_size: int = 224) -> Tuple[np.ndarray, float]:
     pcd = o3d.io.read_point_cloud(pcd_path)
     points = np.asarray(pcd.points)
     if len(points) == 0:
-        return np.zeros((7, gen_size, gen_size), dtype=np.float32), 1.0
+        return _empty_lidar_feature(gen_size), 1.0
 
     H = W = gen_size
     f = W / 2; cx = cy = W / 2
@@ -300,20 +327,20 @@ def generate_pcd_7channel(pcd_path: str, gen_size: int = 224) -> Tuple[np.ndarra
     x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
     valid_mask = z > 0
     if not np.any(valid_mask):
-        return np.zeros((7, gen_size, gen_size), dtype=np.float32), 1.0
+        return _empty_lidar_feature(gen_size), 1.0
 
     x, y, z = x[valid_mask], y[valid_mask], -z[valid_mask]
     u = (f * x / z) + cx; v = (f * y / z) + cy
     in_image = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     if not np.any(in_image):
-        return np.zeros((7, gen_size, gen_size), dtype=np.float32), 1.0
+        return _empty_lidar_feature(gen_size), 1.0
 
     u = u[in_image].astype(int); v = v[in_image].astype(int); z = z[in_image]
     valid_indices = np.where(valid_mask)[0][in_image]
     normals, curv, aniso, plan = compute_features_for_indices(pcd, valid_indices)
     good_mask = ~np.isnan(curv)
     if not np.any(good_mask):
-        return np.zeros((7, gen_size, gen_size), dtype=np.float32), 1.0
+        return _empty_lidar_feature(gen_size), 1.0
 
     u, v, z = u[good_mask], v[good_mask], z[good_mask]
     normals = normals[good_mask]; curv = curv[good_mask]; aniso = aniso[good_mask]; plan = plan[good_mask]
@@ -332,25 +359,28 @@ def generate_pcd_7channel(pcd_path: str, gen_size: int = 224) -> Tuple[np.ndarra
             aniso_img[vi, ui] = aniso[i]
             plan_img[vi, ui] = plan[i]
 
-    finite = np.isfinite(depth_img)
-    if not np.any(finite):
+    valid_img = np.isfinite(depth_img)
+    if not np.any(valid_img):
         depth_img = np.zeros((H, W), dtype=np.float32)
         z_d = 1.0
     else:
-        depth_img[~finite] = 0.0
-        z_d = float(np.mean(depth_img[finite]))
+        z_d = float(np.mean(depth_img[valid_img]))
+        depth_img[~valid_img] = 0.0
         z_d = max(z_d, 1e-3)
 
     cap = np.stack([curv_img, aniso_img, plan_img], axis=0)
     cap = np.clip(cap, 0.0, 1.0).astype(np.float32)
 
     depth_rel = np.clip(depth_img / GLOBAL_DEPTH_MAX, 0.0, 1.0).astype(np.float32)
+    depth_edge = _compute_sparse_depth_edge(depth_rel, valid_img)
     depth_rel = depth_rel[np.newaxis, ...]
+    valid = valid_img.astype(np.float32)[np.newaxis, ...]
+    depth_edge = depth_edge[np.newaxis, ...]
 
     normal = normal_img.transpose(2, 0, 1).astype(np.float32)
-    pcd_7ch = np.concatenate([cap, depth_rel, normal], axis=0)
+    pcd_lidar = np.concatenate([cap, depth_rel, normal, valid, depth_edge], axis=0)
 
-    return pcd_7ch, z_d
+    return pcd_lidar, z_d
 
 
 # ========================= 数据集 =========================
@@ -537,7 +567,7 @@ class Seq1LidarDataset(Dataset):
 
     def _build_cache(self):
         if is_main_process(int(os.environ.get('RANK', 0))):
-            print("预计算 7 通道 LiDAR 特征...")
+            print(f"Precomputing {LIDAR_NUM_CHANNELS}-channel LiDAR features...")
         for i, (ipath, img_ts_ns, pidx, _) in enumerate(self.all_views_meta):
             cache_path = os.path.join(self.cache_dir, f"pcd_{img_ts_ns}.npz")
             if os.path.exists(cache_path):
@@ -546,7 +576,7 @@ class Seq1LidarDataset(Dataset):
             pcd_path = self._find_closest_pcd(img_ts_sec, pidx)
             if pcd_path is None:
                 continue
-            feat, z_d = generate_pcd_7channel(pcd_path, self.pcd_gen_size)
+            feat, z_d = generate_pcd_lidar_feature(pcd_path, self.pcd_gen_size)
             np.savez(cache_path, feat=feat, scale=z_d)
         if is_main_process(int(os.environ.get('RANK', 0))):
             print("缓存完成")
@@ -556,12 +586,14 @@ class Seq1LidarDataset(Dataset):
             cache_path = os.path.join(self.cache_dir, f"pcd_{int(img_ts_sec*1e9)}.npz")
             if os.path.exists(cache_path):
                 data = np.load(cache_path)
-                return data["feat"].astype(np.float32), float(data["scale"])
+                feat = data["feat"].astype(np.float32)
+                if feat.shape[0] == LIDAR_NUM_CHANNELS:
+                    return feat, float(data["scale"])
         pcd_path = self._find_closest_pcd(img_ts_sec, pidx)
         if pcd_path is None:
-            zeros = np.zeros((7, self.pcd_gen_size, self.pcd_gen_size), dtype=np.float32)
+            zeros = _empty_lidar_feature(self.pcd_gen_size)
             return zeros, 1.0
-        return generate_pcd_7channel(pcd_path, self.pcd_gen_size)
+        return generate_pcd_lidar_feature(pcd_path, self.pcd_gen_size)
 
     def __len__(self):
         return max(0, (len(self.all_views_meta) - self.seq_len) // self.stride + 1)
@@ -596,8 +628,8 @@ class Seq1LidarDataset(Dataset):
             confidence = float(rms) if not np.isnan(rms) else 0.5
 
             if self.use_lidar:
-                pcd_7ch, z_d = self._get_pcd_feature(img_ts_sec, pidx)
-                pcd_tensor = torch.from_numpy(pcd_7ch)
+                pcd_lidar, z_d = self._get_pcd_feature(img_ts_sec, pidx)
+                pcd_tensor = torch.from_numpy(pcd_lidar)
                 if pcd_tensor.shape[1] != self.img_size or pcd_tensor.shape[2] != self.img_size:
                     pcd_tensor = F.interpolate(
                         pcd_tensor.unsqueeze(0), size=(self.img_size, self.img_size),
@@ -605,7 +637,7 @@ class Seq1LidarDataset(Dataset):
                     ).squeeze(0)
                 pcd_tensor = pcd_tensor.permute(1, 2, 0).unsqueeze(0)
             else:
-                pcd_tensor = torch.zeros((1, self.img_size, self.img_size, 7), dtype=torch.float32)
+                pcd_tensor = torch.zeros((1, self.img_size, self.img_size, LIDAR_NUM_CHANNELS), dtype=torch.float32)
                 z_d = 1.0
 
             gt_pose = torch.from_numpy(self.gt_poses_list[gt_idx])
@@ -654,6 +686,7 @@ class MapAnythingLoss(nn.Module):
                  w_world_pts: float = 1.0,
                  w_confidence: float = 0.2,
                  w_scale: float = 0.1,
+                 world_loss_cap: float = 2.0,
                  robust_alpha: float = 0.5,
                  robust_c: float = 0.05,
                  top_n_percent: float = 5.0,
@@ -668,6 +701,7 @@ class MapAnythingLoss(nn.Module):
         self.w_world_pts = w_world_pts
         self.w_confidence = w_confidence
         self.w_scale = w_scale
+        self.world_loss_cap = world_loss_cap
         self.use_log_depth = use_log_depth
         self.use_chordal_rot = use_chordal_rot
         self.top_n_percent = top_n_percent
@@ -817,7 +851,11 @@ class MapAnythingLoss(nn.Module):
                 valid_world = torch.isfinite(pred_world).all(dim=-1) & torch.isfinite(gt_pts3d_world).all(dim=-1)
                 if valid_world.any():
                     loss_world = self._compute_world_frame_points_loss(pred_world, gt_pts3d_world, valid_world)
-                    loss_components.append(self.w_world_pts * loss_world)
+                    loss_world_for_total = loss_world
+                    if self.world_loss_cap is not None and self.world_loss_cap > 0:
+                        loss_world_for_total = torch.clamp(loss_world, max=self.world_loss_cap)
+                        metrics[f'world_pts_capped_{i}'] = loss_world_for_total.item()
+                    loss_components.append(self.w_world_pts * loss_world_for_total)
                     metrics[f'world_pts_{i}'] = loss_world.item()
 
             if 'confidence' in pred and ('depth_along_ray' in pred or 'pts3d_cam' in pred):
@@ -895,9 +933,15 @@ class MapAnythingLoss(nn.Module):
         ray_vals = [v for k, v in metrics.items() if k.startswith('ray_')]
         if ray_vals:
             metrics['ray'] = sum(ray_vals) / len(ray_vals)
-        world_vals = [v for k, v in metrics.items() if k.startswith('world_pts_')]
+        world_vals = [
+            v for k, v in metrics.items()
+            if k.startswith('world_pts_') and not k.startswith('world_pts_capped_')
+        ]
         if world_vals:
             metrics['world_pts'] = sum(world_vals) / len(world_vals)
+        world_capped_vals = [v for k, v in metrics.items() if k.startswith('world_pts_capped_')]
+        if world_capped_vals:
+            metrics['world_pts_capped'] = sum(world_capped_vals) / len(world_capped_vals)
 
         if loss_components:
             total_loss = sum(loss_components)
@@ -934,6 +978,7 @@ def build_model(model_dir: str, device: str, rank: int, use_compile: bool = True
     lidar_encoder_config["pretrained"] = False
     lidar_encoder_config["weights"] = None
     lidar_encoder_config["uses_torch_hub"] = False
+    lidar_encoder_config["in_chans"] = LIDAR_NUM_CHANNELS
     geometric_input_config["lidars_encoder_config"] = lidar_encoder_config
     model = MapAnything(
         name=config.get("name", "mapanything"),
@@ -1063,7 +1108,11 @@ def build_model(model_dir: str, device: str, rank: int, use_compile: bool = True
         model.eval()
         with torch.no_grad():
             dummy_img = torch.randn(1, 3, 224, 224, device=device)
-            dummy_pcd = torch.randn(1, 224, 224, 7, device=device) if use_lidar else torch.zeros(1, 224, 224, 7, device=device)
+            dummy_pcd = (
+                torch.randn(1, 224, 224, LIDAR_NUM_CHANNELS, device=device)
+                if use_lidar
+                else torch.zeros(1, 224, 224, LIDAR_NUM_CHANNELS, device=device)
+            )
             dummy_views = [{
                 "img": dummy_img,
                 "pcd": dummy_pcd,
@@ -1151,7 +1200,16 @@ def smart_resume(model, optimizer, scheduler, scaler, ema, ckpt_path, rank, devi
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
 
     if 'model_state_dict' in ckpt:
-        model.load_state_dict(ckpt['model_state_dict'], strict=False)
+        model_state = model.state_dict()
+        resume_state = ckpt['model_state_dict']
+        filtered_state = {
+            k: v for k, v in resume_state.items()
+            if k in model_state and v.shape == model_state[k].shape
+        }
+        skipped = len(resume_state) - len(filtered_state)
+        model.load_state_dict(filtered_state, strict=False)
+        if skipped and is_main_process(rank):
+            print(f"  -> skipped incompatible checkpoint keys after LiDAR channel change: {skipped}")
         if is_main_process(rank):
             print(f"  -> 模型权重已恢复")
     else:
@@ -1674,9 +1732,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
                 if lora_B_params:
                     torch.nn.utils.clip_grad_norm_(lora_B_params, max_norm=args.grad_clip * 5.0)
                 if lidar_params:
-                    torch.nn.utils.clip_grad_norm_(lidar_params, max_norm=0.3)
+                    torch.nn.utils.clip_grad_norm_(lidar_params, max_norm=args.lidar_grad_clip)
                 if fusion_params:
-                    torch.nn.utils.clip_grad_norm_(fusion_params, max_norm=0.5)
+                    torch.nn.utils.clip_grad_norm_(fusion_params, max_norm=args.fusion_grad_clip)
                 scaler.step(optimizer)
                 scaler.update()
             else:
@@ -1685,9 +1743,9 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
                 if lora_B_params:
                     torch.nn.utils.clip_grad_norm_(lora_B_params, max_norm=args.grad_clip * 5.0)
                 if lidar_params:
-                    torch.nn.utils.clip_grad_norm_(lidar_params, max_norm=0.3)
+                    torch.nn.utils.clip_grad_norm_(lidar_params, max_norm=args.lidar_grad_clip)
                 if fusion_params:
-                    torch.nn.utils.clip_grad_norm_(fusion_params, max_norm=0.5)
+                    torch.nn.utils.clip_grad_norm_(fusion_params, max_norm=args.fusion_grad_clip)
                 optimizer.step()
 
             if ema is not None:
@@ -1745,7 +1803,7 @@ def main():
                         help="训练数据路径，可指定多个序列")
     parser.add_argument("--model_dir", type=str, default="/home/xuyh/mapanything/")
     parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/32_lora_lidar")
-    parser.add_argument("--cache_dir", type=str, default="./cache/lidar_7ch")
+    parser.add_argument("--cache_dir", type=str, default="./cache/lidar_9ch")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=4)
@@ -1757,6 +1815,8 @@ def main():
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--grad_clip", type=float, default=1.0)
+    parser.add_argument("--lidar_grad_clip", type=float, default=1.0)
+    parser.add_argument("--fusion_grad_clip", type=float, default=1.0)
     parser.add_argument("--num_workers", type=int, default=8)
     parser.add_argument("--amp", action="store_true", default=False)
     parser.add_argument("--resume", type=str, default="")
@@ -1768,24 +1828,33 @@ def main():
     parser.add_argument("--local_rank", type=int, default=-1)
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=32)
-    parser.add_argument("--lidar_lr_scale", type=float, default=0.2)
-    parser.add_argument("--fusion_lr_scale", type=float, default=0.05,
+    parser.add_argument("--lidar_lr_scale", type=float, default=0.5)
+    parser.add_argument("--fusion_lr_scale", type=float, default=0.2,
                         help="fusion module 的学习率缩放系数，默认更保守")
     parser.add_argument("--use_ema", action="store_true", default=True)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--lidar_dropout_prob", type=float, default=0.0)
     
     # ========== LiDAR Warmup 新参数 ==========
-    parser.add_argument("--lidar_warmup_epochs", type=int, default=3,
-                        help="保留兼容参数；当前默认直接 joint 训练，不执行 warmup")
+    parser.add_argument("--lidar_warmup_epochs", type=int, default=1,
+                        help="number of early epochs to train LiDAR/fusion before joint LoRA training")
     parser.add_argument("--lidar_warmup_lr_scale", type=float, default=0.5,
                         help="warmup 阶段的整体 LR 缩放系数，默认 0.5 更稳")
-    parser.add_argument("--lidar_warmup_gate_alpha", type=float, default=0.70,
+    parser.add_argument("--lidar_warmup_gate_alpha", type=float, default=0.60,
                         help="warmup phase fusion gate target for LiDAR emphasis")
     parser.add_argument("--fusion_smooth_alpha", type=float, default=0.55,
                         help="joint phase fusion gate target after warmup")
-    parser.add_argument("--lidar_warmup_rgb_dropout_prob", type=float, default=0.50,
+    parser.add_argument("--lidar_warmup_rgb_dropout_prob", type=float, default=0.15,
                         help="probability of zeroing RGB inputs during LiDAR warmup")
+    parser.add_argument("--loss_depth_weight", type=float, default=0.1)
+    parser.add_argument("--loss_pose_trans_weight", type=float, default=2.0)
+    parser.add_argument("--loss_pose_rot_weight", type=float, default=0.5)
+    parser.add_argument("--loss_ray_weight", type=float, default=0.1)
+    parser.add_argument("--loss_pts3d_cam_weight", type=float, default=0.1)
+    parser.add_argument("--loss_world_pts_weight", type=float, default=0.05)
+    parser.add_argument("--loss_confidence_weight", type=float, default=0.1)
+    parser.add_argument("--loss_scale_weight", type=float, default=0.1)
+    parser.add_argument("--world_loss_cap", type=float, default=2.0)
     # ========================================
     
     # 训练开关
@@ -1817,7 +1886,7 @@ def main():
         print("MapAnything LiDAR Joint Training")
         print(f"LoRA: {'ON' if args.lora else 'OFF'} | LiDAR: {'ON' if args.lidar else 'OFF'}")
         if args.lidar_warmup_epochs > 0:
-            print(f"LiDAR Warmup 参数已保留，仅用于兼容旧实验：{args.lidar_warmup_epochs}")
+            print(f"LiDAR Warmup: first {args.lidar_warmup_epochs} epoch(s) train LiDAR/fusion before joint LoRA")
         print("=" * 65)
 
     # 加载模型（传入 warmup 配置，控制 fusion_module 初始化）
@@ -1862,10 +1931,20 @@ def main():
     )
 
     criterion = MapAnythingLoss(
-        w_depth=0.1, w_pose_trans=2.0, w_pose_rot=0.5, w_ray=0.1,
-        w_pts3d_cam=0.1, w_world_pts=0.1, w_confidence=0.1,
-        w_scale=0.1, robust_alpha=0.5, robust_c=0.05,
-        top_n_percent=5.0, use_log_depth=True, use_chordal_rot=True)
+        w_depth=args.loss_depth_weight,
+        w_pose_trans=args.loss_pose_trans_weight,
+        w_pose_rot=args.loss_pose_rot_weight,
+        w_ray=args.loss_ray_weight,
+        w_pts3d_cam=args.loss_pts3d_cam_weight,
+        w_world_pts=args.loss_world_pts_weight,
+        w_confidence=args.loss_confidence_weight,
+        w_scale=args.loss_scale_weight,
+        world_loss_cap=args.world_loss_cap,
+        robust_alpha=0.5,
+        robust_c=0.05,
+        top_n_percent=5.0,
+        use_log_depth=True,
+        use_chordal_rot=True)
 
     scaler = GradScaler(enabled=args.amp)
 
