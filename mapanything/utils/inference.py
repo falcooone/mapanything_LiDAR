@@ -242,7 +242,6 @@ def preprocess_input_views_for_inference(
                 normalize_to_unit_sphere=True,
             )
             processed_view["ray_directions"] = ray_directions
-            del processed_view["intrinsics"]
         elif "ray_directions" in view:
             ray_directions = view["ray_directions"]
             ray_norm = torch.norm(ray_directions, dim=-1, keepdim=True)
@@ -389,10 +388,13 @@ def postprocess_model_outputs_for_inference(
 
         # 3. Recover pinhole camera intrinsics from ray directions if available
         if "ray_directions" in processed_output:
-            intrinsics = recover_pinhole_intrinsics_from_ray_directions(
-                processed_output["ray_directions"]
-            )
-            processed_output["intrinsics"] = intrinsics
+            if "intrinsics" in original_view:
+                processed_output["intrinsics"] = original_view["intrinsics"]
+            else:
+                intrinsics = recover_pinhole_intrinsics_from_ray_directions(
+                    processed_output["ray_directions"]
+                )
+                processed_output["intrinsics"] = intrinsics
 
         # 4. Add camera pose matrices if both translation and quaternions are available
         if "cam_trans" in processed_output and "cam_quats" in processed_output:

@@ -12,7 +12,7 @@ MapAnything LoRA Evaluation Script (Fixed)
   5. uses_torch_hub=False（与训练一致）。
   6. lora_alpha 默认 32.0（与训练一致）。
   7. cap 去掉 *255 缩放（与训练一致，值域 [0,1]）。
-  8. pcd shape 修正为 [B, H, W, 9]（与训练一致，channel-last）。
+  8. pcd shape 修正为 [B, H, W, 7]（与训练一致，channel-last）。
   9. 加 fusion_module 权重诊断。
 """
 
@@ -122,7 +122,7 @@ def _normalize_state_dict_keys(state_dict):
 
 
 GLOBAL_DEPTH_MAX = 40.0
-LIDAR_NUM_CHANNELS = 9
+LIDAR_NUM_CHANNELS = 7
 
 
 def _empty_pcd_feature_dict(H, W, device):
@@ -130,8 +130,8 @@ def _empty_pcd_feature_dict(H, W, device):
     normal = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
     cap = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
     valid = torch.zeros((H, W), dtype=torch.float32, device=device)
-    edge = torch.zeros((H, W), dtype=torch.float32, device=device)
-    return {'cap': cap, 'depth': depth, 'normal': normal, 'valid': valid, 'edge': edge}
+    scale = torch.ones((1,), dtype=torch.float32, device=device)
+    return {'cap': cap, 'depth': depth, 'normal': normal, 'valid': valid, 'scale': scale}
 
 
 def _compute_sparse_depth_edge(depth_rel, valid_mask):
@@ -216,20 +216,44 @@ def compute_features_for_indices(pcd, indices, radius=0.1, max_nn=30):
             aniso[i] = 0.0; plan[i] = 0.0
     return normals, curv, aniso, plan
 
-def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
+def _scale_intrinsics(K, src_size, dst_size):
+    src_w, src_h = src_size
+    dst_w, dst_h = dst_size
+    K_scaled = K.astype(np.float32).copy()
+    if src_w > 0 and src_h > 0:
+        sx = float(dst_w) / float(src_w)
+        sy = float(dst_h) / float(src_h)
+        K_scaled[0, 0] *= sx
+        K_scaled[0, 2] *= sx
+        K_scaled[1, 1] *= sy
+        K_scaled[1, 2] *= sy
+    return K_scaled
+
+
+def get_pcd_features(
+    pcd_path,
+    K,
+    intrinsics_size,
+    output_size=(448, 448),
+    device="cuda",
+    pcd_cache=None,
+    pcd_idx=None,
+):
     if pcd_cache is not None and pcd_idx is not None and pcd_idx in pcd_cache:
         return pcd_cache[pcd_idx]
 
     pcd = o3d.io.read_point_cloud(pcd_path)
     points = np.asarray(pcd.points)
 
-    img_size = (448, 448)
-    f = img_size[0] / 2
-    cx, cy = img_size[0] / 2, img_size[1] / 2
-    H, W = img_size[1], img_size[0]
-
-    direction = np.array([1, 0, 0])
-    R = rotation_matrix_from_lookat(direction)
+    W, H = output_size
+    if K is None:
+        result = _empty_pcd_feature_dict(H, W, device)
+        if pcd_cache is not None and pcd_idx is not None:
+            pcd_cache[pcd_idx] = result
+        return result
+    K_proj = _scale_intrinsics(K, intrinsics_size, (W, H))
+    fx, fy = float(K_proj[0, 0]), float(K_proj[1, 1])
+    cx, cy = float(K_proj[0, 2]), float(K_proj[1, 2])
 
     if len(points) == 0:
         result = _empty_pcd_feature_dict(H, W, device)
@@ -237,19 +261,19 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
             pcd_cache[pcd_idx] = result
         return result
 
-    pts_cam = points @ R.T
+    pts_cam = points.astype(np.float32)
     x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
-    valid_mask = z > 0
+    valid_mask = z > 1e-4
     if not np.any(valid_mask):
         result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
             pcd_cache[pcd_idx] = result
         return result
 
-    x, y, z = x[valid_mask], y[valid_mask], -z[valid_mask]
-    u = (f * x / z) + cx
-    v = (f * y / z) + cy
-    in_image = (u >= 0) & (u < img_size[0]) & (v >= 0) & (v < img_size[1])
+    x, y, z = x[valid_mask], y[valid_mask], z[valid_mask]
+    u = (fx * x / z) + cx
+    v = (fy * y / z) + cy
+    in_image = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     if not np.any(in_image):
         result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
@@ -293,8 +317,11 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
     valid_img = np.isfinite(depth_img)
     if not np.any(valid_img):
         depth_img = np.zeros((H, W), dtype=np.float32)
+        z_d = 1.0
     else:
+        z_d = float(np.mean(depth_img[valid_img]))
         depth_img[~valid_img] = 0.0
+        z_d = max(z_d, 1e-3)
 
     # ========== 修复：去掉 *255，与训练一致（值域 [0,1]）==========
     cap_np = np.stack([curv_img, aniso_img, plan_img], axis=-1)
@@ -303,21 +330,20 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
 
     depth_np = np.clip(depth_img / GLOBAL_DEPTH_MAX, 0.0, 1.0).astype(np.float32)
     valid_np = valid_img.astype(np.float32)
-    edge_np = _compute_sparse_depth_edge(depth_np, valid_img)
     normal_np = normal_img.astype(np.float32)
 
     cap_tensor = torch.from_numpy(cap_np).to(device)
     depth_tensor = torch.from_numpy(depth_np).to(device)
     normal_tensor = torch.from_numpy(normal_np).to(device)
     valid_tensor = torch.from_numpy(valid_np).to(device)
-    edge_tensor = torch.from_numpy(edge_np).to(device)
+    scale_tensor = torch.tensor([z_d], dtype=torch.float32, device=device)
 
     result = {
         'cap': cap_tensor,
         'depth': depth_tensor,
         'normal': normal_tensor,
         'valid': valid_tensor,
-        'edge': edge_tensor,
+        'scale': scale_tensor,
     }
     if pcd_cache is not None and pcd_idx is not None:
         pcd_cache[pcd_idx] = result
@@ -326,22 +352,14 @@ def get_pcd_features(pcd_path, device="cuda", pcd_cache=None, pcd_idx=None):
 # ========================= 健壮内参解析 =========================
 def _parse_yaml_intrinsics(file_path):
     try:
-        with open(file_path, 'r') as f:
+        with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
             content = f.read()
-        k_pattern = r'K:\s*\[\[(.*?)\]\s*\[(.*?)\]\s*\[(.*?)\]\]'
-        match = re.search(k_pattern, content, re.DOTALL)
-        if match:
-            rows = []
-            for i in range(1, 4):
-                row_str = match.group(i).replace('\n', ' ').replace('\r', ' ')
-                numbers = re.findall(r'[-+]?\d*\.\d+|\d+', row_str)
-                if len(numbers) >= 3:
-                    rows.append([float(num) for num in numbers[:3]])
-            if len(rows) == 3:
-                return np.array(rows)
-        numbers = re.findall(r'[-+]?\d*\.\d+|\d+', content)
+        k_match = re.search(r"K:\s*\[\[(.*?)\]\]", content, re.DOTALL)
+        if not k_match:
+            return None
+        numbers = re.findall(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", k_match.group(1))
         if len(numbers) >= 9:
-            return np.array([float(num) for num in numbers[:9]]).reshape(3, 3)
+            return np.array([float(num) for num in numbers[:9]], dtype=np.float32).reshape(3, 3)
     except Exception as e:
         print(f"解析YAML内参文件失败 {file_path}: {e}")
     return None
@@ -360,18 +378,37 @@ def _load_intrinsics_file(file_path):
     K = _parse_yaml_intrinsics(file_path)
     if K is not None:
         return K
-    with open(file_path, 'r') as f:
+    with open(file_path, 'r', encoding='utf-8', errors='ignore') as f:
         content = f.read()
     numbers = []
     for line in content.split('\n'):
         line = line.strip()
-        if not line or line.startswith('#'):
+        if not line or line.startswith('#') or ':' in line:
             continue
-        nums = re.findall(r'[-+]?\d*\.\d+|\d+', line)
+        nums = re.findall(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", line)
         numbers.extend([float(n) for n in nums])
     if len(numbers) >= 9:
         return np.array(numbers[:9]).reshape(3, 3)
     return None
+
+
+def _load_intrinsics_with_size(file_path):
+    K = _load_intrinsics_file(file_path)
+    width = 0
+    height = 0
+    if os.path.exists(file_path):
+        try:
+            with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+                content = f.read()
+            width_match = re.search(r"width:\s*(\d+)", content)
+            height_match = re.search(r"height:\s*(\d+)", content)
+            if width_match:
+                width = int(width_match.group(1))
+            if height_match:
+                height = int(height_match.group(1))
+        except Exception:
+            pass
+    return K, (width, height)
 
 # ========================= 模型加载 (保留 FiLM/LoRA 支持) =========================
 def build_model_for_eval(model_dir: str, device: str,
@@ -607,10 +644,12 @@ def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
     print(f"[Data] 图像: {len(img_paths)} 张")
 
     intrinsics_file = os.path.join(seq_root, "color_camera_intrinsics.txt")
-    intrinsics = _load_intrinsics_file(intrinsics_file)
-    if intrinsics is None:
+    intrinsics_raw, intrinsics_size = _load_intrinsics_with_size(intrinsics_file)
+    if intrinsics_raw is None:
         print("[Data] 内参无法解析，使用单位阵")
-        intrinsics = np.eye(3, dtype=np.float32)
+        intrinsics_raw = np.eye(3, dtype=np.float32)
+        intrinsics_size = (img_size, img_size)
+    intrinsics = _scale_intrinsics(intrinsics_raw, intrinsics_size, (img_size, img_size))
 
     tum_file = os.path.join(seq_root, "extrinsics.tum")
     gt_poses = {}
@@ -698,7 +737,16 @@ def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
         else:
             print("[Data] 警告: 启用 LiDAR 但未找到 lidar 目录")
 
-    return img_paths, intrinsics, gt_poses, gt_depths, pcd_file_list, pcd_timestamps
+    return (
+        img_paths,
+        intrinsics,
+        gt_poses,
+        gt_depths,
+        pcd_file_list,
+        pcd_timestamps,
+        intrinsics_raw,
+        intrinsics_size,
+    )
 
 # ========================= 关键修复：手动图像加载（与训练一致） =========================
 def load_images_manual(image_paths, img_size=448, device='cuda'):
@@ -739,6 +787,7 @@ def load_images_manual(image_paths, img_size=448, device='cuda'):
 
 # ========================= 推理（双路径：手动 / load_images） =========================
 def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pcd_timestamps,
+                        intrinsics_raw=None, intrinsics_size=(0, 0),
                         img_size=448, view_pcd_indices=None, pcd_cache=None,
                         use_load_images=False):
     """
@@ -777,6 +826,11 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
         views = load_images_manual(image_paths, img_size=img_size, device=device)
 
     B = views[0]['img'].shape[0]
+    if intrinsics_raw is not None:
+        intrinsics_scaled = _scale_intrinsics(intrinsics_raw, intrinsics_size, (target_w, target_h))
+        intrinsics_tensor = torch.from_numpy(intrinsics_scaled).to(device=device, dtype=torch.float32).unsqueeze(0)
+        for view in views:
+            view['intrinsics'] = intrinsics_tensor.expand(view['img'].shape[0], -1, -1).contiguous()
 
     # confidence 补充（手动加载时已计算，load_images 模式需补充）
     for i, view in enumerate(views):
@@ -800,20 +854,23 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
         pcd_features = {}
 
         for idx in needed_pcd_idxs:
-            feat_dict = get_pcd_features(pcd_file_list[idx], device=device,
-                                         pcd_cache=pcd_cache, pcd_idx=idx)
+            feat_dict = get_pcd_features(
+                pcd_file_list[idx],
+                intrinsics_raw,
+                intrinsics_size,
+                output_size=(target_w, target_h),
+                device=device,
+                pcd_cache=pcd_cache,
+                pcd_idx=idx,
+            )
 
-            # Build LiDAR feature map as (H, W, 9), then resize once.
+            # Build LiDAR feature map as (H, W, 7): cap(3), depth(1), normal(3).
             cap = feat_dict['cap'].to(dtype=torch.float32)       # (H, W, 3)
             depth = feat_dict['depth'].to(dtype=torch.float32)   # (H, W)
             normal = feat_dict['normal'].to(dtype=torch.float32) # (H, W, 3)
-            valid = feat_dict['valid'].to(dtype=torch.float32)   # (H, W)
-            edge = feat_dict['edge'].to(dtype=torch.float32)     # (H, W)
 
             depth = depth.unsqueeze(-1)                           # (H, W, 1)
-            valid = valid.unsqueeze(-1)                           # (H, W, 1)
-            edge = edge.unsqueeze(-1)                             # (H, W, 1)
-            pcd_lidar = torch.cat([cap, depth, normal, valid, edge], dim=-1)
+            pcd_lidar = torch.cat([cap, depth, normal], dim=-1)
 
             # Resize through channel-first layout, then convert back to channel-last.
             pcd_lidar = pcd_lidar.permute(2, 0, 1).unsqueeze(0)
@@ -822,14 +879,19 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
                 mode='bilinear', align_corners=False
             )
             pcd_lidar = pcd_lidar.squeeze(0).permute(1, 2, 0)
-            pcd_features[idx] = pcd_lidar.unsqueeze(0)
+            pcd_features[idx] = {
+                "pcd": pcd_lidar.unsqueeze(0),
+                "scale": feat_dict["scale"].to(dtype=torch.float32),
+                "valid": feat_dict.get("valid"),
+            }
             # =====================================================================
 
         for view, pcd_idx in zip(views, view_pcd_indices):
             if pcd_idx not in pcd_features:
                 raise KeyError(f"PCD index {pcd_idx} not found in pcd_features")
             # Expand batch dimension: final shape is (B, H, W, LIDAR_NUM_CHANNELS).
-            view['pcd'] = pcd_features[pcd_idx].expand(B, -1, -1, -1).contiguous()
+            view['pcd'] = pcd_features[pcd_idx]["pcd"].expand(B, -1, -1, -1).contiguous()
+            view['lidar_depth_scale'] = pcd_features[pcd_idx]["scale"].expand(B).contiguous()
 
     # 统一所有张量到同一设备
     dev = torch.device(device)
@@ -1290,7 +1352,16 @@ def main():
     )
 
     print("\n[2/4] 加载数据...")
-    img_paths, intrinsics, gt_poses, gt_depths, pcd_file_list, pcd_timestamps = load_eval_data(
+    (
+        img_paths,
+        intrinsics,
+        gt_poses,
+        gt_depths,
+        pcd_file_list,
+        pcd_timestamps,
+        intrinsics_raw,
+        intrinsics_size,
+    ) = load_eval_data(
         args.seq_root, img_size=args.img_size,
         use_lidar=bool(args.use_lidar),
         max_images=args.max_images
@@ -1325,6 +1396,8 @@ def main():
             use_lidar=bool(args.use_lidar),
             pcd_file_list=pcd_file_list,
             pcd_timestamps=pcd_timestamps,
+            intrinsics_raw=intrinsics_raw,
+            intrinsics_size=intrinsics_size,
             img_size=args.img_size,
             view_pcd_indices=view_pcd_indices,
             pcd_cache=pcd_cache,

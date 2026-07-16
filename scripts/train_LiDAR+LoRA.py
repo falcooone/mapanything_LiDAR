@@ -284,7 +284,8 @@ def compute_features_for_indices(pcd, indices, radius=0.1, max_nn=30):
 
 # ========================= 全局深度归一化 =========================
 GLOBAL_DEPTH_MAX = 40.0
-LIDAR_NUM_CHANNELS = 9
+LIDAR_NUM_CHANNELS = 7
+LIDAR_CACHE_VERSION = "k_projection_7ch_v1"
 
 
 def _empty_lidar_feature(gen_size: int) -> np.ndarray:
@@ -313,24 +314,87 @@ def _compute_sparse_depth_edge(depth_rel: np.ndarray, valid_mask: np.ndarray) ->
     return np.clip(edge, 0.0, 1.0).astype(np.float32)
 
 
-def generate_pcd_lidar_feature(pcd_path: str, gen_size: int = 224) -> Tuple[np.ndarray, float]:
+def _parse_camera_intrinsics_file(file_path: str) -> Tuple[np.ndarray, Tuple[int, int]]:
+    K = None
+    width = None
+    height = None
+    if not file_path or not os.path.exists(file_path):
+        return np.eye(3, dtype=np.float32), (0, 0)
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        width_match = re.search(r"width:\s*(\d+)", content)
+        height_match = re.search(r"height:\s*(\d+)", content)
+        if width_match:
+            width = int(width_match.group(1))
+        if height_match:
+            height = int(height_match.group(1))
+
+        k_match = re.search(r"K:\s*\[\[(.*?)\]\]", content, re.DOTALL)
+        if k_match:
+            nums = re.findall(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", k_match.group(1))
+            if len(nums) >= 9:
+                K = np.array([float(x) for x in nums[:9]], dtype=np.float32).reshape(3, 3)
+    except Exception:
+        pass
+
+    if K is None:
+        try:
+            data = np.loadtxt(file_path)
+            if data.shape == (3, 3):
+                K = data.astype(np.float32)
+            elif data.size == 9:
+                K = data.reshape(3, 3).astype(np.float32)
+        except Exception:
+            K = np.eye(3, dtype=np.float32)
+
+    return K.astype(np.float32), (int(width or 0), int(height or 0))
+
+
+def _scale_intrinsics(
+    K: np.ndarray,
+    src_size: Tuple[int, int],
+    dst_size: Tuple[int, int],
+) -> np.ndarray:
+    src_w, src_h = src_size
+    dst_w, dst_h = dst_size
+    K_scaled = K.astype(np.float32).copy()
+    if src_w > 0 and src_h > 0:
+        sx = float(dst_w) / float(src_w)
+        sy = float(dst_h) / float(src_h)
+        K_scaled[0, 0] *= sx
+        K_scaled[0, 2] *= sx
+        K_scaled[1, 1] *= sy
+        K_scaled[1, 2] *= sy
+    return K_scaled
+
+
+def generate_pcd_lidar_feature(
+    pcd_path: str,
+    K: np.ndarray,
+    src_size: Tuple[int, int],
+    gen_size: int = 224,
+) -> Tuple[np.ndarray, float]:
     pcd = o3d.io.read_point_cloud(pcd_path)
     points = np.asarray(pcd.points)
     if len(points) == 0:
         return _empty_lidar_feature(gen_size), 1.0
 
     H = W = gen_size
-    f = W / 2; cx = cy = W / 2
-    direction = np.array([1, 0, 0])
-    R_mat = rotation_matrix_from_lookat(direction)
-    pts_cam = points @ R_mat.T
+    K_proj = _scale_intrinsics(K, src_size, (W, H))
+    fx, fy = float(K_proj[0, 0]), float(K_proj[1, 1])
+    cx, cy = float(K_proj[0, 2]), float(K_proj[1, 2])
+
+    pts_cam = points.astype(np.float32)
     x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
-    valid_mask = z > 0
+    valid_mask = z > 1e-4
     if not np.any(valid_mask):
         return _empty_lidar_feature(gen_size), 1.0
 
-    x, y, z = x[valid_mask], y[valid_mask], -z[valid_mask]
-    u = (f * x / z) + cx; v = (f * y / z) + cy
+    x, y, z = x[valid_mask], y[valid_mask], z[valid_mask]
+    u = (fx * x / z) + cx
+    v = (fy * y / z) + cy
     in_image = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     if not np.any(in_image):
         return _empty_lidar_feature(gen_size), 1.0
@@ -372,13 +436,10 @@ def generate_pcd_lidar_feature(pcd_path: str, gen_size: int = 224) -> Tuple[np.n
     cap = np.clip(cap, 0.0, 1.0).astype(np.float32)
 
     depth_rel = np.clip(depth_img / GLOBAL_DEPTH_MAX, 0.0, 1.0).astype(np.float32)
-    depth_edge = _compute_sparse_depth_edge(depth_rel, valid_img)
     depth_rel = depth_rel[np.newaxis, ...]
-    valid = valid_img.astype(np.float32)[np.newaxis, ...]
-    depth_edge = depth_edge[np.newaxis, ...]
 
     normal = normal_img.transpose(2, 0, 1).astype(np.float32)
-    pcd_lidar = np.concatenate([cap, depth_rel, normal, valid, depth_edge], axis=0)
+    pcd_lidar = np.concatenate([cap, depth_rel, normal], axis=0)
 
     return pcd_lidar, z_d
 
@@ -442,8 +503,16 @@ class Seq1LidarDataset(Dataset):
             else:
                 self.part_depths.append({'files': [], 'timestamps': np.array([], dtype=np.int64)})
 
-        intrinsics_file = os.path.join(seq_root, "color_camera_intrinsics.txt")
-        self.intrinsics = self._load_intrinsics(intrinsics_file) if os.path.exists(intrinsics_file) else np.eye(3, dtype=np.float32)
+        root_intrinsics_file = os.path.join(seq_root, "color_camera_intrinsics.txt")
+        root_K, root_size = _parse_camera_intrinsics_file(root_intrinsics_file)
+        self.part_intrinsics = []
+        for part in self.part_folders:
+            part_intrinsics_file = os.path.join(seq_root, part, "color_camera_intrinsics.txt")
+            if os.path.exists(part_intrinsics_file):
+                self.part_intrinsics.append(_parse_camera_intrinsics_file(part_intrinsics_file))
+            else:
+                self.part_intrinsics.append((root_K, root_size))
+        self.intrinsics = self.part_intrinsics[0][0] if self.part_intrinsics else root_K
 
         self.all_views_meta = []
         timestamp_diffs = []
@@ -524,15 +593,8 @@ class Seq1LidarDataset(Dataset):
         return poses
 
     def _load_intrinsics(self, file_path: str):
-        try:
-            data = np.loadtxt(file_path)
-            if data.shape == (3, 3):
-                return data.astype(np.float32)
-            if data.size == 9:
-                return data.reshape(3, 3).astype(np.float32)
-        except Exception:
-            pass
-        return np.eye(3, dtype=np.float32)
+        K, _ = _parse_camera_intrinsics_file(file_path)
+        return K
 
     def _find_closest_depth(self, img_ts_ns: int, part_idx: int):
         depth_info = self.part_depths[part_idx]
@@ -571,13 +633,20 @@ class Seq1LidarDataset(Dataset):
         for i, (ipath, img_ts_ns, pidx, _) in enumerate(self.all_views_meta):
             cache_path = os.path.join(self.cache_dir, f"pcd_{img_ts_ns}.npz")
             if os.path.exists(cache_path):
-                continue
+                try:
+                    cached = np.load(cache_path)
+                    cache_version = str(cached["version"].item()) if "version" in cached else ""
+                    if cached["feat"].shape[0] == LIDAR_NUM_CHANNELS and cache_version == LIDAR_CACHE_VERSION:
+                        continue
+                except Exception:
+                    pass
             img_ts_sec = img_ts_ns / 1e9
             pcd_path = self._find_closest_pcd(img_ts_sec, pidx)
             if pcd_path is None:
                 continue
-            feat, z_d = generate_pcd_lidar_feature(pcd_path, self.pcd_gen_size)
-            np.savez(cache_path, feat=feat, scale=z_d)
+            K, src_size = self.part_intrinsics[pidx]
+            feat, z_d = generate_pcd_lidar_feature(pcd_path, K, src_size, self.pcd_gen_size)
+            np.savez(cache_path, feat=feat, scale=z_d, version=LIDAR_CACHE_VERSION)
         if is_main_process(int(os.environ.get('RANK', 0))):
             print("缓存完成")
 
@@ -587,13 +656,15 @@ class Seq1LidarDataset(Dataset):
             if os.path.exists(cache_path):
                 data = np.load(cache_path)
                 feat = data["feat"].astype(np.float32)
-                if feat.shape[0] == LIDAR_NUM_CHANNELS:
+                cache_version = str(data["version"].item()) if "version" in data else ""
+                if feat.shape[0] == LIDAR_NUM_CHANNELS and cache_version == LIDAR_CACHE_VERSION:
                     return feat, float(data["scale"])
         pcd_path = self._find_closest_pcd(img_ts_sec, pidx)
         if pcd_path is None:
             zeros = _empty_lidar_feature(self.pcd_gen_size)
             return zeros, 1.0
-        return generate_pcd_lidar_feature(pcd_path, self.pcd_gen_size)
+        K, src_size = self.part_intrinsics[pidx]
+        return generate_pcd_lidar_feature(pcd_path, K, src_size, self.pcd_gen_size)
 
     def __len__(self):
         return max(0, (len(self.all_views_meta) - self.seq_len) // self.stride + 1)
@@ -652,7 +723,9 @@ class Seq1LidarDataset(Dataset):
                                              mode='bilinear', align_corners=False)
                 gt_depth = d_tensor
 
-            gt_intrinsics = torch.from_numpy(self.intrinsics).unsqueeze(0)
+            K, src_size = self.part_intrinsics[pidx]
+            K_scaled = _scale_intrinsics(K, src_size, (self.img_size, self.img_size))
+            gt_intrinsics = torch.from_numpy(K_scaled).unsqueeze(0)
 
             views.append({
                 "img": img_tensor.unsqueeze(0),
@@ -1999,7 +2072,7 @@ def main():
         if desired_phase != current_phase:
             current_phase = desired_phase
             set_lidar_warmup_phase(model, enable_warmup=(current_phase == 'warmup'), args=args, rank=rank)
-            if current_phase == 'joint' and args.lidar_warmup_epochs > 0:
+            if 0 and current_phase == 'joint' and args.lidar_warmup_epochs > 0:
                 reinitialize_fusion_module_for_joint_training(
                     model, rank, smooth_alpha=args.fusion_smooth_alpha
                 )
