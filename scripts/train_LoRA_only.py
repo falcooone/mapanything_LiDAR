@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-#coding=gbk
+# -*- coding: utf-8 -*-
 """
 MapAnything LoRA-Only Training Script (Pure RGB, No LiDAR) - v3 Final
 =====================================================================
@@ -53,6 +53,10 @@ from safetensors.torch import load_file
 
 warnings.filterwarnings('ignore')
 
+# Kept consistent with the LiDAR+LoRA model configuration. This script runs
+# with use_lidar=False, so the channel tensor is only a construction fallback.
+LIDAR_NUM_CHANNELS = 9
+
 
 # ========================= DDP 工具 =========================
 
@@ -72,6 +76,62 @@ def cleanup_ddp(is_ddp):
 
 def is_main_process(rank):
     return rank == 0
+
+
+def _parse_camera_intrinsics_file(file_path: str) -> Tuple[np.ndarray, Tuple[int, int]]:
+    K = None
+    width = None
+    height = None
+    if not file_path or not os.path.exists(file_path):
+        return np.eye(3, dtype=np.float32), (0, 0)
+
+    try:
+        with open(file_path, "r", encoding="utf-8", errors="ignore") as f:
+            content = f.read()
+        width_match = re.search(r"width:\s*(\d+)", content)
+        height_match = re.search(r"height:\s*(\d+)", content)
+        if width_match:
+            width = int(width_match.group(1))
+        if height_match:
+            height = int(height_match.group(1))
+
+        k_match = re.search(r"K:\s*\[\[(.*?)\]\]", content, re.DOTALL)
+        if k_match:
+            nums = re.findall(r"[-+]?(?:\d*\.\d+|\d+)(?:[eE][-+]?\d+)?", k_match.group(1))
+            if len(nums) >= 9:
+                K = np.array([float(x) for x in nums[:9]], dtype=np.float32).reshape(3, 3)
+    except Exception:
+        pass
+
+    if K is None:
+        try:
+            data = np.loadtxt(file_path)
+            if data.shape == (3, 3):
+                K = data.astype(np.float32)
+            elif data.size == 9:
+                K = data.reshape(3, 3).astype(np.float32)
+        except Exception:
+            K = np.eye(3, dtype=np.float32)
+
+    return K.astype(np.float32), (int(width or 0), int(height or 0))
+
+
+def _scale_intrinsics(
+    K: np.ndarray,
+    src_size: Tuple[int, int],
+    dst_size: Tuple[int, int],
+) -> np.ndarray:
+    src_w, src_h = src_size
+    dst_w, dst_h = dst_size
+    K_scaled = K.astype(np.float32).copy()
+    if src_w > 0 and src_h > 0:
+        sx = float(dst_w) / float(src_w)
+        sy = float(dst_h) / float(src_h)
+        K_scaled[0, 0] *= sx
+        K_scaled[0, 2] *= sx
+        K_scaled[1, 1] *= sy
+        K_scaled[1, 2] *= sy
+    return K_scaled
 
 
 # ========================= 数值稳定工具函数 =========================
@@ -246,7 +306,7 @@ def enable_gradient_checkpointing_safe(model, rank):
 # ========================= 损失函数 =========================
 
 class MapAnythingLoss(nn.Module):
-    def __init__(self, 
+    def __init__(self,
                  w_depth: float = 0.1,
                  w_pose_trans: float = 0.1,
                  w_pose_rot: float = 0.1,
@@ -411,7 +471,7 @@ class MapAnythingLoss(nn.Module):
                     metrics[f'pts3d_cam_{i}'] = loss_pc.item()
 
             # ---- 世界坐标系点云损失 ----
-            if 'pts3d' in pred and view.get('gt_pose') is not None and view.get('gt_depth') is not None and gt_pts3d_cam is not None:
+            if self.w_world_pts > 0.0 and 'pts3d' in pred and view.get('gt_pose') is not None and view.get('gt_depth') is not None and gt_pts3d_cam is not None:
                 pred_world = pred['pts3d']
                 gt_pose = view['gt_pose'].to(device)
                 if gt_pose.dim() == 2:
@@ -426,7 +486,7 @@ class MapAnythingLoss(nn.Module):
                     metrics[f'world_pts_{i}'] = loss_world.item()
 
             # ---- 置信度损失 ----
-            if 'confidence' in pred and ('depth_along_ray' in pred or 'pts3d_cam' in pred):
+            if self.w_confidence > 0.0 and 'confidence' in pred and ('depth_along_ray' in pred or 'pts3d_cam' in pred):
                 if 'depth_along_ray' in pred and view.get('gt_depth') is not None:
                     pred_d = pred['depth_along_ray'].permute(0, 3, 1, 2)
                     gt_d = view['gt_depth'].to(device)
@@ -570,8 +630,16 @@ class SeqRGBDataset(Dataset):
             else:
                 self.part_depths.append({'files': [], 'timestamps': np.array([], dtype=np.int64)})
 
-        intrinsics_file = os.path.join(seq_root, "color_camera_intrinsics.txt")
-        self.intrinsics = self._load_intrinsics(intrinsics_file) if os.path.exists(intrinsics_file) else np.eye(3, dtype=np.float32)
+        root_intrinsics_file = os.path.join(seq_root, "color_camera_intrinsics.txt")
+        root_K, root_size = _parse_camera_intrinsics_file(root_intrinsics_file)
+        self.part_intrinsics = []
+        for part in self.part_folders:
+            part_intrinsics_file = os.path.join(seq_root, part, "color_camera_intrinsics.txt")
+            if os.path.exists(part_intrinsics_file):
+                self.part_intrinsics.append(_parse_camera_intrinsics_file(part_intrinsics_file))
+            else:
+                self.part_intrinsics.append((root_K, root_size))
+        self.intrinsics = self.part_intrinsics[0][0] if self.part_intrinsics else root_K
 
         self.all_views_meta = []
         for pidx, part in enumerate(self.part_folders):
@@ -654,17 +722,6 @@ class SeqRGBDataset(Dataset):
         d = np.nan_to_num(d, nan=0.0, posinf=0.0, neginf=0.0)
         return d
 
-    def _load_intrinsics(self, file_path: str):
-        try:
-            data = np.loadtxt(file_path)
-            if data.shape == (3, 3):
-                return data.astype(np.float32)
-            if data.size == 9:
-                return data.reshape(3, 3).astype(np.float32)
-        except Exception:
-            pass
-        return np.eye(3, dtype=np.float32)
-
     def __len__(self):
         return max(0, (len(self.all_views_meta) - self.seq_len) // self.stride + 1)
 
@@ -702,7 +759,9 @@ class SeqRGBDataset(Dataset):
                                              mode='bilinear', align_corners=False)
                 d_tensor = torch.nan_to_num(d_tensor, nan=0.0, posinf=0.0, neginf=0.0)
                 gt_depth = d_tensor
-            gt_intrinsics = torch.from_numpy(self.intrinsics).unsqueeze(0)
+            K, src_size = self.part_intrinsics[pidx]
+            K_scaled = _scale_intrinsics(K, src_size, (self.img_size, self.img_size))
+            gt_intrinsics = torch.from_numpy(K_scaled).unsqueeze(0)
             views.append({
                 "img": img_tensor.unsqueeze(0),
                 "data_norm_type": ["dinov2"],
@@ -722,23 +781,36 @@ def collate_fn(batch):
 
 
 # ========================= 模型构建 =========================
-
-def build_model(model_dir: str, device: str, rank: int, lora_r: int = 8, lora_alpha: int = 8):
+def build_model(
+    model_dir: str,
+    device: str,
+    rank: int,
+    lora_r: int = 32,
+    lora_alpha: int = 32,
+    lora_target_mode: str = "all",
+):
     config_path = os.path.join(model_dir, "config.json")
     weights_path = os.path.join(model_dir, "model.safetensors")
     with open(config_path, 'r') as f:
         config = json.load(f)
     encoder_config = config.get("encoder_config", {}).copy()
-    encoder_config.pop("pretrained", None)
-    encoder_config.pop("weights", None)
-    encoder_config["uses_torch_hub"] = True
-    
+    encoder_config.pop("pretrained", None); encoder_config.pop("weights", None)
+    encoder_config["uses_torch_hub"] = False
+    geometric_input_config = copy.deepcopy(config.get("geometric_input_config", {}))
+    lidar_encoder_config = geometric_input_config.get("lidars_encoder_config", {})
+    for key in ("pretrained", "weights", "pretrained_checkpoint_path", "checkpoint_path", "custom_ckpt_path", "load_pretrained_weights"):
+        lidar_encoder_config.pop(key, None)
+    lidar_encoder_config["pretrained"] = False
+    lidar_encoder_config["weights"] = None
+    lidar_encoder_config["uses_torch_hub"] = False
+    lidar_encoder_config["in_chans"] = LIDAR_NUM_CHANNELS
+    geometric_input_config["lidars_encoder_config"] = lidar_encoder_config
     model = MapAnything(
         name=config.get("name", "mapanything"),
         encoder_config=encoder_config,
         info_sharing_config=config.get("info_sharing_config", {}),
         pred_head_config=config.get("pred_head_config", {}),
-        geometric_input_config=config.get("geometric_input_config", {}),
+        geometric_input_config=geometric_input_config,
         pretrained_checkpoint_path=None,
         torch_hub_force_reload=False,
         info_sharing_mlp_layer_str="swiglufused"
@@ -747,18 +819,39 @@ def build_model(model_dir: str, device: str, rank: int, lora_r: int = 8, lora_al
         if is_main_process(rank):
             print(f"加载预训练权重: {weights_path}")
         state_dict = load_file(weights_path)
+        lidar_encoder_keys = [
+            key for key in state_dict.keys()
+            if key.replace('_orig_mod.', '').startswith('lidars_encoder.')
+        ]
+        if lidar_encoder_keys:
+            for key in lidar_encoder_keys:
+                state_dict.pop(key, None)
+            if is_main_process(rank):
+                print(f"  -> 已跳过 {len(lidar_encoder_keys)} 个 LiDAR encoder 权重键，保持随机初始化")
         model.load_state_dict(state_dict, strict=False)
+    else:
+        if is_main_process(rank):
+            print("警告: 未找到预训练权重")
 
     lora_targets = []
-    for attr in ['encoder', 'info_sharing', 'dense_head', 'pose_head', 'scale_head']:
-        if hasattr(model, attr) and getattr(model, attr) is not None:
-            lora_targets.append(getattr(model, attr))
+    if lora_target_mode not in {"all", "no_encoder", "heads_only"}:
+        raise ValueError(f"Invalid lora_target_mode: {lora_target_mode}")
+    if lora_target_mode == "all" and hasattr(model, 'encoder') and model.encoder is not None:
+        lora_targets.append(model.encoder)
+    if lora_target_mode in {"all", "no_encoder"} and hasattr(model, 'info_sharing') and model.info_sharing is not None:
+        lora_targets.append(model.info_sharing)
+    if hasattr(model, 'dense_head') and model.dense_head is not None:
+        lora_targets.append(model.dense_head)
+    if hasattr(model, 'pose_head') and model.pose_head is not None:
+        lora_targets.append(model.pose_head)
+    if hasattr(model, 'scale_head') and model.scale_head is not None:
+        lora_targets.append(model.scale_head)
     for target in lora_targets:
         inject_lora_to_module(target, r=lora_r, lora_alpha=lora_alpha)
 
     if is_main_process(rank):
         lora_layer_count = sum(1 for _ in model.modules() if isinstance(_, LinearWithLoRA))
-        print(f"  -> 已注入 LoRA: {lora_layer_count} 个 Linear 层 (r={lora_r}, alpha={lora_alpha})")
+        print(f"  -> 已注入 LoRA: {lora_layer_count} 个 Linear 层 (r={lora_r}, alpha={lora_alpha}, mode={lora_target_mode})")
 
     for param in model.parameters():
         param.requires_grad = False
@@ -859,7 +952,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
 
         loss_val = loss.item()
         loss_scaled = loss / args.accum_iter
-        
+
         if args.amp:
             scaler.scale(loss_scaled).backward()
         else:
@@ -892,7 +985,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
             # [HOTFIX-3] A/B分离梯度裁剪
             a_params = [p for n, p in model.named_parameters() if p.requires_grad and 'lora_A' in n]
             b_params = [p for n, p in model.named_parameters() if p.requires_grad and 'lora_B' in n]
-            
+
             if args.amp:
                 scaler.unscale_(optimizer)
                 if a_params:
@@ -926,7 +1019,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
 
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
-    
+
     # Epoch结束: 打印B范数诊断
     if is_main_process(rank):
         b_norms = [p.norm().item() for n, p in model.named_parameters() if 'lora_B' in n and p.requires_grad]
@@ -934,7 +1027,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
         print(f"[Epoch {epoch} 结束] B平均范数: {avg_b:.4e} | "
               f"首个batch后B: {b_first_norm if b_first_norm else 'N/A'} | "
               f"跳过batch: {skipped_batches} | NaNGrad: {nan_grad_batches}")
-    
+
     return total_loss / max(num_batches, 1)
 
 
@@ -960,7 +1053,7 @@ def save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, 
     # [HOTFIX-4] EMA shadow不再覆盖真实参数，只作为参考保存
     if ema is not None:
         checkpoint['ema_shadow'] = {k: v.clone() for k, v in ema.shadow.items()}
-    
+
     tmp_path = path + ".tmp"
     try:
         torch.save(checkpoint, tmp_path)
@@ -984,24 +1077,24 @@ def smart_resume(model, optimizer, scheduler, scaler, ema, ckpt_path, rank, devi
 
     if is_main_process(rank):
         print(f"[HOTFIX-5] 智能恢复: {ckpt_path}")
-    
+
     ckpt = torch.load(ckpt_path, map_location='cpu', weights_only=False)
     if 'lora_state_dict' in ckpt:
         state_dict = ckpt['lora_state_dict']
     else:
         state_dict = {k: v for k, v in ckpt.get('model_state_dict', {}).items() if 'lora_A' in k or 'lora_B' in k}
-    
+
     a_state = {k: v for k, v in state_dict.items() if 'lora_A' in k}
     b_state = {k: v for k, v in state_dict.items() if 'lora_B' in k}
-    
+
     # 1. 加载A（永远保留）
     model.load_state_dict(a_state, strict=False)
-    
+
     # 2. 检测B状态
     b_norms = [v.norm().item() for v in b_state.values()]
     avg_b = sum(b_norms) / len(b_norms) if b_norms else 0
     b_reinit = avg_b < 1e-10
-    
+
     if b_reinit:
         # B全为0 → 不加载B，让模型用新的非零初始化
         if is_main_process(rank):
@@ -1012,11 +1105,11 @@ def smart_resume(model, optimizer, scheduler, scaler, ema, ckpt_path, rank, devi
         model.load_state_dict(b_state, strict=False)
         if is_main_process(rank):
             print(f"  -> B非零(avg={avg_b:.4e})，正常加载")
-    
+
     # 3. 优化器状态：选择性处理
     if 'optimizer_state_dict' in ckpt:
         opt_state = ckpt['optimizer_state_dict']
-        
+
         if b_reinit and 'state' in opt_state:
             # [HOTFIX-5b] 清空B参数的Adam动量(exp_avg/exp_avg_sq)
             b_cleared = 0
@@ -1031,7 +1124,7 @@ def smart_resume(model, optimizer, scheduler, scaler, ema, ckpt_path, rank, devi
                             state['exp_avg'].zero_()
                             state['exp_avg_sq'].fill_(1e-8)
                             b_cleared += 1
-            
+
             optimizer.load_state_dict(opt_state)
             if is_main_process(rank):
                 print(f"  -> [HOTFIX-5b] 已清空{b_cleared}个B参数的Adam动量")
@@ -1039,35 +1132,35 @@ def smart_resume(model, optimizer, scheduler, scaler, ema, ckpt_path, rank, devi
             optimizer.load_state_dict(opt_state)
             if is_main_process(rank):
                 print(f"  -> 优化器状态正常加载")
-    
+
     # 4. 学习率调度：直接恢复（跳过warmup）
     if 'scheduler_state_dict' in ckpt and scheduler is not None and ckpt['scheduler_state_dict'] is not None:
         scheduler.load_state_dict(ckpt['scheduler_state_dict'])
         current_lr = optimizer.param_groups[0]['lr']
         if is_main_process(rank):
             print(f"  -> [HOTFIX-5c] 调度器恢复，当前LR={current_lr:.2e}（跳过warmup）")
-    
+
     # 5. Scaler
     if 'scaler_state_dict' in ckpt and scaler is not None and ckpt['scaler_state_dict'] is not None:
         scaler.load_state_dict(ckpt['scaler_state_dict'])
-    
+
     # 6. EMA：不恢复旧shadow，重新注册当前参数
     if ema is not None:
         ema._register(model)
         if is_main_process(rank):
             print(f"  -> [HOTFIX-5d] EMA重新初始化（不使用旧shadow）")
-    
+
     epoch = ckpt.get('epoch', 0)
     best_loss = ckpt.get('best_loss', float('inf'))
-    
+
     if is_main_process(rank):
         print(f"  -> 恢复 epoch {epoch}, best_loss={best_loss:.4f}")
-    
+
     del ckpt, state_dict
     gc.collect()
     torch.cuda.empty_cache()
     torch.cuda.synchronize(device)
-    
+
     return epoch, best_loss
 
 
@@ -1078,7 +1171,7 @@ def main():
     parser.add_argument("--seq_root", type=str, nargs='+',
                         default=["/add02/users/xuyh/seq1/", "/add02/users/xuyh/seq3/"])
     parser.add_argument("--model_dir", type=str, default="/home/xuyh/mapanything/")
-    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/final_lora/")
+    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/32_lora/")
     parser.add_argument("--epochs", type=int, default=100)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=4)
@@ -1097,8 +1190,11 @@ def main():
     parser.add_argument("--save_interval", type=int, default=1)
     parser.add_argument("--tolerance", type=float, default=0.05)
     parser.add_argument("--accum_iter", type=int, default=4)
-    parser.add_argument("--lora_r", type=int, default=8)
-    parser.add_argument("--lora_alpha", type=int, default=8)
+    parser.add_argument("--lora_r", type=int, default=32)
+    parser.add_argument("--lora_alpha", type=int, default=32)
+    parser.add_argument("--lora_target_mode", type=str, default="all",
+                        choices=["all", "no_encoder", "heads_only"],
+                        help="LoRA injection scope; default all matches the stronger reconstruction setting")
     parser.add_argument("--use_ema", action="store_true", default=True)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     args = parser.parse_args()
@@ -1127,23 +1223,31 @@ def main():
         print(f"  A LR: {args.lr}, B LR: {args.lr * args.lr_b_multiplier:.2e}")
         print(f"  Encoder LR ratio: {args.encoder_lr_ratio}")
         print(f"  LoRA r={args.lora_r}, alpha={args.lora_alpha}")
+        print(f"  LoRA target mode: {args.lora_target_mode}")
         print(f"  Accum: {args.accum_iter}, GradClip A/B: {args.grad_clip}/{args.grad_clip*5.0}")
         print("=" * 65)
 
-    model = build_model(args.model_dir, device, rank, lora_r=args.lora_r, lora_alpha=args.lora_alpha)
+    model = build_model(
+        args.model_dir,
+        device,
+        rank,
+        lora_r=args.lora_r,
+        lora_alpha=args.lora_alpha,
+        lora_target_mode=args.lora_target_mode,
+    )
 
     # [HOTFIX-2] B的weight_decay=0
     lora_A_params_encoder = []
     lora_B_params_encoder = []
     lora_A_params_head = []
     lora_B_params_head = []
-    
+
     for name, param in model.named_parameters():
         if not param.requires_grad:
             continue
         is_encoder = 'encoder' in name
         is_B = 'lora_B' in name
-        
+
         if is_encoder and is_B:
             lora_B_params_encoder.append(param)
         elif is_encoder and not is_B:
@@ -1234,13 +1338,13 @@ def main():
                                    device, epoch, args, rank, scheduler, ema)
         if is_main_process(rank):
             print(f"Epoch {epoch} 完成 | 平均损失: {avg_loss:.4f}")
-            
+
             if (epoch + 1) % args.save_interval == 0 or epoch == args.epochs - 1:
                 ckpt_path = os.path.join(args.output_dir, "checkpoints", f"epoch_{epoch:03d}.pt")
                 torch.cuda.empty_cache()
                 save_model = model.module if is_ddp else model
                 save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, ckpt_path, True, ema)
-            
+
             if avg_loss < best_loss:
                 best_loss = avg_loss
                 best_path = os.path.join(args.output_dir, "checkpoints", "best.pt")
@@ -1248,7 +1352,7 @@ def main():
                 save_model = model.module if is_ddp else model
                 save_checkpoint(save_model, optimizer, scheduler, scaler, epoch, best_loss, best_path, True, ema)
                 print(f"  -> 最佳模型 (loss={best_loss:.4f})")
-        
+
         torch.cuda.empty_cache()
         torch.cuda.synchronize(device)
 

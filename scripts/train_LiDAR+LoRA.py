@@ -1,4 +1,4 @@
-#!/usr/bin/env python3
+﻿#!/usr/bin/env python3
 # coding: utf-8
 """
 MapAnything Training Script (LiDAR Warmup + Unified Training)
@@ -284,8 +284,9 @@ def compute_features_for_indices(pcd, indices, radius=0.1, max_nn=30):
 
 # ========================= 全局深度归一化 =========================
 GLOBAL_DEPTH_MAX = 40.0
-LIDAR_NUM_CHANNELS = 7
-LIDAR_CACHE_VERSION = "k_projection_7ch_v1"
+LIDAR_NUM_CHANNELS = 9
+# The cache version must change whenever the channel layout changes.
+LIDAR_CACHE_VERSION = "k_projection_9ch_v1"
 
 
 def _empty_lidar_feature(gen_size: int) -> np.ndarray:
@@ -439,7 +440,11 @@ def generate_pcd_lidar_feature(
     depth_rel = depth_rel[np.newaxis, ...]
 
     normal = normal_img.transpose(2, 0, 1).astype(np.float32)
-    pcd_lidar = np.concatenate([cap, depth_rel, normal], axis=0)
+    valid = valid_img.astype(np.float32)[np.newaxis, ...]
+    depth_edge = _compute_sparse_depth_edge(depth_rel[0], valid_img)[np.newaxis, ...]
+    # Fixed layout shared with scripts/test.py:
+    # cap(3), relative depth(1), normal(3), valid(1), depth edge(1).
+    pcd_lidar = np.concatenate([cap, depth_rel, normal, valid, depth_edge], axis=0)
 
     return pcd_lidar, z_d
 
@@ -1052,6 +1057,9 @@ def build_model(model_dir: str, device: str, rank: int, use_compile: bool = True
     lidar_encoder_config["weights"] = None
     lidar_encoder_config["uses_torch_hub"] = False
     lidar_encoder_config["in_chans"] = LIDAR_NUM_CHANNELS
+    # 448x448 RGB -> 32x32 DINOv2 tokens.  The LiDAR ResNet receives
+    # 512x512 so its stride-16 output is also 32x32.
+    lidar_encoder_config["input_size"] = 512
     geometric_input_config["lidars_encoder_config"] = lidar_encoder_config
     model = MapAnything(
         name=config.get("name", "mapanything"),
@@ -1367,20 +1375,21 @@ def set_lidar_warmup_phase(model, enable_warmup, args, rank):
         clean_name = name.replace('_orig_mod.', '')
         is_lora = 'lora_A' in clean_name or 'lora_B' in clean_name
         is_lidar = any(k in clean_name for k in ('lidars_encoder', 'lidar_film', 'fusion_module', 'fusion_conv'))
+        is_pose_scale = args.lidar and 'pose_scale_proj' in clean_name
         is_head_base = any(h in clean_name for h in ('pose_head', 'dense_head', 'scale_head')) and not is_lora
         is_shared = any(k in clean_name for k in ('shared_linear', 'shared_decoder', 'output_proj'))
 
         if enable_warmup:
             # Warmup should teach the LiDAR branch and the fusion block together,
             # otherwise the fusion layer never learns to surface LiDAR evidence.
-            if is_lidar or is_head_base or is_shared:
+            if is_lidar or is_pose_scale or is_head_base or is_shared:
                 param.requires_grad = True
                 unfrozen_count += 1
             else:
                 param.requires_grad = False
                 frozen_count += 1
         else:
-            if is_lidar or is_lora:
+            if is_lidar or is_pose_scale or is_lora:
                 param.requires_grad = True
                 unfrozen_count += 1
             else:
@@ -1414,6 +1423,7 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
     lora_B_params_head = []
     lidar_params = []
     fusion_params = []
+    pose_scale_params = []
     head_base_params = []
     shared_params = []
     
@@ -1426,6 +1436,7 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
         is_B = 'lora_B' in clean_name
         is_fusion = any(k in clean_name for k in ('fusion_module', 'fusion_conv'))
         is_lidar = any(k in clean_name for k in ('lidars_encoder', 'lidar_film'))
+        is_pose_scale = 'pose_scale_proj' in clean_name
         is_head_base = any(h in clean_name for h in ('pose_head', 'dense_head', 'scale_head')) and 'lora' not in clean_name
         is_shared = any(k in clean_name for k in ('shared_linear', 'shared_decoder', 'output_proj'))
         
@@ -1434,6 +1445,8 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
             fusion_params.append(param)
         elif is_lidar:
             lidar_params.append(param)
+        elif is_pose_scale:
+            pose_scale_params.append(param)
         elif phase == 'joint' and 'lora_B' in clean_name:
             if is_encoder:
                 lora_B_params_encoder.append(param)
@@ -1481,6 +1494,13 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
                 'weight_decay': args.weight_decay,
                 'name': 'head_base'
             })
+        if pose_scale_params:
+            param_groups.append({
+                'params': pose_scale_params,
+                'lr': args.lr * warmup_lr_scale,
+                'weight_decay': args.weight_decay,
+                'name': 'pose_scale'
+            })
     else:
         # 联合训练：只训 LoRA（所有线性层的 A/B）+ LiDAR
         # Head 和 Shared 的基参数冻结，只通过 LoRA 微调
@@ -1492,6 +1512,8 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
             param_groups.append({'params': lora_A_params_encoder, 'lr': args.lr * args.encoder_lr_ratio, 'weight_decay': args.weight_decay, 'name': 'enc_lora_A'})
         if lora_B_params_encoder:
             param_groups.append({'params': lora_B_params_encoder, 'lr': args.lr * args.lr_b_multiplier * args.encoder_lr_ratio, 'weight_decay': 0.0, 'name': 'enc_lora_B'})
+        if pose_scale_params:
+            param_groups.append({'params': pose_scale_params, 'lr': args.lr, 'weight_decay': args.weight_decay, 'name': 'pose_scale'})
         if lidar_params:
             param_groups.append({'params': lidar_params, 'lr': args.lr * args.lidar_lr_scale, 'weight_decay': args.weight_decay, 'name': 'lidar_full'})
         if fusion_params:
@@ -1514,29 +1536,6 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
     
     return optimizer
 
-
-def reinitialize_fusion_module_for_joint_training(model, rank, smooth_alpha=0.35):
-    target_model = model.module if hasattr(model, 'module') else model
-    fusion_module = getattr(target_model, "fusion_module", None)
-    if fusion_module is None:
-        if is_main_process(rank):
-            print("  -> warning: fusion_module not found; skipping reinitialization")
-        return
-
-    with torch.no_grad():
-        gate_mlp = getattr(fusion_module, "gate_mlp", None)
-        if gate_mlp is not None and len(gate_mlp) >= 3 and hasattr(gate_mlp[-1], "weight"):
-            gate_mlp[-1].weight.zero_()
-            gate_mlp[-1].bias.fill_(_gate_bias_from_alpha(smooth_alpha))
-        refine = getattr(fusion_module, "refine", None)
-        if refine is not None and hasattr(refine, "weight"):
-            refine.weight.zero_()
-        fusion_conv = getattr(target_model, "fusion_conv", None)
-        if fusion_conv is not None and hasattr(fusion_conv, "bias"):
-            fusion_conv.bias.zero_()
-
-    if is_main_process(rank):
-        print(f"  -> fusion_module reinitialized to a moderate gate (alpha={smooth_alpha:.2f})")
 
 def build_scheduler(optimizer, args, steps_per_epoch):
     """构建学习率调度器"""
@@ -1915,16 +1914,14 @@ def main():
                         help="warmup 阶段的整体 LR 缩放系数，默认 0.5 更稳")
     parser.add_argument("--lidar_warmup_gate_alpha", type=float, default=0.60,
                         help="warmup phase fusion gate target for LiDAR emphasis")
-    parser.add_argument("--fusion_smooth_alpha", type=float, default=0.55,
-                        help="joint phase fusion gate target after warmup")
     parser.add_argument("--lidar_warmup_rgb_dropout_prob", type=float, default=0.15,
                         help="probability of zeroing RGB inputs during LiDAR warmup")
     parser.add_argument("--loss_depth_weight", type=float, default=0.1)
-    parser.add_argument("--loss_pose_trans_weight", type=float, default=2.0)
-    parser.add_argument("--loss_pose_rot_weight", type=float, default=0.5)
+    parser.add_argument("--loss_pose_trans_weight", type=float, default=1.5)
+    parser.add_argument("--loss_pose_rot_weight", type=float, default=0.35)
     parser.add_argument("--loss_ray_weight", type=float, default=0.1)
     parser.add_argument("--loss_pts3d_cam_weight", type=float, default=0.1)
-    parser.add_argument("--loss_world_pts_weight", type=float, default=0.05)
+    parser.add_argument("--loss_world_pts_weight", type=float, default=0.15)
     parser.add_argument("--loss_confidence_weight", type=float, default=0.1)
     parser.add_argument("--loss_scale_weight", type=float, default=0.1)
     parser.add_argument("--world_loss_cap", type=float, default=2.0)
@@ -2072,10 +2069,6 @@ def main():
         if desired_phase != current_phase:
             current_phase = desired_phase
             set_lidar_warmup_phase(model, enable_warmup=(current_phase == 'warmup'), args=args, rank=rank)
-            if 0 and current_phase == 'joint' and args.lidar_warmup_epochs > 0:
-                reinitialize_fusion_module_for_joint_training(
-                    model, rank, smooth_alpha=args.fusion_smooth_alpha
-                )
             optimizer = build_optimizer_for_phase(model, args, rank, phase=current_phase)
             scheduler, warmup_steps = build_scheduler(optimizer, args, steps_per_epoch)
             if ema is not None and current_phase == 'joint':

@@ -8,11 +8,10 @@ MapAnything LoRA Evaluation Script (Fixed)
      避免 load_images 内置 tvf.Normalize 导致的二次归一化。
   2. LoRA 权重加载兼容 lora_state_dict / model_state_dict。
   3. data_norm_type 统一为 list 格式。
-  4. 支持 --use_load_images 开关用于对比实验。
   5. uses_torch_hub=False（与训练一致）。
   6. lora_alpha 默认 32.0（与训练一致）。
   7. cap 去掉 *255 缩放（与训练一致，值域 [0,1]）。
-  8. pcd shape 修正为 [B, H, W, 7]（与训练一致，channel-last）。
+  8. pcd shape 修正为 [B, H, W, 9]（与训练一致，channel-last）。
   9. 加 fusion_module 权重诊断。
 """
 
@@ -25,6 +24,7 @@ import glob
 import re
 import math
 import copy
+import gc
 import warnings
 from typing import List, Dict
 
@@ -38,8 +38,9 @@ import open3d as o3d
 from PIL import Image
 
 try:
-    from scipy.spatial import procrustes
+    from scipy.spatial import cKDTree, procrustes
 except ImportError:
+    cKDTree = None
     procrustes = None
 
 try:
@@ -51,7 +52,6 @@ except ImportError:
     print("[警告] 未安装 openpyxl，xlsx 导出将不可用。请执行: pip install openpyxl")
 
 from mapanything.models import MapAnything
-from mapanything.utils.image import load_images
 from safetensors.torch import load_file
 
 warnings.filterwarnings('ignore')
@@ -74,7 +74,7 @@ os.environ["HF_HOME"] = "/tmp/hf_cache"
 
 # ========================= LoRA (与训练脚本逐行一致) =========================
 class LinearWithLoRA(nn.Module):
-    def __init__(self, linear: nn.Linear, r: int = 8, lora_alpha: float = 32.0):
+    def __init__(self, linear: nn.Linear, r: int = 8, lora_alpha: float = 16.0):
         super().__init__()
         self.linear = linear
         self.scaling = lora_alpha / r
@@ -93,7 +93,7 @@ class LinearWithLoRA(nn.Module):
         return out.add_(lora, alpha=self.scaling)
 
 
-def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: float = 32.0):
+def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: float = 16.0):
     for name, child in list(module.named_children()):
         if isinstance(child, nn.Linear):
             setattr(module, name, LinearWithLoRA(child, r, lora_alpha))
@@ -122,7 +122,7 @@ def _normalize_state_dict_keys(state_dict):
 
 
 GLOBAL_DEPTH_MAX = 40.0
-LIDAR_NUM_CHANNELS = 7
+LIDAR_NUM_CHANNELS = 9
 
 
 def _empty_pcd_feature_dict(H, W, device):
@@ -130,8 +130,16 @@ def _empty_pcd_feature_dict(H, W, device):
     normal = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
     cap = torch.zeros((H, W, 3), dtype=torch.float32, device=device)
     valid = torch.zeros((H, W), dtype=torch.float32, device=device)
+    edge = torch.zeros((H, W), dtype=torch.float32, device=device)
     scale = torch.ones((1,), dtype=torch.float32, device=device)
-    return {'cap': cap, 'depth': depth, 'normal': normal, 'valid': valid, 'scale': scale}
+    return {
+        'cap': cap,
+        'depth': depth,
+        'normal': normal,
+        'valid': valid,
+        'edge': edge,
+        'scale': scale,
+    }
 
 
 def _compute_sparse_depth_edge(depth_rel, valid_mask):
@@ -240,7 +248,10 @@ def get_pcd_features(
     pcd_idx=None,
 ):
     if pcd_cache is not None and pcd_idx is not None and pcd_idx in pcd_cache:
-        return pcd_cache[pcd_idx]
+        cached = pcd_cache[pcd_idx]
+        if device is None:
+            return cached
+        return {k: v.to(device=device, non_blocking=True) if torch.is_tensor(v) else v for k, v in cached.items()}
 
     pcd = o3d.io.read_point_cloud(pcd_path)
     points = np.asarray(pcd.points)
@@ -249,7 +260,7 @@ def get_pcd_features(
     if K is None:
         result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
-            pcd_cache[pcd_idx] = result
+            pcd_cache[pcd_idx] = {k: v.cpu() if torch.is_tensor(v) else v for k, v in result.items()}
         return result
     K_proj = _scale_intrinsics(K, intrinsics_size, (W, H))
     fx, fy = float(K_proj[0, 0]), float(K_proj[1, 1])
@@ -258,7 +269,7 @@ def get_pcd_features(
     if len(points) == 0:
         result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
-            pcd_cache[pcd_idx] = result
+            pcd_cache[pcd_idx] = {k: v.cpu() if torch.is_tensor(v) else v for k, v in result.items()}
         return result
 
     pts_cam = points.astype(np.float32)
@@ -267,7 +278,7 @@ def get_pcd_features(
     if not np.any(valid_mask):
         result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
-            pcd_cache[pcd_idx] = result
+            pcd_cache[pcd_idx] = {k: v.cpu() if torch.is_tensor(v) else v for k, v in result.items()}
         return result
 
     x, y, z = x[valid_mask], y[valid_mask], z[valid_mask]
@@ -277,7 +288,7 @@ def get_pcd_features(
     if not np.any(in_image):
         result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
-            pcd_cache[pcd_idx] = result
+            pcd_cache[pcd_idx] = {k: v.cpu() if torch.is_tensor(v) else v for k, v in result.items()}
         return result
 
     u = u[in_image].astype(int)
@@ -290,7 +301,7 @@ def get_pcd_features(
     if not np.any(good_mask):
         result = _empty_pcd_feature_dict(H, W, device)
         if pcd_cache is not None and pcd_idx is not None:
-            pcd_cache[pcd_idx] = result
+            pcd_cache[pcd_idx] = {k: v.cpu() if torch.is_tensor(v) else v for k, v in result.items()}
         return result
 
     u, v, z = u[good_mask], v[good_mask], z[good_mask]
@@ -330,24 +341,29 @@ def get_pcd_features(
 
     depth_np = np.clip(depth_img / GLOBAL_DEPTH_MAX, 0.0, 1.0).astype(np.float32)
     valid_np = valid_img.astype(np.float32)
+    edge_np = _compute_sparse_depth_edge(depth_np, valid_img)
     normal_np = normal_img.astype(np.float32)
 
-    cap_tensor = torch.from_numpy(cap_np).to(device)
-    depth_tensor = torch.from_numpy(depth_np).to(device)
-    normal_tensor = torch.from_numpy(normal_np).to(device)
-    valid_tensor = torch.from_numpy(valid_np).to(device)
-    scale_tensor = torch.tensor([z_d], dtype=torch.float32, device=device)
+    cap_tensor = torch.from_numpy(cap_np)
+    depth_tensor = torch.from_numpy(depth_np)
+    normal_tensor = torch.from_numpy(normal_np)
+    valid_tensor = torch.from_numpy(valid_np)
+    edge_tensor = torch.from_numpy(edge_np)
+    scale_tensor = torch.tensor([z_d], dtype=torch.float32)
 
-    result = {
+    result_cpu = {
         'cap': cap_tensor,
         'depth': depth_tensor,
         'normal': normal_tensor,
         'valid': valid_tensor,
+        'edge': edge_tensor,
         'scale': scale_tensor,
     }
     if pcd_cache is not None and pcd_idx is not None:
-        pcd_cache[pcd_idx] = result
-    return result
+        pcd_cache[pcd_idx] = result_cpu
+    if device is None:
+        return result_cpu
+    return {k: v.to(device=device, non_blocking=True) if torch.is_tensor(v) else v for k, v in result_cpu.items()}
 
 # ========================= 健壮内参解析 =========================
 def _parse_yaml_intrinsics(file_path):
@@ -414,7 +430,7 @@ def _load_intrinsics_with_size(file_path):
 def build_model_for_eval(model_dir: str, device: str,
                          trained_ckpt_path: str = None,
                          use_lora: bool = False,
-                         lora_r: int = 8, lora_alpha: float = 32.0):
+                         lora_r: int = 8, lora_alpha: float = 16.0):
     config_path = os.path.join(model_dir, "config.json")
     weights_path = os.path.join(model_dir, "model.safetensors")
     with open(config_path, 'r') as f:
@@ -432,6 +448,9 @@ def build_model_for_eval(model_dir: str, device: str,
     lidar_encoder_config["uses_torch_hub"] = False
     lidar_encoder_config.pop("pretrained", None)
     lidar_encoder_config.pop("weights", None)
+    # Keep the LiDAR ResNet grid aligned with the 32x32 RGB token grid:
+    # 512x512 input with stride 16 produces 32x32 features.
+    lidar_encoder_config["input_size"] = 512
     geometric_input_config["lidars_encoder_config"] = lidar_encoder_config
 
     model = MapAnything(
@@ -522,9 +541,16 @@ def build_model_for_eval(model_dir: str, device: str,
             print(f"[LoRA-Diag] 成功匹配的 LoRA 参数: {len(lora_common)}")
 
             if lora_common:
-                sample_key = lora_common[0]
-                diff = torch.abs(model.state_dict()[sample_key].cpu() - new_state_dict[sample_key].cpu()).max().item()
-                print(f"[LoRA-Diag] 抽样 {sample_key}: 权重差异 max={diff:.6f}")
+                sample_key = None
+                for k in lora_common:
+                    if new_state_dict[k].shape == model.state_dict()[k].shape:
+                        sample_key = k
+                        break
+                if sample_key is not None:
+                    diff = torch.abs(model.state_dict()[sample_key].cpu() - new_state_dict[sample_key].cpu()).max().item()
+                    print(f"[LoRA-Diag] 抽样 {sample_key}: 权重差异 max={diff:.6f}")
+                else:
+                    print("[LoRA-Diag] 所有公共 LoRA key 的 shape 都不一致，跳过抽样 diff 检查")
 
                 a_norms = [model.state_dict()[k].norm().item() for k in model_keys if 'lora_A' in k]
                 b_norms = [model.state_dict()[k].norm().item() for k in model_keys if 'lora_B' in k]
@@ -785,45 +811,13 @@ def load_images_manual(image_paths, img_size=448, device='cuda'):
         })
     return views
 
-# ========================= 推理（双路径：手动 / load_images） =========================
+# ========================= ????????????=========================
 def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pcd_timestamps,
                         intrinsics_raw=None, intrinsics_size=(0, 0),
-                        img_size=448, view_pcd_indices=None, pcd_cache=None,
-                        use_load_images=False):
-    """
-    支持两种图像加载模式：
-      - use_load_images=False（默认）：手动 PIL 加载，与训练预处理完全一致。
-      - use_load_images=True：使用原始 load_images（若需对比基线 behavior）。
-    """
+                        img_size=448, view_pcd_indices=None, pcd_cache=None):
+    """Use the same preprocessing path as training."""
     target_h, target_w = img_size, img_size
-
-    if use_load_images:
-        # 原始路径（保留用于对比实验）
-        views = load_images(
-            image_paths,
-            norm_type="dinov2",
-            resolution_set=518,
-            patch_size=14
-        )
-        # 确保 data_norm_type 为 list
-        for view in views:
-            dnt = view.get('data_norm_type')
-            if isinstance(dnt, str):
-                view['data_norm_type'] = [dnt]
-            elif dnt is None:
-                view['data_norm_type'] = ['dinov2']
-
-        # 强制 resize 到 448
-        orig_h, orig_w = views[0]['img'].shape[2:4]
-        if orig_h != target_h or orig_w != target_w:
-            for view in views:
-                view['img'] = F.interpolate(
-                    view['img'], size=(target_h, target_w),
-                    mode='bilinear', align_corners=False
-                )
-    else:
-        # 修复路径：与训练一致
-        views = load_images_manual(image_paths, img_size=img_size, device=device)
+    views = load_images_manual(image_paths, img_size=img_size, device=device)
 
     B = views[0]['img'].shape[0]
     if intrinsics_raw is not None:
@@ -832,7 +826,7 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
         for view in views:
             view['intrinsics'] = intrinsics_tensor.expand(view['img'].shape[0], -1, -1).contiguous()
 
-    # confidence 补充（手动加载时已计算，load_images 模式需补充）
+    # confidence is computed from the original image when absent.
     for i, view in enumerate(views):
         if 'confidence' not in view:
             try:
@@ -864,13 +858,18 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
                 pcd_idx=idx,
             )
 
-            # Build LiDAR feature map as (H, W, 7): cap(3), depth(1), normal(3).
+            # Build LiDAR feature map as (H, W, 9):
+            # cap(3), depth(1), normal(3), valid(1), depth edge(1).
             cap = feat_dict['cap'].to(dtype=torch.float32)       # (H, W, 3)
             depth = feat_dict['depth'].to(dtype=torch.float32)   # (H, W)
             normal = feat_dict['normal'].to(dtype=torch.float32) # (H, W, 3)
+            valid = feat_dict['valid'].to(dtype=torch.float32)   # (H, W)
+            edge = feat_dict['edge'].to(dtype=torch.float32)     # (H, W)
 
             depth = depth.unsqueeze(-1)                           # (H, W, 1)
-            pcd_lidar = torch.cat([cap, depth, normal], dim=-1)
+            valid = valid.unsqueeze(-1)
+            edge = edge.unsqueeze(-1)
+            pcd_lidar = torch.cat([cap, depth, normal, valid, edge], dim=-1)
 
             # Resize through channel-first layout, then convert back to channel-last.
             pcd_lidar = pcd_lidar.permute(2, 0, 1).unsqueeze(0)
@@ -988,6 +987,162 @@ def align_trajectory_SE3(pred_poses, gt_poses):
         aligned_poses.append(T_aligned)
 
     return aligned_poses
+
+
+POINTCLOUD_THRESHOLDS_M = (0.05, 0.10, 0.20)
+POINTCLOUD_VOXEL_SIZE_M = 0.05
+POINTCLOUD_MAX_POINTS_PER_FRAME = 20000
+POINTCLOUD_MAX_POINTS_TOTAL = 300000
+
+
+def _as_hw_depth(depth):
+    depth = np.asarray(depth, dtype=np.float32)
+    if depth.ndim == 3 and depth.shape[-1] == 1:
+        depth = depth[..., 0]
+    return depth
+
+
+def _depth_to_camera_points(depth, K, valid_mask):
+    h, w = depth.shape
+    u, v = np.meshgrid(np.arange(w, dtype=np.float32), np.arange(h, dtype=np.float32))
+    z = depth[valid_mask].astype(np.float32)
+    x = (u[valid_mask] - float(K[0, 2])) * z / float(K[0, 0])
+    y = (v[valid_mask] - float(K[1, 2])) * z / float(K[1, 1])
+    return np.stack([x, y, z], axis=1).astype(np.float32)
+
+
+def _transform_points(points_cam, pose_c2w):
+    R = pose_c2w[:3, :3].astype(np.float32)
+    t = pose_c2w[:3, 3].astype(np.float32)
+    return (points_cam @ R.T) + t
+
+
+def _subsample_points(points, max_points, rng):
+    if points.shape[0] <= max_points:
+        return points
+    idx = rng.choice(points.shape[0], size=max_points, replace=False)
+    return points[idx]
+
+
+def _voxel_downsample_np(points, voxel_size):
+    if points.size == 0 or voxel_size <= 0:
+        return points
+    voxel = np.floor(points / voxel_size).astype(np.int64)
+    _, unique_idx = np.unique(voxel, axis=0, return_index=True)
+    return points[np.sort(unique_idx)]
+
+
+def _nearest_distances(src_points, dst_points):
+    tree = cKDTree(dst_points)
+    distances, _ = tree.query(src_points, k=1)
+    return distances.astype(np.float32)
+
+
+def _compute_pointcloud_reconstruction_metrics(
+    matched_frames,
+    pred_poses_aligned,
+    gt_poses_raw,
+    gt_depths,
+    gt_intrinsics,
+):
+    if cKDTree is None or not gt_depths or gt_intrinsics is None:
+        return {}
+
+    depth_timestamps = np.array(sorted(gt_depths.keys()), dtype=np.int64)
+    if len(depth_timestamps) == 0:
+        return {}
+
+    rng = np.random.default_rng(42)
+    pred_clouds = []
+    gt_clouds = []
+    pc_frame_count = 0
+
+    for m, pred_pose, gt_pose in zip(matched_frames, pred_poses_aligned, gt_poses_raw):
+        pred_d = m.get("depth_z")
+        if pred_d is None:
+            continue
+
+        img_ts_raw = int(round(m["pred_ts"] * 1e9))
+        idx = np.argmin(np.abs(depth_timestamps - img_ts_raw))
+        best_ts = int(depth_timestamps[idx])
+        if abs(best_ts - img_ts_raw) > 5e7:
+            continue
+
+        pred_d = _as_hw_depth(pred_d)
+        gt_d = _as_hw_depth(gt_depths[best_ts])
+
+        if pred_d.shape[:2] != gt_d.shape[:2]:
+            gt_d = cv2.resize(
+                gt_d,
+                (pred_d.shape[1], pred_d.shape[0]),
+                interpolation=cv2.INTER_NEAREST,
+            )
+
+        valid_pred = np.isfinite(pred_d) & (pred_d > 0)
+        valid_gt = np.isfinite(gt_d) & (gt_d > 0)
+        if not np.any(valid_pred) or not np.any(valid_gt):
+            continue
+
+        pred_points_cam = _depth_to_camera_points(pred_d, gt_intrinsics, valid_pred)
+        gt_points_cam = _depth_to_camera_points(gt_d, gt_intrinsics, valid_gt)
+
+        pred_points_world = _transform_points(pred_points_cam, pred_pose)
+        gt_points_world = _transform_points(gt_points_cam, gt_pose)
+
+        pred_points_world = _subsample_points(
+            pred_points_world, POINTCLOUD_MAX_POINTS_PER_FRAME, rng
+        )
+        gt_points_world = _subsample_points(
+            gt_points_world, POINTCLOUD_MAX_POINTS_PER_FRAME, rng
+        )
+
+        pred_clouds.append(pred_points_world)
+        gt_clouds.append(gt_points_world)
+        pc_frame_count += 1
+
+    if not pred_clouds or not gt_clouds:
+        return {}
+
+    pred_points = np.concatenate(pred_clouds, axis=0).astype(np.float32)
+    gt_points = np.concatenate(gt_clouds, axis=0).astype(np.float32)
+
+    pred_points = _voxel_downsample_np(pred_points, POINTCLOUD_VOXEL_SIZE_M)
+    gt_points = _voxel_downsample_np(gt_points, POINTCLOUD_VOXEL_SIZE_M)
+    pred_points = _subsample_points(pred_points, POINTCLOUD_MAX_POINTS_TOTAL, rng)
+    gt_points = _subsample_points(gt_points, POINTCLOUD_MAX_POINTS_TOTAL, rng)
+
+    if pred_points.shape[0] == 0 or gt_points.shape[0] == 0:
+        return {}
+
+    pred_to_gt = _nearest_distances(pred_points, gt_points)
+    gt_to_pred = _nearest_distances(gt_points, pred_points)
+
+    accuracy = float(np.mean(pred_to_gt))
+    completeness = float(np.mean(gt_to_pred))
+    metrics = {
+        "pc_num_frames": int(pc_frame_count),
+        "pc_num_pred_points": int(pred_points.shape[0]),
+        "pc_num_gt_points": int(gt_points.shape[0]),
+        "pc_accuracy_mean": accuracy,
+        "pc_completeness_mean": completeness,
+        "pc_chamfer_l1": float(accuracy + completeness),
+        "pc_rmse": float(
+            np.sqrt((np.mean(pred_to_gt ** 2) + np.mean(gt_to_pred ** 2)) / 2.0)
+        ),
+    }
+
+    for tau in POINTCLOUD_THRESHOLDS_M:
+        precision = float(np.mean(pred_to_gt < tau) * 100.0)
+        recall = float(np.mean(gt_to_pred < tau) * 100.0)
+        fscore = 0.0 if precision + recall == 0 else (2.0 * precision * recall) / (precision + recall)
+        suffix = f"{int(round(tau * 100))}cm"
+        metrics[f"pc_precision_{suffix}"] = precision
+        metrics[f"pc_recall_{suffix}"] = recall
+        metrics[f"pc_fscore_{suffix}"] = float(fscore)
+        metrics[f"pc_outlier_{suffix}"] = float(100.0 - precision)
+
+    return metrics
+
 
 # ========================= 评测 =========================
 def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics, output_dir,
@@ -1164,6 +1319,14 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         angle = np.arccos(dot) * 180 / np.pi
         ray_errs.append(np.mean(angle))
 
+    pc_stats = _compute_pointcloud_reconstruction_metrics(
+        matched_frames,
+        pred_poses_aligned,
+        gt_poses_raw,
+        gt_depths,
+        gt_intrinsics,
+    )
+
     # ========== stats dict key 与旧版完全一致（带 deg 后缀）==========
     stats = {
         'num_frames': len(matched_frames),
@@ -1190,6 +1353,7 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         'ray_error_mean': float(np.mean(ray_errs)) if ray_errs else None,
         'ray_error_std': float(np.std(ray_errs)) if ray_errs else None,
     }
+    stats.update(pc_stats)
     # =================================================================
 
     # ========== 打印输出与旧版完全一致（带 ° 符号）==========
@@ -1214,6 +1378,17 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         print(f"  Depth: 未计算（匹配失败 0 帧，检查时间戳单位）")
     if ray_errs:
         print(f"  Ray error: {stats['ray_error_mean']:.2f} ± {stats['ray_error_std']:.2f} deg")
+    if pc_stats:
+        print(
+            f"  Point cloud Chamfer-L1: {stats['pc_chamfer_l1']:.4f} m "
+            f"(Acc={stats['pc_accuracy_mean']:.4f} m, Comp={stats['pc_completeness_mean']:.4f} m)"
+        )
+        print(
+            f"  Point cloud F-score@10cm: {stats['pc_fscore_10cm']:.2f} % "
+            f"(P={stats['pc_precision_10cm']:.2f} %, R={stats['pc_recall_10cm']:.2f} %)"
+        )
+    else:
+        print("  Point cloud: 未计算（缺少 GT depth / 有效点云 / scipy cKDTree）")
     # =========================================================
 
     os.makedirs(output_dir, exist_ok=True)
@@ -1287,6 +1462,25 @@ def save_results_to_xlsx(stats: dict, output_dir: str, use_lora: int, use_lidar:
         ("Depth_Tau_Std", stats.get('depth_tau_std'), "%", "深度 τ 阈值通过率标准差"),
         ("Ray_Error_Mean", stats.get('ray_error_mean'), "deg", "射线方向误差均值"),
         ("Ray_Error_Std", stats.get('ray_error_std'), "deg", "射线方向误差标准差"),
+        ("PC_Chamfer_L1", stats.get('pc_chamfer_l1'), "m", "预测点云到 GT 点云的双向最近邻 L1 距离"),
+        ("PC_Accuracy", stats.get('pc_accuracy_mean'), "m", "预测点到 GT 点云的平均最近邻距离"),
+        ("PC_Completeness", stats.get('pc_completeness_mean'), "m", "GT 点到预测点云的平均最近邻距离"),
+        ("PC_RMSE", stats.get('pc_rmse'), "m", "预测/GT 双向最近邻 RMSE"),
+        ("PC_Precision@5cm", stats.get('pc_precision_5cm'), "%", "预测点中距离 GT 小于 5cm 的比例"),
+        ("PC_Recall@5cm", stats.get('pc_recall_5cm'), "%", "GT 点中距离预测点小于 5cm 的比例"),
+        ("PC_Fscore@5cm", stats.get('pc_fscore_5cm'), "%", "5cm 阈值下的点云 F-score"),
+        ("PC_Outlier@5cm", stats.get('pc_outlier_5cm'), "%", "预测点中距离 GT 大于等于 5cm 的比例"),
+        ("PC_Precision@10cm", stats.get('pc_precision_10cm'), "%", "预测点中距离 GT 小于 10cm 的比例"),
+        ("PC_Recall@10cm", stats.get('pc_recall_10cm'), "%", "GT 点中距离预测点小于 10cm 的比例"),
+        ("PC_Fscore@10cm", stats.get('pc_fscore_10cm'), "%", "10cm 阈值下的点云 F-score"),
+        ("PC_Outlier@10cm", stats.get('pc_outlier_10cm'), "%", "预测点中距离 GT 大于等于 10cm 的比例"),
+        ("PC_Precision@20cm", stats.get('pc_precision_20cm'), "%", "预测点中距离 GT 小于 20cm 的比例"),
+        ("PC_Recall@20cm", stats.get('pc_recall_20cm'), "%", "GT 点中距离预测点小于 20cm 的比例"),
+        ("PC_Fscore@20cm", stats.get('pc_fscore_20cm'), "%", "20cm 阈值下的点云 F-score"),
+        ("PC_Outlier@20cm", stats.get('pc_outlier_20cm'), "%", "预测点中距离 GT 大于等于 20cm 的比例"),
+        ("PC_Num_Frames", stats.get('pc_num_frames'), "-", "参与点云指标计算的帧数"),
+        ("PC_Num_Pred_Points", stats.get('pc_num_pred_points'), "-", "下采样后的预测点数"),
+        ("PC_Num_GT_Points", stats.get('pc_num_gt_points'), "-", "下采样后的 GT 点数"),
         ("Num_Frames", stats.get('num_frames'), "-", "参与评测的有效帧数"),
     ]
     # ==========================================================
@@ -1323,15 +1517,13 @@ def main():
     parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/mapanything/output/")
     parser.add_argument("--use_lidar", type=int, default=1)
     parser.add_argument("--use_lora", type=int, default=1)
-    parser.add_argument("--lora_r", type=int, default=32)
-    parser.add_argument("--lora_alpha", type=float, default=32.0)
+    parser.add_argument("--lora_r", type=int, default=16)
+    parser.add_argument("--lora_alpha", type=float, default=16.0)
     parser.add_argument("--batch_size", type=int, default=4, 
                         help="测试时每次输入模型的视图数。注意：若 use_lora=1 且 info_sharing 被 LoRA，建议设为训练时的 seq_len(4)")
     parser.add_argument("--img_size", type=int, default=448)
     parser.add_argument("--max_images", type=int, default=None)
     parser.add_argument("--gpu", type=int, default=3)
-    parser.add_argument("--use_load_images", action="store_true", default=False,
-                        help="使用原始 load_images（会先做 DINOv2 归一化）。默认使用手动加载（与训练一致）。")
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -1340,7 +1532,6 @@ def main():
 
     dataset_id = parse_dataset_id(args.seq_root)
     print(f"[Info] 数据集标识: {dataset_id}")
-    print(f"[Info] 图像加载模式: {'load_images (原始)' if args.use_load_images else 'manual (与训练一致)'}")
 
     print("\n[1/4] 加载模型...")
     model = build_model_for_eval(
@@ -1401,7 +1592,6 @@ def main():
             img_size=args.img_size,
             view_pcd_indices=view_pcd_indices,
             pcd_cache=pcd_cache,
-            use_load_images=args.use_load_images
         )
 
         if predictions is None:
@@ -1415,7 +1605,9 @@ def main():
         del predictions
         if views is not None:
             del views
+        del batch_outputs
         torch.cuda.empty_cache()
+        gc.collect()
 
     print(f"[3/4] 推理完成: {len(all_predictions)} 帧, 耗时 {time.time()-t0:.1f}s")
 

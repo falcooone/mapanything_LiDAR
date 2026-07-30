@@ -131,6 +131,7 @@ class GatedMultimodalFusion(nn.Module):
             nn.GELU(),
             nn.Linear(hidden_dim, feat_dim),
         )
+        self.spatial_gate = nn.Conv2d(3, 1, kernel_size=3, padding=1, bias=True)
         self.refine = nn.Conv2d(
             feat_dim,
             feat_dim,
@@ -144,16 +145,46 @@ class GatedMultimodalFusion(nn.Module):
         # LiDAR contribution where it is helpful.
         nn.init.zeros_(self.gate_mlp[-1].weight)
         nn.init.constant_(self.gate_mlp[-1].bias, 0.0)
+        nn.init.zeros_(self.spatial_gate.weight)
+        nn.init.constant_(self.spatial_gate.bias, 2.0)
         nn.init.zeros_(self.refine.weight)
 
-    def forward(self, rgb_feat: torch.Tensor, lidar_feat: torch.Tensor) -> torch.Tensor:
-        rgb_context = F.adaptive_avg_pool2d(rgb_feat, output_size=1).flatten(1)
-        lidar_context = F.adaptive_avg_pool2d(lidar_feat, output_size=1).flatten(1)
+    @staticmethod
+    def _masked_avg_pool(feat: torch.Tensor, mask: torch.Tensor = None) -> torch.Tensor:
+        if mask is None:
+            return F.adaptive_avg_pool2d(feat, output_size=1).flatten(1)
+        mask = mask.to(dtype=feat.dtype, device=feat.device).clamp(0.0, 1.0)
+        denom = mask.sum(dim=(2, 3), keepdim=True).clamp_min(1.0)
+        return (feat * mask).sum(dim=(2, 3), keepdim=True).div(denom).flatten(1)
+
+    def forward(
+        self,
+        rgb_feat: torch.Tensor,
+        lidar_feat: torch.Tensor,
+        lidar_reliability: torch.Tensor = None,
+    ) -> torch.Tensor:
+        rgb_context = self._masked_avg_pool(rgb_feat, lidar_reliability)
+        lidar_context = self._masked_avg_pool(lidar_feat, lidar_reliability)
         gate = torch.sigmoid(
             self.gate_mlp(torch.cat([rgb_context, lidar_context], dim=1))
         ).view(rgb_feat.shape[0], rgb_feat.shape[1], 1, 1)
 
-        fused = rgb_feat + gate * (lidar_feat - rgb_feat)
+        rgb_energy = rgb_feat.detach().float().pow(2).mean(dim=1, keepdim=True).sqrt()
+        lidar_energy = lidar_feat.detach().float().pow(2).mean(dim=1, keepdim=True).sqrt()
+        if lidar_reliability is None:
+            lidar_reliability = torch.ones_like(rgb_energy)
+        else:
+            lidar_reliability = lidar_reliability.to(
+                dtype=rgb_energy.dtype, device=rgb_energy.device
+            ).clamp(0.0, 1.0)
+
+        spatial_gate = torch.sigmoid(
+            self.spatial_gate(
+                torch.cat([rgb_energy, lidar_energy, lidar_reliability], dim=1).to(rgb_feat.dtype)
+            )
+        )
+        effective_gate = gate * spatial_gate * lidar_reliability.to(rgb_feat.dtype)
+        fused = rgb_feat + effective_gate * (lidar_feat - rgb_feat)
         return fused + self.refine(fused)
 
 
@@ -243,8 +274,12 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         ray_dirs_encoder_config["patch_size"] = self.encoder.patch_size
         self.ray_dirs_encoder = encoder_factory(**ray_dirs_encoder_config)
         
-        # Initialize the encoder for lidars
-        lidars_encoder_config = self.geometric_input_config["lidars_encoder_config"]
+        # Initialize the encoder for lidars. Feed a 512x512 raster by default
+        # so a stride-16 ResNet produces a 32x32 feature grid, matching
+        # DINOv2 at a 448x448 / patch-14 input. Keep this setting outside the
+        # third-party encoder config because it may not accept input_size.
+        lidars_encoder_config = self.geometric_input_config["lidars_encoder_config"].copy()
+        self.lidar_input_size = int(lidars_encoder_config.pop("input_size", 512))
         self.lidar_in_chans = int(lidars_encoder_config.get("in_chans", 7))
         lidars_encoder_config["enc_embed_dim"] = self.encoder.enc_embed_dim
         lidars_encoder_config["patch_size"] = self.encoder.patch_size
@@ -309,6 +344,15 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         # During inference extended to (B, C, T), where T is the number of tokens (i.e., 1)
         self.scale_token = nn.Parameter(torch.zeros(self.encoder.enc_embed_dim))
         torch.nn.init.trunc_normal_(self.scale_token, std=0.02)
+        # Minimal global-scale conditioning path for pose prediction.
+        # The training code can leave it effectively disabled by not providing
+        # a valid global scale (e.g., when LiDAR is missing or dropped).
+        self.pose_scale_proj = nn.Linear(1, self.encoder.enc_embed_dim)
+        # Preserve the pretrained pose path at initialization. The new scale
+        # condition is learned from the pose loss instead of injecting a
+        # randomly initialized global feature into every pose prediction.
+        nn.init.zeros_(self.pose_scale_proj.weight)
+        nn.init.zeros_(self.pose_scale_proj.bias)
 
         # Set the MLP layer config for the info sharing transformer
         if info_sharing_mlp_layer_str == "mlp":
@@ -1260,6 +1304,66 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
 
         return all_encoder_features_across_views
 
+    def _build_pose_scale_condition(
+        self,
+        views,
+        num_views,
+        batch_size_per_view,
+        device,
+        dtype,
+    ):
+        """
+        Build a lightweight global-scale conditioning tensor for the pose head.
+
+        The path is enabled only for samples that have both a valid LiDAR input
+        and a finite, positive lidar_depth_scale. If no valid samples are found,
+        return None so the pose head follows the original path unchanged.
+        """
+        if not hasattr(self, "pose_scale_proj") or self.pose_scale_proj is None:
+            return None
+
+        scale_vals = []
+        valid_masks = []
+        for view_idx in range(num_views):
+            view = views[view_idx]
+            sample_mask = torch.zeros(batch_size_per_view, device=device, dtype=torch.bool)
+            if "pcd" in view and torch.is_tensor(view["pcd"]):
+                pcd = view["pcd"]
+                if pcd.dim() == 5:
+                    pcd = pcd.squeeze(1)
+                # 9-channel layout: valid is channel 7. Fall back to the
+                # depth channel for older inputs, but never use curvature or
+                # normal values as a proxy for LiDAR availability.
+                if pcd.shape[-1] >= 9:
+                    sample_mask = (pcd[..., 7] > 1e-6).any(dim=(1, 2))
+                elif pcd.shape[-1] >= 4:
+                    sample_mask = (pcd[..., 3].abs() > 1e-6).any(dim=(1, 2))
+                else:
+                    sample_mask = torch.isfinite(pcd).any(dim=(1, 2, 3)) & (pcd.abs().sum(dim=(1, 2, 3)) > 1e-8)
+
+            z = torch.ones(batch_size_per_view, device=device, dtype=dtype)
+            has_explicit_scale = False
+            if "lidar_depth_scale" in view and torch.is_tensor(view["lidar_depth_scale"]):
+                curr_scale = view["lidar_depth_scale"].to(device=device, dtype=dtype).view(-1)
+                if curr_scale.numel() == 1 and batch_size_per_view > 1:
+                    curr_scale = curr_scale.expand(batch_size_per_view)
+                z = curr_scale[:batch_size_per_view]
+                has_explicit_scale = True
+
+            valid = sample_mask & has_explicit_scale & torch.isfinite(z) & (z > 1e-6)
+            scale_vals.append(z)
+            valid_masks.append(valid)
+
+        scale_vals = torch.cat(scale_vals, dim=0).clamp(min=1e-3)
+        valid_masks = torch.cat(valid_masks, dim=0)
+        if not valid_masks.any():
+            return None
+
+        scale_feat = torch.log(scale_vals.unsqueeze(-1) + 1e-8)
+        scale_feat = self.pose_scale_proj(scale_feat)
+        scale_feat = scale_feat * valid_masks.unsqueeze(-1).to(dtype)
+        return scale_feat
+
     def _encode_lidars(
         self,
         views,
@@ -1318,12 +1422,71 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         lidars = torch.cat(lidars_list, dim=0)
         lidars = lidars.permute(0, 3, 1, 2).contiguous()
 
+        # Keep RGB at its native 448x448 input size, but use a 512x512 LiDAR
+        # raster so a stride-16 ResNet naturally emits a 32x32 feature grid.
+        # The raster still covers the same normalized image domain, so this
+        # resize does not change the camera calibration of the projected data.
+        if self.lidar_input_size > 0:
+            lidar_input_hw = (self.lidar_input_size, self.lidar_input_size)
+            if lidars.shape[-2:] != lidar_input_hw:
+                lidars = F.interpolate(
+                    lidars,
+                    size=lidar_input_hw,
+                    mode="bilinear",
+                    align_corners=False,
+                )
+
         # Encode the lidar
         lidars_features_across_views = self.lidars_encoder(
             ViTEncoderNonImageInput(data=lidars)
         )
 
         return lidars_features_across_views.features
+
+    def _build_lidar_reliability(
+        self,
+        views,
+        num_views,
+        batch_size_per_view,
+        per_sample_lidars_input_mask,
+        target_size: Tuple[int, int],
+        dtype,
+        device,
+    ) -> torch.Tensor:
+        _, _, height, width = views[0]["img"].shape
+        reliability_list = []
+        for view_idx in range(num_views):
+            curr_mask = per_sample_lidars_input_mask[
+                view_idx * batch_size_per_view : (view_idx + 1) * batch_size_per_view
+            ]
+            reliability = torch.zeros(
+                (batch_size_per_view, 1, height, width),
+                dtype=dtype,
+                device=device,
+            )
+            if "pcd" in views[view_idx] and curr_mask.any():
+                pcd = views[view_idx]["pcd"][curr_mask].to(device=device, dtype=dtype)
+                if pcd.shape[-1] >= 9:
+                    # 9-channel layout: valid is channel 7. Keep it as a
+                    # soft mask because the input raster may already have
+                    # been resized with bilinear interpolation.
+                    curr_reliability = pcd[..., 7].clamp(0.0, 1.0).unsqueeze(1)
+                elif pcd.shape[-1] >= 4:
+                    curr_reliability = (pcd[..., 3].abs() > 1e-6).to(dtype).unsqueeze(1)
+                else:
+                    curr_reliability = (pcd.abs().sum(dim=-1) > 0).to(dtype).unsqueeze(1)
+                reliability[curr_mask] = curr_reliability
+            reliability_list.append(reliability)
+
+        reliability = torch.cat(reliability_list, dim=0)
+        if reliability.shape[-2:] != target_size:
+            reliability = F.interpolate(
+                reliability,
+                size=target_size,
+                mode="bilinear",
+                align_corners=False,
+            )
+        return reliability.clamp(0.0, 1.0)
 
     def _encode_and_fuse_optional_geometric_inputs(
         self, views, all_encoder_features_across_views_list, use_lidar
@@ -1487,6 +1650,15 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 all_encoder_features_across_views,
                 per_sample_lidars_input_mask,
             )   # (B*V, enc_embed_dim, H_lidar_feat, W_lidar_feat)
+            lidar_reliability = self._build_lidar_reliability(
+                views,
+                num_views,
+                batch_size_per_view,
+                per_sample_lidars_input_mask,
+                target_size=(H_feat, W_feat),
+                dtype=all_encoder_features_across_views.dtype,
+                device=all_encoder_features_across_views.device,
+            )
 
             # ========== Fused Feature Map Info ==========
             # C_fused, Hf_fused, Wf_fused = lidars_features_across_views.shape[1], lidars_features_across_views.shape[2], lidars_features_across_views.shape[3]
@@ -1529,20 +1701,36 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                     align_corners=False
                 )
 
-            # Confidence-based weighting
-            view_confidences = torch.stack([views[i]["confidence"] for i in range(num_views)])  # (V,)
-            conf_RGB = view_confidences.repeat_interleave(batch_size_per_view, dim=0).view(batch_size_per_view * num_views, 1, 1, 1)
-            half = torch.tensor(0.5, dtype=conf_RGB.dtype, device=conf_RGB.device)
-            conf_Lidar = half / (half + conf_RGB)
-            conf_RGB = 1 - conf_Lidar
-
-             # Apply weights
-            all_encoder_features_across_views = all_encoder_features_across_views * conf_RGB
-            lidars_features_across_views = lidars_features_across_views * conf_Lidar
+            confidence_values = []
+            for view_idx in range(num_views):
+                confidence = views[view_idx].get("confidence", None)
+                if confidence is None:
+                    confidence = torch.ones(
+                        batch_size_per_view,
+                        dtype=all_encoder_features_across_views.dtype,
+                        device=all_encoder_features_across_views.device,
+                    ) * 0.5
+                else:
+                    confidence = confidence.to(
+                        dtype=all_encoder_features_across_views.dtype,
+                        device=all_encoder_features_across_views.device,
+                    ).view(-1)
+                    if confidence.numel() == 1 and batch_size_per_view > 1:
+                        confidence = confidence.expand(batch_size_per_view)
+                    confidence = confidence[:batch_size_per_view]
+                confidence_values.append(confidence)
+            view_confidences = torch.cat(confidence_values, dim=0).view(
+                batch_size_per_view * num_views, 1, 1, 1
+            )
+            half = torch.tensor(0.5, dtype=view_confidences.dtype, device=view_confidences.device)
+            lidar_confidence_prior = (half / (half + view_confidences.clamp_min(0.0))).clamp(0.25, 1.0)
+            lidar_reliability = (lidar_reliability * lidar_confidence_prior).clamp(0.0, 1.0)
+            lidars_features_across_views = lidars_features_across_views * lidar_reliability
 
             all_encoder_features_across_views = self.fusion_module(
                 all_encoder_features_across_views,
                 lidars_features_across_views,
+                lidar_reliability,
             )
             fusion_pair = torch.cat(
                 [all_encoder_features_across_views, lidars_features_across_views],
@@ -1653,7 +1841,8 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
         self,
         dense_head_inputs: Union[torch.Tensor, List[torch.Tensor]],
         scale_head_inputs: torch.Tensor,
-        img_shape: Tuple[int, int],
+        pose_scale_inputs: torch.Tensor = None,
+        img_shape: Tuple[int, int] = (0, 0),
         memory_efficient_inference: bool = False,
         minibatch_size: int = None,
     ):
@@ -1721,6 +1910,14 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                 # Pose prediction (mini-batched)
                 if self.pred_head_type == "dpt+pose":
                     pose_head_inputs_batch = dense_head_inputs[-1][start_idx:end_idx]
+                    if pose_scale_inputs is not None:
+                        pose_scale_batch = pose_scale_inputs[start_idx:end_idx]
+                        if pose_scale_batch.ndim == 2:
+                            pose_scale_batch = pose_scale_batch.unsqueeze(-1).unsqueeze(-1)
+                        elif pose_scale_batch.ndim == 3:
+                            pose_scale_batch = pose_scale_batch.unsqueeze(-1)
+                        pose_scale_batch = pose_scale_batch.to(pose_head_inputs_batch.dtype)
+                        pose_head_inputs_batch = pose_head_inputs_batch + pose_scale_batch
                     pose_head_outputs_batch = self.pose_head(
                         PredictionHeadInput(last_feature=pose_head_inputs_batch)
                     )
@@ -1772,8 +1969,17 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             # Pose prediction
             pose_final_outputs = None
             if self.pred_head_type == "dpt+pose":
+                pose_head_inputs = dense_head_inputs[-1]
+                if pose_scale_inputs is not None:
+                    pose_scale_inputs_full = pose_scale_inputs
+                    if pose_scale_inputs_full.ndim == 2:
+                        pose_scale_inputs_full = pose_scale_inputs_full.unsqueeze(-1).unsqueeze(-1)
+                    elif pose_scale_inputs_full.ndim == 3:
+                        pose_scale_inputs_full = pose_scale_inputs_full.unsqueeze(-1)
+                    pose_scale_inputs_full = pose_scale_inputs_full.to(pose_head_inputs.dtype)
+                    pose_head_inputs = pose_head_inputs + pose_scale_inputs_full
                 pose_head_outputs = self.pose_head(
-                    PredictionHeadInput(last_feature=dense_head_inputs[-1])
+                    PredictionHeadInput(last_feature=pose_head_inputs)
                 )
                 pose_final_outputs = self.pose_adaptor(
                     AdaptorInput(
@@ -1937,16 +2143,27 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
             scale_head_inputs = (
                 final_info_sharing_multi_view_feat.additional_token_features
             )
+            pose_scale_inputs = self._build_pose_scale_condition(
+                views=views,
+                num_views=num_views,
+                batch_size_per_view=batch_size_per_view,
+                # _encode_and_fuse_optional_geometric_inputs returns a
+                # per-view tuple/list; the scale token is the already-stacked
+                # tensor that shares the pose-head batch/device convention.
+                device=scale_head_inputs.device,
+                dtype=scale_head_inputs.dtype,
+            ) if use_lidar else None
 
             # Run the downstream heads
             dense_final_outputs, pose_final_outputs, scale_final_output = (
                 self.downstream_head(
-                    dense_head_inputs=dense_head_inputs,
-                    scale_head_inputs=scale_head_inputs,
-                    img_shape=img_shape,
-                    memory_efficient_inference=memory_efficient_inference,
-                    minibatch_size=minibatch_size,
-                )
+                dense_head_inputs=dense_head_inputs,
+                scale_head_inputs=scale_head_inputs,
+                img_shape=img_shape,
+                pose_scale_inputs=pose_scale_inputs,
+                memory_efficient_inference=memory_efficient_inference,
+                minibatch_size=minibatch_size,
+            )
             )
 
             # Prepare the final scene representation for all views
