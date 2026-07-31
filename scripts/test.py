@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coding: utf-8
+# coding: gbk
 """
 MapAnything LoRA Evaluation Script (Fixed)
 ==========================================
@@ -1044,6 +1044,7 @@ def _compute_pointcloud_reconstruction_metrics(
     gt_poses_raw,
     gt_depths,
     gt_intrinsics,
+    tolerance = 0.01
 ):
     if cKDTree is None or not gt_depths or gt_intrinsics is None:
         return {}
@@ -1065,7 +1066,7 @@ def _compute_pointcloud_reconstruction_metrics(
         img_ts_raw = int(round(m["pred_ts"] * 1e9))
         idx = np.argmin(np.abs(depth_timestamps - img_ts_raw))
         best_ts = int(depth_timestamps[idx])
-        if abs(best_ts - img_ts_raw) > 5e7:
+        if abs(best_ts - img_ts_raw) > tolerance * 1e9:
             continue
 
         pred_d = _as_hw_depth(pred_d)
@@ -1146,7 +1147,7 @@ def _compute_pointcloud_reconstruction_metrics(
 
 # ========================= 评测 =========================
 def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics, output_dir,
-                                 use_lora, use_lidar, dataset_id):
+                                 use_lora, use_lidar, dataset_id, tolerance = 0.01):
     if not predictions or not gt_poses:
         print("[Eval] 无预测结果或真值，跳过评测")
         return None
@@ -1174,6 +1175,10 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         left_ts = gt_timestamps[idx - 1]
         right_ts = gt_timestamps[idx]
         best_ts = left_ts if abs(pred_ts - left_ts) < abs(pred_ts - right_ts) else right_ts
+        
+        # tolerance 单位是秒，pred_ts 单位是秒，不需要转换
+        if abs(pred_ts - best_ts) > tolerance:
+            continue
 
         pred_pose = pred.get('camera_poses')
         if pred_pose is None:
@@ -1277,7 +1282,7 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
             best_ts = int(depth_timestamps[idx])
             diff = abs(best_ts - img_ts_raw)
 
-            tolerance_ns = 5e7
+            tolerance_ns = tolerance * 1e9
 
             if diff > tolerance_ns:
                 continue
@@ -1325,6 +1330,7 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
         gt_poses_raw,
         gt_depths,
         gt_intrinsics,
+        tolerance,
     )
 
     # ========== stats dict key 与旧版完全一致（带 deg 后缀）==========
@@ -1523,7 +1529,8 @@ def main():
                         help="测试时每次输入模型的视图数。注意：若 use_lora=1 且 info_sharing 被 LoRA，建议设为训练时的 seq_len(4)")
     parser.add_argument("--img_size", type=int, default=448)
     parser.add_argument("--max_images", type=int, default=None)
-    parser.add_argument("--gpu", type=int, default=3)
+    parser.add_argument("--tolerance", type=float, default=0.01)
+    parser.add_argument("--gpu", type=int, default=5)
     args = parser.parse_args()
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
@@ -1614,8 +1621,8 @@ def main():
     print("\n[4/4] 开始评测...")
     stats = run_comprehensive_validation(
         all_predictions, gt_poses, gt_depths, intrinsics, args.output_dir,
-        use_lora=args.use_lora, use_lidar=args.use_lidar, dataset_id=dataset_id
-    )
+        use_lora=args.use_lora, use_lidar=args.use_lidar, dataset_id=dataset_id,
+        tolerance=args.tolerance)
 
     if stats:
         save_results_to_xlsx(

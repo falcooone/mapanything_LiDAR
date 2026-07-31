@@ -42,19 +42,25 @@ import importlib
 
 
 def find_repo_root() -> Path:
-    """Find the repository for both root-level and scripts/ execution."""
+    """Find the repository for root-level and scripts/ execution.
+
+    The server stores all scripts directly in the repository root, while the
+    local checkout stores this implementation under scripts/. Never walk up
+    to a user's home directory merely because a test.py exists there.
+    """
     script_path = Path(__file__).resolve()
-    for candidate in (script_path.parent, *script_path.parents):
-        has_project_package = (candidate / "mapanything").is_dir()
-        has_eval_script = (
-            (candidate / "test.py").is_file()
-            or (candidate / "scripts" / "test.py").is_file()
-        )
-        if has_project_package and has_eval_script:
+    script_dir = script_path.parent
+    search_dirs = [script_dir, *script_dir.parents]
+    for candidate in search_dirs:
+        if not (candidate / "mapanything").is_dir():
+            continue
+        if (candidate / "test.py").is_file():
+            return candidate
+        if (candidate / "scripts" / "test.py").is_file():
             return candidate
     raise RuntimeError(
-        "Could not locate repository root. Expected mapanything/ and "
-        "test.py or scripts/test.py."
+        f"Could not locate repository root from {script_path}. Expected "
+        "a mapanything/ package and a test.py in the same repository."
     )
 
 
@@ -69,7 +75,14 @@ if str(ROOT) not in sys.path:
 # that actually exposes the required API; a same-named but older test.py may
 # exist and may only contain a different evaluation entry point.
 TEST_API = ("build_model_for_eval", "load_eval_data", "run_inference_batch")
-TEST_CANDIDATES = [ROOT / "test.py", ROOT / "scripts" / "test.py"]
+SCRIPT_DIR = Path(__file__).resolve().parent
+TEST_CANDIDATES = [
+    SCRIPT_DIR / "test.py",
+    ROOT / "test.py",
+    ROOT / "scripts" / "test.py",
+]
+# Preserve order while removing duplicate paths.
+TEST_CANDIDATES = list(dict.fromkeys(path.resolve() for path in TEST_CANDIDATES))
 PROJECT_TEST = None
 TEST_SCRIPT = None
 candidate_errors = []
@@ -102,6 +115,8 @@ if PROJECT_TEST is None or TEST_SCRIPT is None:
         f"{TEST_API}. Candidates checked:\n{details}"
     )
 
+print(f"[Diagnosis] script: {Path(__file__).resolve()}")
+print(f"[Diagnosis] repository: {ROOT}")
 print(f"[Eval API] loaded: {TEST_SCRIPT}")
 build_model_for_eval = PROJECT_TEST.build_model_for_eval
 load_eval_data = PROJECT_TEST.load_eval_data
@@ -155,6 +170,212 @@ PARAM_GROUPS = OrderedDict(
         ("pose_scale_proj", ("pose_scale_proj.",)),
     )
 )
+
+PART_NAME_RE = re.compile(r"^shuangchuang_seq\d+_(?:night|daytime)\d+th$")
+IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".tif")
+DEPTH_EXTS = (".npy", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp")
+
+
+def _timestamp_from_name(path: str) -> int:
+    match = re.search(r"color_(\d+)", os.path.basename(path))
+    if match is None:
+        match = re.search(r"(\d+)", os.path.basename(path))
+    if match is not None:
+        return int(match.group(1))
+    return int(os.path.getmtime(path) * 1e9)
+
+
+def discover_part_roots(seq_root: str) -> List[str]:
+    """Return actual part directories without mixing their timestamps."""
+    root = os.path.abspath(seq_root)
+    if PART_NAME_RE.match(os.path.basename(root)):
+        return [root]
+
+    part_roots = [
+        os.path.join(root, name)
+        for name in sorted(os.listdir(root))
+        if PART_NAME_RE.match(name)
+        and os.path.isdir(os.path.join(root, name))
+    ]
+    if part_roots:
+        return part_roots
+    raise ValueError(
+        f"No part directories matching {PART_NAME_RE.pattern} under {root}. "
+        "Pass --seq_root as the parent sequence directory or as one part directory."
+    )
+
+
+def _load_intrinsics_for_part(part_root: str, seq_root: str):
+    """Use part intrinsics when present, otherwise sequence-level intrinsics."""
+    candidates = [
+        os.path.join(part_root, "color_camera_intrinsics.txt"),
+        os.path.join(seq_root, "color_camera_intrinsics.txt"),
+    ]
+    for path in candidates:
+        if os.path.exists(path):
+            loader = getattr(PROJECT_TEST, "_load_intrinsics_with_size", None)
+            if loader is not None:
+                raw, size = loader(path)
+                if raw is not None:
+                    return raw, size, path
+    return np.eye(3, dtype=np.float32), (0, 0), None
+
+
+def _index_depth_files(part_root: str) -> Dict[int, str]:
+    depth_dir = os.path.join(part_root, "depth")
+    result: Dict[int, str] = {}
+    if not os.path.isdir(depth_dir):
+        return result
+    for path in sorted(os.listdir(depth_dir)):
+        full_path = os.path.join(depth_dir, path)
+        if not os.path.isfile(full_path):
+            continue
+        if os.path.splitext(path)[1].lower() not in DEPTH_EXTS:
+            continue
+        timestamp = _timestamp_from_name(full_path)
+        result[timestamp] = full_path
+    return result
+
+
+def _load_tum_timestamps(seq_root: str) -> np.ndarray:
+    pose_path = os.path.join(os.path.abspath(seq_root), "extrinsics.tum")
+    timestamps = []
+    if not os.path.isfile(pose_path):
+        return np.asarray([], dtype=np.float64)
+    with open(pose_path, "r", encoding="utf-8", errors="ignore") as handle:
+        for line in handle:
+            parts = line.strip().split()
+            if not parts or parts[0].startswith("#") or len(parts) < 8:
+                continue
+            try:
+                timestamps.append(float(parts[0]))
+            except ValueError:
+                continue
+    return np.asarray(sorted(timestamps), dtype=np.float64)
+
+
+def _count_timestamp_matches(
+    image_paths: List[str],
+    reference_timestamps: Iterable[int],
+    tolerance_seconds: float,
+) -> int:
+    reference = np.asarray(list(reference_timestamps), dtype=np.float64)
+    if reference.size == 0:
+        return 0
+    matched = 0
+    for path in image_paths:
+        image_seconds = _timestamp_from_name(path) / 1e9
+        nearest = float(np.min(np.abs(reference - image_seconds)))
+        if nearest <= tolerance_seconds:
+            matched += 1
+    return matched
+
+
+def _sample_depth_metadata(depth_index: Dict[int, str]) -> Dict[str, Any]:
+    if not depth_index:
+        return {"sample_path": None, "sample_shape": None, "sample_dtype": None}
+    sample_path = next(iter(depth_index.values()))
+    try:
+        if os.path.splitext(sample_path)[1].lower() == ".npy":
+            sample = np.load(sample_path, mmap_mode="r")
+        else:
+            sample = np.asarray(Image.open(sample_path))
+        return {
+            "sample_path": sample_path,
+            "sample_shape": list(sample.shape),
+            "sample_dtype": str(sample.dtype),
+        }
+    except Exception as exc:
+        return {
+            "sample_path": sample_path,
+            "sample_shape": None,
+            "sample_dtype": None,
+            "sample_error": f"{type(exc).__name__}: {exc}",
+        }
+
+
+def _load_part_record(part_root: str, seq_root: str, img_size: int, limit: Optional[int]):
+    rgb_dir = os.path.join(part_root, "rgb")
+    image_paths = []
+    if os.path.isdir(rgb_dir):
+        image_paths = [
+            os.path.join(rgb_dir, name)
+            for name in sorted(os.listdir(rgb_dir))
+            if os.path.splitext(name)[1].lower() in IMAGE_EXTS
+        ]
+    if limit is not None and limit > 0:
+        image_paths = image_paths[:limit]
+
+    lidar_dir = os.path.join(part_root, "lidar")
+    pcd_paths = []
+    if os.path.isdir(lidar_dir):
+        pcd_paths = [
+            os.path.join(lidar_dir, name)
+            for name in sorted(os.listdir(lidar_dir))
+            if name.lower().endswith(".pcd")
+        ]
+    pcd_timestamps = [_timestamp_from_name(path) for path in pcd_paths]
+    intrinsics_raw, intrinsics_size, intrinsics_path = _load_intrinsics_for_part(
+        part_root, seq_root
+    )
+    depth_index = _index_depth_files(part_root)
+    gt_pose_timestamps = _load_tum_timestamps(seq_root)
+    gt_depth_timestamps = list(depth_index.keys())
+    return {
+        "part_root": part_root,
+        "part_name": os.path.basename(part_root),
+        "image_paths": image_paths,
+        "pcd_file_list": pcd_paths,
+        "pcd_timestamps": pcd_timestamps,
+        "intrinsics_raw": intrinsics_raw,
+        "intrinsics_size": intrinsics_size,
+        "intrinsics_path": intrinsics_path,
+        "gt_depth_index": depth_index,
+        "gt_pose_timestamps": gt_pose_timestamps,
+        "gt_pose_matches": _count_timestamp_matches(
+            image_paths, gt_pose_timestamps * 1e9, 0.05
+        ),
+        "gt_depth_matches": _count_timestamp_matches(
+            image_paths, gt_depth_timestamps, 0.05
+        ),
+        "gt_depth_sample": _sample_depth_metadata(depth_index),
+    }
+
+
+def load_sequence_parts(seq_root: str, img_size: int, max_images: Optional[int]) -> List[Dict[str, Any]]:
+    """Load RGB/LiDAR/GT metadata one part at a time.
+
+    The diagnostic compares predictions, so GT arrays are indexed rather than
+    materialized. GT poses live at the sequence root; depth files live in each
+    part's depth/ directory alongside its RGB and LiDAR data.
+    """
+    part_roots = discover_part_roots(seq_root)
+    remaining = max_images if max_images is not None and max_images > 0 else None
+    records = []
+    for part_root in part_roots:
+        limit = remaining
+        record = _load_part_record(part_root, os.path.abspath(seq_root), img_size, limit)
+        if record["image_paths"]:
+            records.append(record)
+            if remaining is not None:
+                remaining -= len(record["image_paths"])
+                if remaining <= 0:
+                    break
+    if not records:
+        raise ValueError(f"No RGB frames found under parts of {seq_root}")
+
+    pose_count = len(records[0]["gt_pose_timestamps"])
+    for record in records:
+        print(
+            f"[Data] {record['part_name']}: RGB={len(record['image_paths'])}, "
+            f"LiDAR={len(record['pcd_file_list'])}, "
+            f"GT-depth={len(record['gt_depth_index'])}, "
+            f"pose-match={record['gt_pose_matches']}, "
+            f"depth-match={record['gt_depth_matches']}, "
+            f"intrinsics={record['intrinsics_path'] or 'identity fallback'}"
+        )
+    print(f"[Data] parts={len(records)}, sequence GT poses={pose_count}, root={seq_root}")
+    return records
 
 
 def set_seed(seed: int) -> None:
@@ -557,7 +778,11 @@ def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--model_dir", default="/home/xuyh/mapanything/")
     parser.add_argument("--checkpoint", default="/add02/users/xuyh/checkpoints/32_lora_lidar/checkpoints/epoch_002.pt")
-    parser.add_argument("--seq_root", default="/add02/users/xuyh/seq2/",help="One sequence containing rgb/ and lidar/")
+    parser.add_argument(
+        "--seq_root",
+        default="/add02/users/xuyh/seq2/",
+        help="Parent sequence containing shuangchuang_seq* part directories, or one part directory",
+    )
     parser.add_argument("--output_json", default="lidar_effect_diagnosis.json")
     parser.add_argument("--batch_size", type=int, default=4)
     parser.add_argument("--img_size", type=int, default=448)
@@ -599,81 +824,115 @@ def main() -> None:
     model.eval()
     parameter_stats = parameter_diagnostics(model, base_state, checkpoint_state)
 
-    (
-        image_paths,
-        _intrinsics,
-        _gt_poses,
-        _gt_depths,
-        pcd_file_list,
-        pcd_timestamps,
-        intrinsics_raw,
-        intrinsics_size,
-    ) = load_eval_data(
+    part_records = load_sequence_parts(
         args.seq_root,
         img_size=args.img_size,
-        use_lidar=True,
         max_images=args.max_images,
     )
-    if not pcd_file_list:
-        raise RuntimeError("No LiDAR PCD files found. Check --seq_root/lidar.")
 
     recorder = ForwardRecorder()
     recorder.attach(model)
     output_accumulators: Dict[str, RunningDiff] = {}
     input_stats = InputStats()
     failed_batches = 0
-    pcd_cache: Dict[int, Dict[str, Any]] = {}
+    compared_frames = 0
+    part_reports = []
     t0 = time.time()
 
-    for batch_start in range(0, len(image_paths), args.batch_size):
-        batch_paths = image_paths[batch_start : batch_start + args.batch_size]
-        batch_number = batch_start // args.batch_size + 1
-        total_batches = (len(image_paths) + args.batch_size - 1) // args.batch_size
-        indices = image_pcd_indices(batch_paths, pcd_timestamps)
-
-        # Resetting the RNG makes optional geometric-input dropout identical
-        # in both forwards. Evaluation mode removes dropout from the network.
-        set_seed(args.seed + batch_number)
-        rgb_predictions, _ = run_inference_batch(
-            model,
-            batch_paths,
-            device,
-            use_lidar=False,
-            pcd_file_list=[],
-            pcd_timestamps=[],
-            intrinsics_raw=intrinsics_raw,
-            intrinsics_size=intrinsics_size,
-            img_size=args.img_size,
-            view_pcd_indices=[0] * len(batch_paths),
-            pcd_cache=pcd_cache,
-        )
-
-        set_seed(args.seed + batch_number)
-        lidar_predictions, lidar_views = run_inference_batch(
-            model,
-            batch_paths,
-            device,
-            use_lidar=True,
-            pcd_file_list=pcd_file_list,
-            pcd_timestamps=pcd_timestamps,
-            intrinsics_raw=intrinsics_raw,
-            intrinsics_size=intrinsics_size,
-            img_size=args.img_size,
-            view_pcd_indices=indices,
-            pcd_cache=pcd_cache,
-        )
-
-        if rgb_predictions is None or lidar_predictions is None:
-            failed_batches += 1
-            print(f"[Batch {batch_number}/{total_batches}] failed")
+    for part_idx, record in enumerate(part_records):
+        image_paths = record["image_paths"]
+        pcd_file_list = record["pcd_file_list"]
+        pcd_timestamps = record["pcd_timestamps"]
+        if not pcd_file_list or not pcd_timestamps:
+            print(f"[Part {record['part_name']}] WARNING: no LiDAR files; skipped")
+            part_reports.append(
+                {
+                    "part_name": record["part_name"],
+                    "part_root": record["part_root"],
+                    "rgb_frames": len(image_paths),
+                    "lidar_frames": 0,
+                    "compared_frames": 0,
+                    "skipped": True,
+                    "reason": "no_lidar_files",
+                }
+            )
             continue
-        add_prediction_diffs(rgb_predictions, lidar_predictions, output_accumulators)
-        input_stats.add_views(lidar_views)
-        print(f"[Batch {batch_number}/{total_batches}] compared {len(batch_paths)} frames")
-        del rgb_predictions, lidar_predictions, lidar_views
-        gc.collect()
-        if device.type == "cuda":
-            torch.cuda.empty_cache()
+
+        pcd_cache: Dict[int, Dict[str, Any]] = {}
+        part_compared = 0
+        part_failed = 0
+        total_batches = (len(image_paths) + args.batch_size - 1) // args.batch_size
+        print(f"\n[Part {part_idx + 1}/{len(part_records)}] {record['part_name']}")
+
+        for batch_start in range(0, len(image_paths), args.batch_size):
+            batch_paths = image_paths[batch_start : batch_start + args.batch_size]
+            batch_number = batch_start // args.batch_size + 1
+            indices = image_pcd_indices(batch_paths, pcd_timestamps)
+
+            # Resetting the RNG makes optional geometric-input dropout
+            # identical in both forwards. Evaluation mode removes dropout.
+            seed = args.seed + part_idx * 100000 + batch_number
+            set_seed(seed)
+            rgb_predictions, _ = run_inference_batch(
+                model,
+                batch_paths,
+                device,
+                use_lidar=False,
+                pcd_file_list=[],
+                pcd_timestamps=[],
+                intrinsics_raw=record["intrinsics_raw"],
+                intrinsics_size=record["intrinsics_size"],
+                img_size=args.img_size,
+                view_pcd_indices=[0] * len(batch_paths),
+                pcd_cache=pcd_cache,
+            )
+
+            set_seed(seed)
+            lidar_predictions, lidar_views = run_inference_batch(
+                model,
+                batch_paths,
+                device,
+                use_lidar=True,
+                pcd_file_list=pcd_file_list,
+                pcd_timestamps=pcd_timestamps,
+                intrinsics_raw=record["intrinsics_raw"],
+                intrinsics_size=record["intrinsics_size"],
+                img_size=args.img_size,
+                view_pcd_indices=indices,
+                pcd_cache=pcd_cache,
+            )
+
+            if rgb_predictions is None or lidar_predictions is None:
+                failed_batches += 1
+                part_failed += 1
+                print(f"[Part {record['part_name']}] batch {batch_number}/{total_batches} failed")
+                continue
+            add_prediction_diffs(rgb_predictions, lidar_predictions, output_accumulators)
+            input_stats.add_views(lidar_views)
+            part_compared += len(batch_paths)
+            compared_frames += len(batch_paths)
+            print(
+                f"[Part {record['part_name']}] batch {batch_number}/{total_batches} "
+                f"compared {len(batch_paths)} frames"
+            )
+            del rgb_predictions, lidar_predictions, lidar_views
+            gc.collect()
+            if device.type == "cuda":
+                torch.cuda.empty_cache()
+
+        part_reports.append(
+            {
+                "part_name": record["part_name"],
+                "part_root": record["part_root"],
+                "rgb_frames": len(image_paths),
+                "lidar_frames": len(pcd_file_list),
+                "gt_depth_frames": len(record["gt_depth_index"]),
+                "intrinsics_path": record["intrinsics_path"],
+                "compared_frames": part_compared,
+                "failed_batches": part_failed,
+                "skipped": False,
+            }
+        )
 
     recorder.close()
     result = {
@@ -681,6 +940,8 @@ def main() -> None:
         "base_model": base_meta,
         "args": vars(args),
         "input": input_stats.report(),
+        "parts": part_reports,
+        "compared_frames": compared_frames,
         "parameter_diagnostics": parameter_stats,
         "forward_hooks": recorder.report(),
         "output_differences": {key: value.report() for key, value in output_accumulators.items()},
