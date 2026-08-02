@@ -56,6 +56,7 @@ warnings.filterwarnings('ignore')
 # Kept consistent with the LiDAR+LoRA model configuration. This script runs
 # with use_lidar=False, so the channel tensor is only a construction fallback.
 LIDAR_NUM_CHANNELS = 9
+MAX_TIMESTAMP_TOLERANCE_SEC = 0.01
 
 
 # ========================= DDP 工具 =========================
@@ -586,7 +587,16 @@ class SeqRGBDataset(Dataset):
         self.seq_len = seq_len
         self.stride = stride
         self.img_size = img_size
-        self.tolerance = tolerance
+        requested_tolerance = float(tolerance)
+        self.tolerance = min(
+            max(requested_tolerance, 0.0),
+            MAX_TIMESTAMP_TOLERANCE_SEC,
+        )
+        if requested_tolerance > MAX_TIMESTAMP_TOLERANCE_SEC and is_main_process(int(os.environ.get('RANK', 0))):
+            print(
+                f"[Data] timestamp tolerance {requested_tolerance:.6f}s exceeds the hard "
+                f"limit; clamped to {MAX_TIMESTAMP_TOLERANCE_SEC:.6f}s"
+            )
         if img_exts is None:
             img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp')
         self.img_exts = tuple(e.lower() for e in img_exts)
@@ -669,7 +679,7 @@ class SeqRGBDataset(Dataset):
                     right_diff = abs(self.gt_timestamps[pos] - img_ts_sec)
                     nearest_idx = pos - 1 if left_diff < right_diff else pos
                 diff = abs(self.gt_timestamps[nearest_idx] - img_ts_sec)
-                if diff < tolerance:
+                if diff <= self.tolerance:
                     self.all_views_meta.append((ipath, img_ts_ns, pidx, nearest_idx))
 
         if not self.all_views_meta and is_main_process(int(os.environ.get('RANK', 0))):
@@ -705,7 +715,7 @@ class SeqRGBDataset(Dataset):
         idx = np.argmin(np.abs(depth_info['timestamps'] - img_ts_ns))
         matched_ts = int(depth_info['timestamps'][idx])
         diff_ns = abs(matched_ts - img_ts_ns)
-        if diff_ns < self.tolerance * 1e9:
+        if diff_ns <= self.tolerance * 1e9:
             return depth_info['files'][idx]
         return None
 
@@ -1188,7 +1198,12 @@ def main():
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=1)
-    parser.add_argument("--tolerance", type=float, default=0.05)
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=MAX_TIMESTAMP_TOLERANCE_SEC,
+        help="maximum RGB/GT/depth timestamp error in seconds (hard-capped at 0.01)",
+    )
     parser.add_argument("--accum_iter", type=int, default=4)
     parser.add_argument("--lora_r", type=int, default=32)
     parser.add_argument("--lora_alpha", type=int, default=32)

@@ -31,6 +31,7 @@ import argparse
 import glob
 import re
 import math
+import itertools
 import random
 import warnings
 from typing import List, Dict, Tuple
@@ -285,12 +286,108 @@ def compute_features_for_indices(pcd, indices, radius=0.1, max_nn=30):
 # ========================= 全局深度归一化 =========================
 GLOBAL_DEPTH_MAX = 40.0
 LIDAR_NUM_CHANNELS = 9
+MAX_TIMESTAMP_TOLERANCE_SEC = 0.05
 # The cache version must change whenever the channel layout changes.
-LIDAR_CACHE_VERSION = "k_projection_9ch_v1"
+LIDAR_CACHE_VERSION = "k_projection_9ch_y_z_x_tolerance_50ms_v4"
 
 
 def _empty_lidar_feature(gen_size: int) -> np.ndarray:
     return np.zeros((LIDAR_NUM_CHANNELS, gen_size, gen_size), dtype=np.float32)
+
+
+def _lidar_points_to_camera_axes(points_xyz: np.ndarray) -> np.ndarray:
+    # Confirmed manually from projection overlays: X_cam=Y_lidar, Y_cam=Z_lidar, Z_cam=X_lidar.
+    return np.stack([points_xyz[:, 1], points_xyz[:, 2], points_xyz[:, 0]], axis=1).astype(np.float32)
+
+
+def _make_lidar_diag(reason: str, **kwargs) -> Dict[str, object]:
+    diag = {"reason": reason}
+    diag.update(kwargs)
+    return diag
+
+
+def _axis_projection_diagnostics(
+    points_xyz: np.ndarray,
+    fx: float,
+    fy: float,
+    cx: float,
+    cy: float,
+    width: int,
+    height: int,
+) -> List[Dict[str, object]]:
+    x = points_xyz[:, 0]
+    y = points_xyz[:, 1]
+    z = points_xyz[:, 2]
+
+    axis_vectors = {
+        "x": x,
+        "y": y,
+        "z": z,
+        "negx": -x,
+        "negy": -y,
+        "negz": -z,
+    }
+    axis_names = ("x", "y", "z")
+    axis_signs = ("", "neg")
+
+    results = []
+    for perm in itertools.permutations(axis_names, 3):
+        for sign_bits in itertools.product((1, -1), repeat=3):
+            # Only keep proper right-handed rotations (determinant +1).
+            # For a signed permutation matrix, the determinant is the permutation sign
+            # multiplied by the product of axis signs.
+            perm_sign = 1
+            perm_list = list(perm)
+            # Compute permutation sign by inversion count.
+            order = {"x": 0, "y": 1, "z": 2}
+            idxs = [order[a] for a in perm_list]
+            inv_count = sum(1 for i in range(3) for j in range(i + 1, 3) if idxs[i] > idxs[j])
+            if inv_count % 2 == 1:
+                perm_sign = -1
+            sign_product = sign_bits[0] * sign_bits[1] * sign_bits[2]
+            if perm_sign * sign_product != 1:
+                continue
+
+            name_parts = []
+            px = axis_vectors["neg" + perm[0]] if sign_bits[0] < 0 else axis_vectors[perm[0]]
+            py = axis_vectors["neg" + perm[1]] if sign_bits[1] < 0 else axis_vectors[perm[1]]
+            pz = axis_vectors["neg" + perm[2]] if sign_bits[2] < 0 else axis_vectors[perm[2]]
+            for axis_name, sign in zip(perm, sign_bits):
+                name_parts.append(f"{'-' if sign < 0 else ''}{axis_name}")
+            name = "_".join(name_parts)
+
+            positive = pz > 1e-4
+            positive_count = int(np.count_nonzero(positive))
+            if positive_count == 0:
+                results.append({
+                    "name": name,
+                    "positive_depth_count": 0,
+                    "projected_count": 0,
+                    "u_min": None,
+                    "u_max": None,
+                    "v_min": None,
+                    "v_max": None,
+                })
+                continue
+
+            px = px[positive]
+            py = py[positive]
+            pz = pz[positive]
+            u = (fx * px / pz) + cx
+            v = (fy * py / pz) + cy
+            in_image = (u >= 0) & (u < width) & (v >= 0) & (v < height)
+            results.append({
+                "name": name,
+                "positive_depth_count": positive_count,
+                "projected_count": int(np.count_nonzero(in_image)),
+                "u_min": float(np.min(u)),
+                "u_max": float(np.max(u)),
+                "v_min": float(np.min(v)),
+                "v_max": float(np.max(v)),
+            })
+
+    results.sort(key=lambda item: (-item["projected_count"], item["name"]))
+    return results
 
 
 def _compute_sparse_depth_edge(depth_rel: np.ndarray, valid_mask: np.ndarray) -> np.ndarray:
@@ -376,36 +473,109 @@ def generate_pcd_lidar_feature(
     K: np.ndarray,
     src_size: Tuple[int, int],
     gen_size: int = 224,
-) -> Tuple[np.ndarray, float]:
+) -> Tuple[np.ndarray, float, Dict[str, object]]:
     pcd = o3d.io.read_point_cloud(pcd_path)
     points = np.asarray(pcd.points)
     if len(points) == 0:
-        return _empty_lidar_feature(gen_size), 1.0
+        return _empty_lidar_feature(gen_size), 1.0, _make_lidar_diag(
+            "empty_point_cloud",
+            num_points=0,
+            num_positive_z=0,
+            num_projected=0,
+            num_valid_pixels=0,
+        )
 
     H = W = gen_size
     K_proj = _scale_intrinsics(K, src_size, (W, H))
     fx, fy = float(K_proj[0, 0]), float(K_proj[1, 1])
     cx, cy = float(K_proj[0, 2]), float(K_proj[1, 2])
 
-    pts_cam = points.astype(np.float32)
+    pts_cam = _lidar_points_to_camera_axes(points.astype(np.float32))
     x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
+    x_min, x_max = float(np.min(x)), float(np.max(x))
+    y_min, y_max = float(np.min(y)), float(np.max(y))
+    z_min, z_max = float(np.min(z)), float(np.max(z))
     valid_mask = z > 1e-4
+    num_positive_z = int(np.count_nonzero(valid_mask))
     if not np.any(valid_mask):
-        return _empty_lidar_feature(gen_size), 1.0
+        return _empty_lidar_feature(gen_size), 1.0, _make_lidar_diag(
+            "no_positive_depth",
+            num_points=int(len(points)),
+            num_positive_z=num_positive_z,
+            num_projected=0,
+            num_valid_pixels=0,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+        )
 
     x, y, z = x[valid_mask], y[valid_mask], z[valid_mask]
     u = (fx * x / z) + cx
     v = (fy * y / z) + cy
+    u_min, u_max = float(np.min(u)), float(np.max(u))
+    v_min, v_max = float(np.min(v)), float(np.max(v))
     in_image = (u >= 0) & (u < W) & (v >= 0) & (v < H)
+    num_projected = int(np.count_nonzero(in_image))
     if not np.any(in_image):
-        return _empty_lidar_feature(gen_size), 1.0
+        axis_diag = _axis_projection_diagnostics(
+            pts_cam,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            width=W,
+            height=H,
+        )
+        return _empty_lidar_feature(gen_size), 1.0, _make_lidar_diag(
+            "projection_out_of_frame",
+            num_points=int(len(points)),
+            num_positive_z=num_positive_z,
+            num_projected=num_projected,
+            num_valid_pixels=0,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            src_size=src_size,
+            gen_size=gen_size,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+            u_min=u_min,
+            u_max=u_max,
+            v_min=v_min,
+            v_max=v_max,
+            axis_projection_candidates=axis_diag[:4],
+        )
 
     u = u[in_image].astype(int); v = v[in_image].astype(int); z = z[in_image]
     valid_indices = np.where(valid_mask)[0][in_image]
     normals, curv, aniso, plan = compute_features_for_indices(pcd, valid_indices)
     good_mask = ~np.isnan(curv)
     if not np.any(good_mask):
-        return _empty_lidar_feature(gen_size), 1.0
+        return _empty_lidar_feature(gen_size), 1.0, _make_lidar_diag(
+            "feature_estimation_failed",
+            num_points=int(len(points)),
+            num_positive_z=num_positive_z,
+            num_projected=num_projected,
+            num_valid_pixels=0,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+            u_min=u_min,
+            u_max=u_max,
+            v_min=v_min,
+            v_max=v_max,
+        )
 
     u, v, z = u[good_mask], v[good_mask], z[good_mask]
     normals = normals[good_mask]; curv = curv[good_mask]; aniso = aniso[good_mask]; plan = plan[good_mask]
@@ -425,6 +595,7 @@ def generate_pcd_lidar_feature(
             plan_img[vi, ui] = plan[i]
 
     valid_img = np.isfinite(depth_img)
+    num_valid_pixels = int(np.count_nonzero(valid_img))
     if not np.any(valid_img):
         depth_img = np.zeros((H, W), dtype=np.float32)
         z_d = 1.0
@@ -446,7 +617,23 @@ def generate_pcd_lidar_feature(
     # cap(3), relative depth(1), normal(3), valid(1), depth edge(1).
     pcd_lidar = np.concatenate([cap, depth_rel, normal, valid, depth_edge], axis=0)
 
-    return pcd_lidar, z_d
+    return pcd_lidar, z_d, _make_lidar_diag(
+        "ok",
+        num_points=int(len(points)),
+        num_positive_z=num_positive_z,
+        num_projected=num_projected,
+        num_valid_pixels=num_valid_pixels,
+        x_min=x_min,
+        x_max=x_max,
+        y_min=y_min,
+        y_max=y_max,
+        z_min=z_min,
+        z_max=z_max,
+        u_min=u_min,
+        u_max=u_max,
+        v_min=v_min,
+        v_max=v_max,
+    )
 
 
 # ========================= 数据集 =========================
@@ -454,7 +641,7 @@ def generate_pcd_lidar_feature(
 class Seq1LidarDataset(Dataset):
     def __init__(self, seq_root: str, seq_len: int = 2, stride: int = 1,
                  img_size: int = 448, pcd_gen_size: int = 224,
-                 cache_dir: str = None, tolerance: float = 0.01,
+                 cache_dir: str = None, tolerance: float = 0.05,
                  img_exts: tuple = None, use_lidar: bool = True):
         super().__init__()
         self.seq_root = seq_root
@@ -462,7 +649,7 @@ class Seq1LidarDataset(Dataset):
         self.stride = stride
         self.img_size = img_size
         self.pcd_gen_size = pcd_gen_size
-        self.tolerance = tolerance
+        self.tolerance = max(float(tolerance), 0.0)
         self.cache_dir = cache_dir
         self.use_lidar = use_lidar
         if img_exts is None:
@@ -518,9 +705,27 @@ class Seq1LidarDataset(Dataset):
             else:
                 self.part_intrinsics.append((root_K, root_size))
         self.intrinsics = self.part_intrinsics[0][0] if self.part_intrinsics else root_K
+        self.lidar_diag_counts = {}
+        self._lidar_diag_examples = {}
+
+        self.part_pcds = []
+        if use_lidar:
+            for part in self.part_folders:
+                lidar_dir = os.path.join(seq_root, part, "lidar")
+                pcd_files = sorted(glob.glob(os.path.join(lidar_dir, "*.pcd")))
+                pcd_ts = []
+                for pf in pcd_files:
+                    m = re.search(r'(\d+)', os.path.basename(pf))
+                    ts = int(m.group(1)) if m else int(os.path.getmtime(pf) * 1e9)
+                    pcd_ts.append(ts)
+                self.part_pcds.append({'files': pcd_files, 'timestamps': np.array(pcd_ts, dtype=np.int64)})
+        else:
+            for _ in self.part_folders:
+                self.part_pcds.append({'files': [], 'timestamps': np.array([], dtype=np.int64)})
 
         self.all_views_meta = []
         timestamp_diffs = []
+        dropped_no_lidar = 0
         for pidx, part in enumerate(self.part_folders):
             rgb_dir = os.path.join(seq_root, part, "rgb")
             if not os.path.exists(rgb_dir):
@@ -548,34 +753,24 @@ class Seq1LidarDataset(Dataset):
                     right_diff = abs(self.gt_timestamps[pos] - img_ts_sec)
                     nearest_idx = pos - 1 if left_diff < right_diff else pos
                 diff = abs(self.gt_timestamps[nearest_idx] - img_ts_sec)
-                if diff < tolerance:
-                    self.all_views_meta.append((ipath, img_ts_ns, pidx, nearest_idx))
-                else:
+                if diff > self.tolerance:
                     timestamp_diffs.append(diff)
+                    continue
+                if self.use_lidar and self._find_closest_pcd(img_ts_sec, pidx) is None:
+                    dropped_no_lidar += 1
+                    continue
+                self.all_views_meta.append((ipath, img_ts_ns, pidx, nearest_idx))
 
         if not self.all_views_meta and is_main_process(int(os.environ.get('RANK', 0))):
             raise ValueError("没有任何图像通过时间戳匹配！")
-
-        self.part_pcds = []
-        if use_lidar:
-            for part in self.part_folders:
-                lidar_dir = os.path.join(seq_root, part, "lidar")
-                pcd_files = sorted(glob.glob(os.path.join(lidar_dir, "*.pcd")))
-                pcd_ts = []
-                for pf in pcd_files:
-                    m = re.search(r'(\d+)', os.path.basename(pf))
-                    ts = int(m.group(1)) if m else int(os.path.getmtime(pf) * 1e9)
-                    pcd_ts.append(ts)
-                self.part_pcds.append({'files': pcd_files, 'timestamps': np.array(pcd_ts, dtype=np.int64)})
-        else:
-            for _ in self.part_folders:
-                self.part_pcds.append({'files': [], 'timestamps': np.array([], dtype=np.int64)})
 
         if cache_dir and use_lidar:
             os.makedirs(cache_dir, exist_ok=True)
             self._build_cache()
         if is_main_process(int(os.environ.get('RANK', 0))):
             print(f"[Dataset] 最终有效帧总数: {len(self.all_views_meta)}")
+            if self.use_lidar:
+                print(f"[Dataset] 因缺少匹配 LiDAR 被移除: {dropped_no_lidar}")
 
     def _load_tum_poses(self, tum_file: str):
         poses = {}
@@ -608,7 +803,7 @@ class Seq1LidarDataset(Dataset):
         idx = np.argmin(np.abs(depth_info['timestamps'] - img_ts_ns))
         matched_ts = int(depth_info['timestamps'][idx])
         diff_ns = abs(matched_ts - img_ts_ns)
-        if diff_ns < self.tolerance * 1e9:
+        if diff_ns <= self.tolerance * 1e9:
             return depth_info['files'][idx]
         return None
 
@@ -630,6 +825,10 @@ class Seq1LidarDataset(Dataset):
         if len(pcd_info['timestamps']) == 0:
             return None
         idx = np.argmin(np.abs(pcd_info['timestamps'] - ts_ns))
+        matched_ts = int(pcd_info['timestamps'][idx])
+        diff_ns = abs(matched_ts - ts_ns)
+        if diff_ns > self.tolerance * 1e9:
+            return None
         return pcd_info['files'][idx]
 
     def _build_cache(self):
@@ -650,12 +849,22 @@ class Seq1LidarDataset(Dataset):
             if pcd_path is None:
                 continue
             K, src_size = self.part_intrinsics[pidx]
-            feat, z_d = generate_pcd_lidar_feature(pcd_path, K, src_size, self.pcd_gen_size)
+            feat, z_d, diag = generate_pcd_lidar_feature(pcd_path, K, src_size, self.pcd_gen_size)
+            self._record_lidar_diag(diag, pcd_path, img_ts_ns, source="cache_build")
             np.savez(cache_path, feat=feat, scale=z_d, version=LIDAR_CACHE_VERSION)
         if is_main_process(int(os.environ.get('RANK', 0))):
             print("缓存完成")
+            self._print_lidar_diag_summary(prefix="[Dataset][LiDARDiag][cache]")
 
     def _get_pcd_feature(self, img_ts_sec: float, pidx: int):
+        # Validate the current RGB/PCD timestamp pair before consulting the
+        # cache. This prevents a cache created with an older, looser tolerance
+        # from reintroducing an invalid nearest-neighbour match.
+        pcd_path = self._find_closest_pcd(img_ts_sec, pidx)
+        if pcd_path is None:
+            zeros = _empty_lidar_feature(self.pcd_gen_size)
+            return zeros, 1.0
+
         if self.cache_dir:
             cache_path = os.path.join(self.cache_dir, f"pcd_{int(img_ts_sec*1e9)}.npz")
             if os.path.exists(cache_path):
@@ -664,12 +873,69 @@ class Seq1LidarDataset(Dataset):
                 cache_version = str(data["version"].item()) if "version" in data else ""
                 if feat.shape[0] == LIDAR_NUM_CHANNELS and cache_version == LIDAR_CACHE_VERSION:
                     return feat, float(data["scale"])
-        pcd_path = self._find_closest_pcd(img_ts_sec, pidx)
-        if pcd_path is None:
-            zeros = _empty_lidar_feature(self.pcd_gen_size)
-            return zeros, 1.0
         K, src_size = self.part_intrinsics[pidx]
-        return generate_pcd_lidar_feature(pcd_path, K, src_size, self.pcd_gen_size)
+        feat, z_d, diag = generate_pcd_lidar_feature(pcd_path, K, src_size, self.pcd_gen_size)
+        self._record_lidar_diag(diag, pcd_path, int(img_ts_sec * 1e9), source="getitem")
+        return feat, z_d
+
+    def _record_lidar_diag(self, diag: Dict[str, object], pcd_path: str, img_ts_ns: int, source: str):
+        reason = str(diag.get("reason", "unknown"))
+        self.lidar_diag_counts[reason] = self.lidar_diag_counts.get(reason, 0) + 1
+        if reason != "ok" and reason not in self._lidar_diag_examples:
+            example = {
+                "source": source,
+                "img_ts_ns": int(img_ts_ns),
+                "pcd_path": pcd_path,
+            }
+            example.update(diag)
+            self._lidar_diag_examples[reason] = example
+
+    def _print_lidar_diag_summary(self, prefix: str):
+        if not self.lidar_diag_counts:
+            return
+        ordered = sorted(self.lidar_diag_counts.items(), key=lambda kv: (-kv[1], kv[0]))
+        summary = ", ".join(f"{reason}={count}" for reason, count in ordered)
+        print(f"{prefix} {summary}")
+        for reason, example in sorted(self._lidar_diag_examples.items()):
+            print(
+                f"{prefix} example {reason}: img_ts_ns={example.get('img_ts_ns')} "
+                f"pcd={example.get('pcd_path')} projected={example.get('num_projected')} "
+                f"positive_z={example.get('num_positive_z')} valid_pixels={example.get('num_valid_pixels')}"
+            )
+            if reason == "projection_out_of_frame":
+                print(
+                    f"{prefix} example {reason} intrinsics: "
+                    f"fx={example.get('fx'):.3f} fy={example.get('fy'):.3f} "
+                    f"cx={example.get('cx'):.3f} cy={example.get('cy'):.3f} "
+                    f"src_size={example.get('src_size')} gen_size={example.get('gen_size')}"
+                )
+                print(
+                    f"{prefix} example {reason} xyz_range: "
+                    f"x=[{example.get('x_min'):.3f}, {example.get('x_max'):.3f}] "
+                    f"y=[{example.get('y_min'):.3f}, {example.get('y_max'):.3f}] "
+                    f"z=[{example.get('z_min'):.3f}, {example.get('z_max'):.3f}]"
+                )
+            print(
+                f"{prefix} example {reason} uv_range: "
+                f"u=[{example.get('u_min'):.3f}, {example.get('u_max'):.3f}] "
+                f"v=[{example.get('v_min'):.3f}, {example.get('v_max'):.3f}]"
+            )
+            candidates = example.get("axis_projection_candidates") or []
+            for candidate in candidates:
+                u_min = candidate.get("u_min")
+                u_max = candidate.get("u_max")
+                v_min = candidate.get("v_min")
+                v_max = candidate.get("v_max")
+                uv_range = (
+                    f"u=[{u_min:.3f}, {u_max:.3f}] v=[{v_min:.3f}, {v_max:.3f}]"
+                    if None not in (u_min, u_max, v_min, v_max)
+                    else "u/v unavailable"
+                )
+                print(
+                    f"{prefix} example {reason} axis_candidate: "
+                    f"name={candidate.get('name')} projected={candidate.get('projected_count')} "
+                    f"positive_depth={candidate.get('positive_depth_count')} {uv_range}"
+                )
 
     def __len__(self):
         return max(0, (len(self.all_views_meta) - self.seq_len) // self.stride + 1)
@@ -1894,7 +2160,12 @@ def main():
     parser.add_argument("--resume", type=str, default="")
     parser.add_argument("--log_interval", type=int, default=10)
     parser.add_argument("--save_interval", type=int, default=1)
-    parser.add_argument("--tolerance", type=float, default=0.05)
+    parser.add_argument(
+        "--tolerance",
+        type=float,
+        default=MAX_TIMESTAMP_TOLERANCE_SEC,
+        help="maximum allowed RGB/GT/depth/LiDAR timestamp error in seconds",
+    )
     parser.add_argument("--accum_iter", type=int, default=8)
     parser.add_argument("--use_compile", action="store_true", default=False)
     parser.add_argument("--local_rank", type=int, default=-1)

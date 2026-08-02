@@ -1414,8 +1414,9 @@ class MapAnything(nn.Module, PyTorchModelHubMixin):
                     view_idx * batch_size_per_view : (view_idx + 1)
                     * batch_size_per_view
                 ] = False
-                print(f"LiDAR Fuse Error on view {view_idx}! Using zeros.")
-                # Keep lidars_for_curr_view as zeros and continue
+                # Missing or temporally unmatched LiDAR is an expected
+                # RGB-only sample, not a forward-pass error. Keep zeros and
+                # disable the LiDAR branch for this view.
             lidars_list.append(lidars_for_curr_view)
 
         # Stack the lidars for all the views and permute to (B * V, C, H, W)

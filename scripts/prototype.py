@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-# coding: utf-8
+# coding: gbk
 """
 MapAnything LoRA Evaluation Script (Fixed)
 ==========================================
@@ -123,12 +123,6 @@ def _normalize_state_dict_keys(state_dict):
 
 GLOBAL_DEPTH_MAX = 40.0
 LIDAR_NUM_CHANNELS = 9
-MAX_TIMESTAMP_TOLERANCE_SEC = 0.05
-
-
-def _lidar_points_to_camera_axes(points_xyz: np.ndarray) -> np.ndarray:
-    # Confirmed manually from projection overlays: X_cam=Y_lidar, Y_cam=Z_lidar, Z_cam=X_lidar.
-    return np.stack([points_xyz[:, 1], points_xyz[:, 2], points_xyz[:, 0]], axis=1).astype(np.float32)
 
 
 def _empty_pcd_feature_dict(H, W, device):
@@ -278,7 +272,7 @@ def get_pcd_features(
             pcd_cache[pcd_idx] = {k: v.cpu() if torch.is_tensor(v) else v for k, v in result.items()}
         return result
 
-    pts_cam = _lidar_points_to_camera_axes(points.astype(np.float32))
+    pts_cam = points.astype(np.float32)
     x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
     valid_mask = z > 1e-4
     if not np.any(valid_mask):
@@ -661,7 +655,7 @@ def build_model_for_eval(model_dir: str, device: str,
 
 # ========================= 数据加载 =========================
 def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
-                   max_images: int = None, tolerance: float = MAX_TIMESTAMP_TOLERANCE_SEC):
+                   max_images: int = None):
     rgb_dir = os.path.join(seq_root, "rgb")
     if not os.path.exists(rgb_dir):
         raise ValueError(f"RGB 目录不存在: {rgb_dir}")
@@ -769,9 +763,6 @@ def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
         else:
             print("[Data] 警告: 启用 LiDAR 但未找到 lidar 目录")
 
-        if not pcd_timestamps:
-            print("[Data] LiDAR 时间戳为空，将退化为 RGB-only 推理路径")
-
     return (
         img_paths,
         intrinsics,
@@ -820,24 +811,6 @@ def load_images_manual(image_paths, img_size=448, device='cuda'):
         })
     return views
 
-
-def _timestamp_ns_from_image_path(image_path):
-    match = re.search(r'color_(\d+)', image_path)
-    if match:
-        return int(match.group(1))
-    return int(os.path.getmtime(image_path) * 1e9)
-
-
-def _pcd_feature_has_valid_points(feat_dict) -> bool:
-    valid = feat_dict.get("valid")
-    if valid is None:
-        return False
-    if torch.is_tensor(valid):
-        return bool(torch.isfinite(valid).all() and torch.count_nonzero(valid).item() > 0)
-    valid_np = np.asarray(valid)
-    return bool(np.isfinite(valid_np).all() and np.count_nonzero(valid_np) > 0)
-
-
 # ========================= ????????????=========================
 def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pcd_timestamps,
                         intrinsics_raw=None, intrinsics_size=(0, 0),
@@ -871,36 +844,19 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
 
     # 处理激光雷达数据（如果启用）
     if use_lidar:
-        if view_pcd_indices is None:
-            view_pcd_indices = [0] * len(views)
-        if len(view_pcd_indices) != len(views):
-            raise ValueError(
-                "view_pcd_indices must contain one entry per image/view"
-            )
-
-        valid_pcd_indices = {
-            int(idx)
-            for idx in view_pcd_indices
-            if idx is not None and int(idx) >= 0 and int(idx) < len(pcd_file_list)
-        }
+        needed_pcd_idxs = set(view_pcd_indices)
         pcd_features = {}
 
-        for idx in valid_pcd_indices:
-            try:
-                feat_dict = get_pcd_features(
-                    pcd_file_list[idx],
-                    intrinsics_raw,
-                    intrinsics_size,
-                    output_size=(target_w, target_h),
-                    device=device,
-                    pcd_cache=pcd_cache,
-                    pcd_idx=idx,
-                )
-            except Exception as e:
-                print(f"[LiDAR] PCD 异常，回退为零特征 idx={idx}: {pcd_file_list[idx]} | {e}")
-                feat_dict = _empty_pcd_feature_dict(target_h, target_w, device)
-            if not _pcd_feature_has_valid_points(feat_dict):
-                print(f"[LiDAR] 空投影 PCD，回退为零特征 idx={idx}: {pcd_file_list[idx]}")
+        for idx in needed_pcd_idxs:
+            feat_dict = get_pcd_features(
+                pcd_file_list[idx],
+                intrinsics_raw,
+                intrinsics_size,
+                output_size=(target_w, target_h),
+                device=device,
+                pcd_cache=pcd_cache,
+                pcd_idx=idx,
+            )
 
             # Build LiDAR feature map as (H, W, 9):
             # cap(3), depth(1), normal(3), valid(1), depth edge(1).
@@ -929,11 +885,9 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
             }
             # =====================================================================
 
-        for image_path, view, pcd_idx in zip(image_paths, views, view_pcd_indices):
-            if pcd_idx is None or int(pcd_idx) not in pcd_features:
-                print(f"[LiDAR] 样本缺少可用 PCD，保留 RGB-only: {os.path.basename(image_path)}")
-                continue
-            pcd_idx = int(pcd_idx)
+        for view, pcd_idx in zip(views, view_pcd_indices):
+            if pcd_idx not in pcd_features:
+                raise KeyError(f"PCD index {pcd_idx} not found in pcd_features")
             # Expand batch dimension: final shape is (B, H, W, LIDAR_NUM_CHANNELS).
             view['pcd'] = pcd_features[pcd_idx]["pcd"].expand(B, -1, -1, -1).contiguous()
             view['lidar_depth_scale'] = pcd_features[pcd_idx]["scale"].expand(B).contiguous()
@@ -971,12 +925,12 @@ def run_inference_batch(model, image_paths, device, use_lidar, pcd_file_list, pc
                 apply_confidence_mask=False,
                 use_lidar=use_lidar,
             )
-        return predictions, views, image_paths
+        return predictions, views
     except Exception as e:
         print(f"批次处理失败: {e}")
         import traceback
         traceback.print_exc()
-        return None, None, None
+        return None, None
 
 # ========================= 输出提取 =========================
 def extract_batch_outputs(predictions, image_paths, views):
@@ -1090,9 +1044,8 @@ def _compute_pointcloud_reconstruction_metrics(
     gt_poses_raw,
     gt_depths,
     gt_intrinsics,
-    tolerance=0.05,
+    tolerance = 0.01
 ):
-    tolerance = max(float(tolerance), 0.0)
     if cKDTree is None or not gt_depths or gt_intrinsics is None:
         return {}
 
@@ -1194,12 +1147,10 @@ def _compute_pointcloud_reconstruction_metrics(
 
 # ========================= 评测 =========================
 def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics, output_dir,
-                                 use_lora, use_lidar, dataset_id, tolerance = 0.05):
+                                 use_lora, use_lidar, dataset_id, tolerance = 0.01):
     if not predictions or not gt_poses:
         print("[Eval] 无预测结果或真值，跳过评测")
         return None
-
-    tolerance = max(float(tolerance), 0.0)
 
     def ts_from_file(f):
         match = re.search(r'color_(\d+)', f)
@@ -1218,14 +1169,12 @@ def run_comprehensive_validation(predictions, gt_poses, gt_depths, gt_intrinsics
             continue
 
         idx = np.searchsorted(gt_timestamps, pred_ts)
-        if idx == 0:
-            best_ts = gt_timestamps[0]
-        elif idx == len(gt_timestamps):
-            best_ts = gt_timestamps[-1]
-        else:
-            left_ts = gt_timestamps[idx - 1]
-            right_ts = gt_timestamps[idx]
-            best_ts = left_ts if abs(pred_ts - left_ts) < abs(pred_ts - right_ts) else right_ts
+        if idx == 0 or idx == len(gt_timestamps):
+            continue
+
+        left_ts = gt_timestamps[idx - 1]
+        right_ts = gt_timestamps[idx]
+        best_ts = left_ts if abs(pred_ts - left_ts) < abs(pred_ts - right_ts) else right_ts
         
         # tolerance 单位是秒，pred_ts 单位是秒，不需要转换
         if abs(pred_ts - best_ts) > tolerance:
@@ -1580,15 +1529,9 @@ def main():
                         help="测试时每次输入模型的视图数。注意：若 use_lora=1 且 info_sharing 被 LoRA，建议设为训练时的 seq_len(4)")
     parser.add_argument("--img_size", type=int, default=448)
     parser.add_argument("--max_images", type=int, default=None)
-    parser.add_argument(
-        "--tolerance",
-        type=float,
-        default=0.05,
-        help="maximum RGB/GT/depth/LiDAR timestamp error in seconds",
-    )
+    parser.add_argument("--tolerance", type=float, default=0.01)
     parser.add_argument("--gpu", type=int, default=5)
     args = parser.parse_args()
-    args.tolerance = max(float(args.tolerance), 0.0)
 
     device = torch.device(f"cuda:{args.gpu}" if torch.cuda.is_available() else "cpu")
     torch.cuda.set_device(args.gpu)
@@ -1619,8 +1562,7 @@ def main():
     ) = load_eval_data(
         args.seq_root, img_size=args.img_size,
         use_lidar=bool(args.use_lidar),
-        max_images=args.max_images,
-        tolerance=args.tolerance,
+        max_images=args.max_images
     )
 
     print("\n[3/4] 开始推理...")
@@ -1629,11 +1571,6 @@ def main():
     num_batches = (len(img_paths) + args.batch_size - 1) // args.batch_size
     pcd_cache = {}
     pcd_timestamps_np = np.array(pcd_timestamps) if pcd_timestamps else np.array([])
-    pcd_match_total = 0
-    pcd_match_valid = 0
-    pcd_nearest_min_sec = float('inf')
-    pcd_nearest_max_sec = 0.0
-    pcd_nearest_sum_sec = 0.0
 
     for b in range(num_batches):
         batch_paths = img_paths[b * args.batch_size:(b + 1) * args.batch_size]
@@ -1642,23 +1579,17 @@ def main():
         view_pcd_indices = []
         if args.use_lidar and len(pcd_file_list) > 0:
             for img_path in batch_paths:
-                img_ts = _timestamp_ns_from_image_path(img_path)
-                pcd_diff_ns = np.abs(pcd_timestamps_np - img_ts)
-                closest_idx = int(np.argmin(pcd_diff_ns))
-                nearest_diff_sec = float(pcd_diff_ns[closest_idx]) / 1e9
-                pcd_match_total += 1
-                pcd_nearest_min_sec = min(pcd_nearest_min_sec, nearest_diff_sec)
-                pcd_nearest_max_sec = max(pcd_nearest_max_sec, nearest_diff_sec)
-                pcd_nearest_sum_sec += nearest_diff_sec
-                if pcd_diff_ns[closest_idx] <= args.tolerance * 1e9:
-                    pcd_match_valid += 1
+                match = re.search(r'color_(\d+)', img_path)
+                if not match:
+                    img_ts = int(os.path.getmtime(img_path) * 1e9)
+                else:
+                    img_ts = int(match.group(1))
+                closest_idx = np.argmin(np.abs(pcd_timestamps_np - img_ts))
                 view_pcd_indices.append(closest_idx)
         else:
-            view_pcd_indices = [0] * len(batch_paths) if len(pcd_file_list) > 0 else [None] * len(batch_paths)
-            if args.use_lidar:
-                pcd_match_total += len(batch_paths)
+            view_pcd_indices = [0] * len(batch_paths)
 
-        predictions, views, kept_batch_paths = run_inference_batch(
+        predictions, views = run_inference_batch(
             model, batch_paths, device,
             use_lidar=bool(args.use_lidar),
             pcd_file_list=pcd_file_list,
@@ -1674,7 +1605,8 @@ def main():
             print(f"[Infer] Batch {b+1} 推理失败, 跳过")
             torch.cuda.empty_cache()
             continue
-        batch_outputs = extract_batch_outputs(predictions, kept_batch_paths, views)
+
+        batch_outputs = extract_batch_outputs(predictions, batch_paths, views)
         all_predictions.extend(batch_outputs)
 
         del predictions
@@ -1685,17 +1617,6 @@ def main():
         gc.collect()
 
     print(f"[3/4] 推理完成: {len(all_predictions)} 帧, 耗时 {time.time()-t0:.1f}s")
-    if args.use_lidar:
-        if pcd_match_total > 0 and pcd_timestamps_np.size > 0:
-            print(
-                f"[TimeMatch] RGB-PCD valid={pcd_match_valid}/{pcd_match_total} "
-                f"within {args.tolerance:.3f}s; nearest diff "
-                f"min={pcd_nearest_min_sec:.6f}s, "
-                f"mean={pcd_nearest_sum_sec / pcd_match_total:.6f}s, "
-                f"max={pcd_nearest_max_sec:.6f}s"
-            )
-        else:
-            print("[TimeMatch] no PCD timestamps available; all frames use RGB-only path")
 
     print("\n[4/4] 开始评测...")
     stats = run_comprehensive_validation(

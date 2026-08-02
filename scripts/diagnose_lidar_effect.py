@@ -174,6 +174,7 @@ PARAM_GROUPS = OrderedDict(
 PART_NAME_RE = re.compile(r"^shuangchuang_seq\d+_(?:night|daytime)\d+th$")
 IMAGE_EXTS = (".png", ".jpg", ".jpeg", ".bmp", ".webp", ".tiff", ".tif")
 DEPTH_EXTS = (".npy", ".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".tif", ".webp")
+MAX_TIMESTAMP_TOLERANCE_SEC = 0.01
 
 
 def _timestamp_from_name(path: str) -> int:
@@ -259,6 +260,10 @@ def _count_timestamp_matches(
     reference_timestamps: Iterable[int],
     tolerance_seconds: float,
 ) -> int:
+    tolerance_seconds = min(
+        max(float(tolerance_seconds), 0.0),
+        MAX_TIMESTAMP_TOLERANCE_SEC,
+    )
     reference = np.asarray(list(reference_timestamps), dtype=np.float64)
     if reference.size == 0:
         return 0
@@ -333,10 +338,10 @@ def _load_part_record(part_root: str, seq_root: str, img_size: int, limit: Optio
         "gt_depth_index": depth_index,
         "gt_pose_timestamps": gt_pose_timestamps,
         "gt_pose_matches": _count_timestamp_matches(
-            image_paths, gt_pose_timestamps * 1e9, 0.05
+            image_paths, gt_pose_timestamps * 1e9, MAX_TIMESTAMP_TOLERANCE_SEC
         ),
         "gt_depth_matches": _count_timestamp_matches(
-            image_paths, gt_depth_timestamps, 0.05
+            image_paths, gt_depth_timestamps, MAX_TIMESTAMP_TOLERANCE_SEC
         ),
         "gt_depth_sample": _sample_depth_metadata(depth_index),
     }
@@ -698,15 +703,21 @@ class ForwardRecorder:
         return result
 
 
-def image_pcd_indices(batch_paths: List[str], pcd_timestamps: List[int]) -> List[int]:
+def image_pcd_indices(batch_paths: List[str], pcd_timestamps: List[int]) -> List[Optional[int]]:
     if not pcd_timestamps:
-        raise ValueError("LiDAR mode requested, but no PCD timestamps were found")
+        return [None] * len(batch_paths)
     timestamps = np.asarray(pcd_timestamps)
-    indices = []
+    indices: List[Optional[int]] = []
     for image_path in batch_paths:
         match = re.search(r"color_(\d+)", image_path)
         image_ts = int(match.group(1)) if match else int(os.path.getmtime(image_path) * 1e9)
-        indices.append(int(np.argmin(np.abs(timestamps - image_ts))))
+        timestamp_diffs = np.abs(timestamps - image_ts)
+        closest_idx = int(np.argmin(timestamp_diffs))
+        if timestamp_diffs[closest_idx] <= MAX_TIMESTAMP_TOLERANCE_SEC * 1e9:
+            indices.append(closest_idx)
+        else:
+            # Do not silently attach a temporally unrelated point cloud.
+            indices.append(None)
     return indices
 
 
