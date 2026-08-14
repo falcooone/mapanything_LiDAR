@@ -2542,7 +2542,7 @@ def main():
                         default=["/add02/users/xuyh/seq1/", "/add02/users/xuyh/seq3/"],
                         help="训练数据路径，可指定多个序列")
     parser.add_argument("--model_dir", type=str, default="/home/xuyh/mapanything/")
-    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/32_lora_lidar_balib")
+    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/32_lora_lidar_calib_freeze")
     parser.add_argument("--cache_dir", type=str, default="/add02/users/xuyh/cache/lidar_9ch_calib")
     parser.add_argument(
         "--lidar_extrinsics_path",
@@ -2605,7 +2605,7 @@ def main():
     )
     
     # ========== LiDAR Warmup 新参数 ==========
-    parser.add_argument("--lidar_warmup_epochs", type=int, default=4,
+    parser.add_argument("--lidar_warmup_epochs", type=int, default=5,
                         help="number of early epochs to train LiDAR/fusion before joint LoRA training")
     parser.add_argument("--lidar_warmup_lr_scale", type=float, default=0.4,
                         help="warmup 阶段的整体 LR 缩放系数，默认 0.4 更稳")
@@ -2618,7 +2618,7 @@ def main():
     parser.add_argument("--loss_pose_rot_weight", type=float, default=0.5)
     parser.add_argument("--loss_ray_weight", type=float, default=0.1)
     parser.add_argument("--loss_pts3d_cam_weight", type=float, default=0.1)
-    parser.add_argument("--loss_world_pts_weight", type=float, default=0.15)
+    parser.add_argument("--loss_world_pts_weight", type=float, default=0.20)
     parser.add_argument("--loss_confidence_weight", type=float, default=0.1)
     parser.add_argument("--loss_scale_weight", type=float, default=0.1)
     parser.add_argument("--world_loss_cap", type=float, default=2.0)
