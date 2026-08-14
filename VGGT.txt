@@ -1,0 +1,857 @@
+                          This CVPR paper is the Open Access version, provided by the Computer Vision Foundation.
+                                       Except for this watermark, it is identical to the accepted version;
+                                 the final published version of the proceedings is available on IEEE Xplore.
+
+
+
+
+                           VGGT: Visual Geometry Grounded Transformer
+
+          Jianyuan Wang1,2                Minghao Chen1,2                 Nikita Karaev1,2              Andrea Vedaldi1,2
+                                     Christian Rupprecht1                      David Novotny2
+                     1                                                                                 2
+                         Visual Geometry Group, University of Oxford                                       Meta AI
+      …
+
+
+
+
+Figure 1. VGGT is a large feed-forward transformer with minimal 3D-inductive biases trained on a trove of 3D-annotated data. It accepts
+up to hundreds of images and predicts cameras, point maps, depth maps, and point tracks for all images at once in less than a second, which
+often outperforms optimization-based alternatives without further processing.
+
+                           Abstract                                      1. Introduction
+                                                                         We consider the problem of estimating the 3D attributes
+We present VGGT, a feed-forward neural network that di-                  of a scene captured in a set of images utilizing a feed-
+rectly infers all key 3D attributes of a scene, including cam-           forward neural network. Traditionally, 3D reconstruction
+era parameters, point maps, depth maps, and 3D point                     has been approached with visual-geometry methods, utiliz-
+tracks, from one, a few, or hundreds of its views. This                  ing iterative optimization techniques like Bundle Adjust-
+approach is a step forward in 3D computer vision, where                  ment (BA) [33]. Machine learning has often played an
+models have typically been constrained to and special-                   important complementary role, addressing tasks that can-
+ized for single tasks. It is also simple and efficient, re-              not be solved by geometry alone, such as feature matching
+constructing images in under one second, and still out-                  and monocular depth prediction. The integration has be-
+performing alternatives that require post-processing with                come increasingly tight, and now state-of-the-art Structure-
+visual geometry optimization techniques. The network                     from-Motion (SfM) methods like VGGSfM [83] combine
+achieves state-of-the-art results in multiple 3D tasks, in-              machine learning and visual geometry end-to-end via dif-
+cluding camera parameter estimation, multi-view depth es-                ferentiable BA. Even so, visual geometry still plays a major
+timation, dense point cloud reconstruction, and 3D point                 role in 3D reconstruction, which increases complexity and
+tracking. We also show that using pretrained VGGT as a                   computational cost.
+feature backbone significantly enhances downstream tasks,                   As networks become ever more powerful, we ask if,
+such as non-rigid point tracking and feed-forward novel                  finally, 3D tasks can be solved directly by a neural net-
+view synthesis. Code and models are publicly available at                work, eschewing geometry post-processing almost entirely.
+https://github.com/facebookresearch/vggt.                                Recent contributions like DUSt3R [87] and its evolution
+
+
+
+                                                                  5294
+MASt3R [43] have shown promising results in this direc-                   VGGT achieves state-of-the-art results across the board,
+tion, but these networks can only process two images at                   even when compared to methods that specialize in a sub-
+once and rely on post-processing to reconstruct more im-                  set of 3D tasks, often improving quality substantially.
+ages, fusing pairwise reconstructions.
+    In this paper, we take a further step towards removing the            2. Related Work
+need to optimize 3D geometry in post-processing. We do
+                                                                          Structure from Motion is a classic computer vision prob-
+so by introducing Visual Geometry Grounded Transformer
+                                                                          lem [33, 52, 54] that involves estimating camera parameters
+(VGGT), a feed-forward neural network that performs 3D
+                                                                          and reconstructing sparse point clouds from a set of images
+reconstruction from one, a few, or even hundreds of input
+                                                                          of a static scene captured from different viewpoints. The
+views of a scene. VGGT predicts a full set of 3D attributes,
+                                                                          traditional SfM pipeline [2, 24, 48, 62, 68, 92] consists of
+including camera parameters, depth maps, point maps, and
+                                                                          multiple stages, including image matching, triangulation,
+3D point tracks. It does so in a single forward pass in sec-
+                                                                          and bundle adjustment. COLMAP [62] is the most popu-
+onds. Remarkably, it often outperforms optimization-based
+                                                                          lar framework based on the traditional pipeline. In recent
+alternatives even without further processing. This is a sub-
+                                                                          years, deep learning has improved many components of the
+stantial departure from DUSt3R, MASt3R, or VGGSfM,
+                                                                          SfM pipeline, with keypoint detection [12, 19, 76, 102] and
+which still require costly iterative post-optimization to ob-
+                                                                          image matching [7, 46, 60, 66] being two primary areas of
+tain usable results.
+                                                                          focus. Recent methods [3, 67, 71, 74, 75, 78, 81, 83, 89,
+    We also show that it is unnecessary to design a special               108] explored end-to-end differentiable SfM, where VG-
+network for 3D reconstruction. Instead, VGGT is based                     GSfM [83] started to outperform traditional algorithms on
+on a fairly standard large transformer [79], with no par-                 challenging phototourism scenarios.
+ticular 3D or other inductive biases (except for alternating
+between frame-wise and global attention), but trained on a                Multi-view Stereo aims to densely reconstruct the geome-
+large number of publicly available datasets with 3D annota-               try of a scene from multiple overlapping images, typically
+tions. VGGT is thus built in the same mould as large models               assuming known camera parameters, which are often esti-
+for natural language processing and computer vision, such                 mated with SfM. MVS methods can be divided into three
+as GPTs [1, 18, 101], CLIP [56], DINO [6, 53], and Stable                 categories: traditional handcrafted [26, 27, 64, 88], global
+Diffusion [22]. These have emerged as versatile backbones                 optimization [25, 50, 91, 100], and learning-based meth-
+that can be fine-tuned to solve new, specific tasks. Simi-                ods [30, 49, 55, 99, 106]. As in SfM, learning-based MVS
+larly, we show that the features computed by VGGT can                     approaches have recently seen a lot of progress. Here,
+significantly enhance downstream tasks like point tracking                DUSt3R [87] and MASt3R [43] directly estimate aligned
+in dynamic videos and novel view synthesis.                               dense point clouds from a pair of views, similar to MVS
+    There are several recent examples of large 3D neural                  but without requiring camera parameters. Some concur-
+networks, including DepthAnything [97], MoGe [86], and                    rent works [73, 85, 96, 105] explore replacing DUSt3R’s
+LRM [34]. However, these models only focus on a sin-                      test-time optimization with neural networks, though these
+gle 3D task, such as monocular depth estimation or novel                  attempts achieve only suboptimal or comparable perfor-
+view synthesis. In contrast, VGGT uses a shared backbone                  mance to DUSt3R. Instead, VGGT outperforms DUSt3R
+to predict all 3D quantities of interest together. We demon-              and MASt3R by a large margin.
+strate that learning to predict these interrelated 3D attributes          Tracking-Any-Point was first introduced in Particle
+enhances overall accuracy despite potential redundancies.                 Video [59] and revived by PIPs [32] during the deep learn-
+At the same time, we show that, during inference, we can                  ing era, aiming to track points of interest across video se-
+derive the point maps from separately predicted depth and                 quences, including dynamic motion. Given a video and
+camera parameters, obtaining better accuracy compared to                  some 2D query points, the task is to predict the 2D corre-
+directly using the dedicated point map head.                              spondences of these points across all other frames. TAP-
+    To summarize, we make the following contributions: (1)                Vid [13] proposed three benchmarks for this task, and
+We introduce VGGT, a large feed-forward transformer that,                 a simple baseline method later improved in TAPIR [14].
+given one, a few, or even hundreds of images of a scene,                  CoTracker [37, 38] utilized correlations between different
+can predict all its key 3D attributes, including camera intrin-           points to track through occlusions, while DOT [41] enabled
+sics and extrinsics, point maps, depth maps, and 3D point                 dense tracking through occlusions. Recently, TAPTR [44]
+tracks, in seconds. (2) We demonstrate that VGGT’s pre-                   proposed an end-to-end transformer for this task, and Lo-
+dictions are directly usable, being highly competitive and                coTrack [8] extended commonly used pointwise features to
+usually better than those of state-of-the-art methods that use            nearby regions. Here, we demonstrate that VGGT’s fea-
+slow post-processing optimization techniques. (3) We also                 tures yield state-of-the-art tracking performance when cou-
+show that, when further combined with BA post-processing,                 pled with existing point trackers.
+
+
+
+                                                                   5295
+                                    Add             Global        Frame                              Camera Head            Cameras
+                                 camera token      Attention     Attention
+     Input
+
+
+                                                                                                                            Depth maps
+
+
+
+                DINO        Concat
+
+
+                                                                                                        DPT                 Point maps
+
+
+                                                                                                                            Tracks
+
+
+                                                          × 𝐿 times
+
+
+Figure 2. Architecture Overview. Our model first patchifies the input images into tokens by DINO, and appends camera tokens for camera
+prediction. It then alternates between frame-wise and global self attention layers. A camera head makes the final prediction for camera
+extrinsics and intrinsics, and a DPT [57] head for any dense output.
+
+
+3. Method                                                                    maps are viewpoint invariant, meaning that the 3D points
+                                                                             Pi (y) are defined in the coordinate system of the first cam-
+We introduce VGGT, a large transformer that ingests a set                    era g1 , which we take as the world reference frame.
+of images as input and produces a variety of 3D quantities
+as output. We start by introducing the problem in Sec. 3.1,                      Finally, for keypoint tracking, we follow track-any-
+followed by our architecture in Sec. 3.2 and its prediction                  point methods such as [15, 39]. Namely, given a fixed query
+heads in Sec. 3.3.                                                           image point yq in the query image Iq , the network outputs
+                                                                             a track T ⋆ (yq ) = (yi )N
+                                                                                                      i=1 formed by the corresponding 2D
+3.1. Problem definition and notation                                         points yi ∈ R2 in all images Ii .
+The input is a sequence (Ii )N                                                   Note that the transformer f above does not output the
+                             i=1 of N RGB images Ii ∈
+R3×H×W , observing the same 3D scene. VGGT’s trans-                          tracks directly but instead features Ti ∈ RC×H×W , which
+former is a function that maps this sequence to a corre-                     are used for tracking. The tracking is delegated to a sep-
+sponding set of 3D annotations, one per frame:                               arate module, described in Sec. 3.3, which implements a
+                                                                             function T ((yj )M           N                N    M
+                                                                                               j=1 , (Ti )i=1 ) = ((ŷj,i )i=1 )j=1 . It ingests
+            f (Ii )N
+                                            N                               the query point yq and the dense tracking features Ti output
+                   i=1 = (gi , Di , Pi , Ti )i=1 .   (1)
+                                                                             by the transformer f and then computes the track. The two
+The transformer thus maps each image Ii to its camera pa-                    networks f and T are trained jointly end-to-end.
+rameters gi ∈ R9 (intrinsics and extrinsics), its depth map
+                                                                             Order of Predictions. The order of the images in the input
+Di ∈ RH×W , its point map Pi ∈ R3×H×W , and a grid
+                                                                             sequence is arbitrary, except that the first image is chosen as
+Ti ∈ RC×H×W of C-dimensional features for point track-
+                                                                             the reference frame. The network architecture is designed
+ing. We explain next how these are defined.
+                                                                             to be permutation equivariant for all but the first frame.
+    For the camera parameters gi , we use the parametriza-
+tion from [83] and set g = [q, t, f ] which is the concatena-                Over-complete Predictions. Notably, not all quantities
+tion of the rotation quaternion q ∈ R4 , the translation vec-                predicted by VGGT are independent. For example, as
+tor t ∈ R3 , and the field of view f ∈ R2 . We assume that                   shown by DUSt3R [87], the camera parameters g can be in-
+the camera’s principal point is at the image center, which is                ferred from the invariant point map P , for instance, by solv-
+common in SfM frameworks [63, 83].                                           ing the Perspective-n-Point (PnP) problem [23, 42]. Fur-
+    We denote the domain of the image Ii with I(Ii ) =                       thermore, the depth maps can be deduced from the point
+{1, . . . , H} × {1, . . . , W }, i.e., the set of pixel locations.          map and the camera parameters. However, as we show in
+The depth map Di associates each pixel location y ∈ I(Ii )                   Sec. 4.5, tasking VGGT with explicitly predicting all afore-
+with its corresponding depth value Di (y) ∈ R+ , as ob-                      mentioned quantities during training brings substantial per-
+served from the i-th camera. Likewise, the point map Pi                      formance gains, even when these are related by closed-form
+associates each pixel with its corresponding 3D scene point                  relationships. Meanwhile, during inference, it is observed
+Pi (y) ∈ R3 . Importantly, like in DUSt3R [87], the point                    that combining independently estimated depth maps and
+
+
+
+                                                                      5296
+           Input                                         Ours                                                 DUSt3R
+                                                                            < 0.1s                                                    < 0.1s
+
+
+
+
+        Single view
+
+                                                                            < 0.1s                                                    < 0.1s
+
+
+
+
+         Two views
+
+
+                                                                           < 0.6 s                                                   > 200s
+                 …
+
+
+                 …
+
+
+          32 views
+
+Figure 3. In-the-wild comparison of our predicted 3D points to DUSt3R. As shown in the top row, our method successfully predicts the
+geometric structure of an oil painting, while DUSt3R predicts a slightly distorted plane. In the second row, our method correctly recovers
+a 3D scene from two images with no overlap, while DUSt3R fails. The third row provides a challenging example with repeated textures
+while our prediction is still high-quality. We do not include examples with more than 32 frames, as DUSt3R then runs out of memory.
+
+
+camera parameters produces more accurate 3D points com-                  attention. In Sec. 4, we demonstrate that our AA architec-
+pared to directly employing a specialized point map branch.              ture brings significant performance gains. Note that our ar-
+                                                                         chitecture does not employ any cross-attention layers.
+3.2. Feature Backbone
+Following recent works in 3D deep learning [36, 87, 90],                 3.3. Prediction heads
+we design a simple architecture with minimal 3D induc-
+                                                                         Here, we describe how f predicts the camera parameters,
+tive biases, letting the model learn from ample quantities
+                                                                         depth maps, point maps, and point tracks. First, for each
+of 3D-annotated data. In particular, we implement the
+                                                                         input image Ii , we augment the corresponding image to-
+model f as a large transformer [79]. To this end, each in-                                                                              ′
+                                                                         kens tIi with an additional camera token tgi ∈ R1×C and
+put image I is initially patchified into a set of K tokens1                                                          ′
+                                                                         four register tokens [10] tR    i ∈R
+                                                                                                                 4×C
+                                                                                                                       . The concatenation of
+tI ∈ RK×C through DINO [53]. The combined set of im-                       I g R N
+                                                                         (ti , ti , ti j)i=1 is then passed to the AA transformer, yield-
+age tokens from all frames, i.e., tI = ∪N       I
+                                          i=1 {ti }, is subse-
+                                                                         ing output tokens (t̂Ii , t̂gi , t̂R  N
+                                                                                                            i )i=1 . Here, the camera token
+quently processed through the main network structure, al-
+                                                                         and register tokens of the first frame (tg1 := t̄g , tR          R
+                                                                                                                                   1 := t̄ )
+ternating frame-wise and global self-attention layers.                                                                        g R
+                                                                         are set to a different set of learnable tokens t , t than those
+Alternating-Attention. We slightly adjust the standard                                                    g            R
+                                                                         of all other frames (tgi := t , tR     i := t , i ∈ [2, . . . , N ]),
+transformer design by introducing Alternating-Attention
+                                                                         which are also learnable. This allows the model to distin-
+(AA), making the transformer focus within each frame and
+                                                                         guish the first frame from the rest, and to represent the 3D
+globally in an alternate fashion. Specifically, frame-wise
+                                                                         predictions in the coordinate frame of the first camera. Note
+self-attention attends to the tokens tIk within each frame
+                                                                         that the refined camera and register tokens now become
+separately, and global self-attention attends to the tokens
+                                                                         frame-specific—–this is because our AA transformer con-
+tI across all frames jointly. This strikes a balance between
+                                                                         tains frame-wise self-attention layers that allow the trans-
+integrating information across different images and normal-
+                                                                         former to match the camera and register tokens with the cor-
+izing the activations for the tokens within each image. By
+                                                                         responding tokens from the same image. Following com-
+default, we employ L = 24 layers of global and frame-wise
+                                                                         mon practice, the output register tokens t̂R     i are discarded
+   1 The number of tokens depends on the image resolution.               while t̂Ii , t̂gi are used for prediction.
+
+
+
+                                                                  5297
+Coordinate Frame. As noted above, we predict cameras,                                               Re10K (unseen)     CO3Dv2
+                                                                                    Methods                                         Time
+point maps, and depth maps in the coordinate frame of the                                            AUC@30 ↑         AUC@30 ↑
+first camera g1 . As such, the camera extrinsics output for                    Colmap+SPSG [60]          45.2            25.3       ∼ 15s
+the first camera are set to the identity, i.e., the first rotation                PixSfM [45]            49.4            30.1       > 20s
+quaternion is q1 = [0, 0, 0, 1] and the first translation vector                 PoseDiff [82]           48.0            66.5       ∼ 7s
+                                                                                  DUSt3R [87]            67.7            76.7       ∼ 7s
+is t1 = [0, 0, 0]. Recall that the special camera and register                   MASt3R [43]             76.4            81.8       ∼ 9s
+                g          R
+tokens tg1 := t , tR1 := t allow the transformer to identify                    VGGSfM v2 [83]           78.9            83.4       ∼ 10s
+the first camera.                                                              MV-DUSt3R [73] ‡          71.3           (69.5)     ∼ 0.6s
+                                                                                CUT3R [85] ‡             75.3            82.8      ∼ 0.6s
+Camera Predictions. The camera parameters (ĝi )N     i=1 are                   FLARE [105] ‡            78.8            83.4      ∼ 0.5s
+predicted from the output camera tokens (t̂gi )N
+                                               i=1 using four                    Fast3R [96] ‡           72.7            82.5      ∼ 0.2s
+additional self-attention layers followed by a linear layer.                  Ours (Feed-Forward)        85.3            88.2      ∼ 0.2s
+This forms the camera head that predicts the camera intrin-                     Ours (with BA)           93.5            91.8      ∼ 1.8s
+sics and extrinsics.
+                                                                             Table 1. Camera Pose Estimation on RealEstate10K [109] and
+Dense Predictions. The output image tokens t̂Ii are used                     CO3Dv2 [58] with 10 random frames. All metrics the higher the
+to predict the dense outputs, i.e., the depth maps Di , point                better. Runtime were measured using one H100 GPU. None of the
+maps Pi , and tracking features Ti . More specifically, t̂Ii are             methods were trained on the Re10K dataset; () means not trained
+                                                ′′
+first converted to dense feature maps Fi ∈ RC ×H×W with                      on CO3D. Methods marked with ‡ represent concurrent work.
+a DPT layer [57]. Each Fi is then mapped with a 3 × 3 con-
+volutional layer to the corresponding depth and point maps
+Di and Pi . Additionally, the DPT head also outputs dense                    4.1. Camera Pose Estimation
+features Ti ∈ RC×H×W , which serve as input to the track-
+ing head. We also predict the aleatoric uncertainty [40, 51]                 We first evaluate our method on the CO3Dv2 [58] and
+ΣD        H×W
+                 and ΣP       H×W                                            RealEstate10K [109] datasets for camera pose estimation,
+  i ∈ R+              i ∈ R+         for each depth and point
+map, respectively. The uncertainty maps are used in the loss                 as shown in Tab. 1. Following [82], we randomly select 10
+(as detailed in the supplementary) and, after training, are                  images per scene and evaluate them using the standard met-
+proportional to the model’s confidence in the predictions.                   ric AUC@30, which combines RRA and RTA. RRA (Rela-
+                                                                             tive Rotation Accuracy) and RTA (Relative Translation Ac-
+Tracking. In order to implement the tracking module T ,                      curacy) calculate the relative angular errors in rotation and
+we use the CoTracker2 architecture [39], which takes the                     translation, respectively, for each image pair. These angu-
+dense tracking features Ti as input. More specifically, given                lar errors are then thresholded to determine the accuracy
+a query point yj in a query image Iq (during training, we al-                scores. AUC is the area under the accuracy-threshold curve
+ways set q = 1, but any other image can be potentially used                  of the minimum values between RRA and RTA across vary-
+as a query), the tracking head T predicts the set of 2D points               ing thresholds. The (learnable) methods in Tab. 1 have been
+T ((yj )M           N                N    M
+         j=1 , (Ti )i=1 ) = ((ŷj,i )i=1 )j=1 in all images Ii that
+                                                                             trained on Co3Dv2 and not on RealEstate10K. Our feed-
+correspond to the same 3D point as y. To do so, the fea-                     forward model consistently outperforms competing meth-
+ture map Tq of the query image is first bilinearly sampled at                ods across all metrics on both datasets, including those that
+the query point yj to obtain its feature. This feature is then               employ computationally expensive post-optimization steps,
+correlated with all other feature maps Ti , i ̸= q to obtain a               such as Global Alignment for DUSt3R/MASt3R and Bun-
+set of correlation maps. These maps are then processed by                    dle Adjustment for VGGSfM, typically requiring more than
+self-attention layers to predict the final 2D points ŷi , which             10 seconds. In contrast, VGGT achieves superior perfor-
+are all in correspondence with yj . Note that, similar to VG-                mance while only operating in a feed-forward manner, re-
+GSfM [83], our tracker does not assume any temporal or-                      quiring just 0.2 seconds on the same hardware. Compared
+dering of the input frames and, hence, can be applied to any                 to concurrent works [73, 85, 96, 105] (indicated by ‡ ), our
+set of input images, not just videos.                                        method demonstrates significant performance advantages,
+                                                                             with speed similar to the fastest variant Fast3R [96]. Fur-
+                                                                             thermore, our model’s performance advantage is even more
+4. Experiments                                                               pronounced on the RealEstate10K dataset, which none of
+                                                                             the methods presented in Tab. 1 were trained on. This vali-
+This section compares our method to state-of-the-art ap-                     dates the superior generalization of VGGT.
+proaches across multiple tasks to show its effectiveness.                        Our results also show that VGGT can be improved even
+Detailed discussions on architecture, training losses, and                   further by combining it with optimization methods from vi-
+datasets are included in the supplementary material.                         sual geometry optimization like BA. Specifically, refining
+
+
+
+                                                                      5298
+  Known GT
+                      Method          Acc.↓   Comp.↓     Overall↓
+                                                                            tantly, it achieves results comparable to methods that know
+   camera                                                                   ground-truth cameras at test time. The significant perfor-
+      ✓           Gipuma [28]         0.283    0.873      0.578             mance gains can likely be attributed to our model’s multi-
+      ✓           MVSNet [98]         0.396    0.527      0.462             image training scheme that teaches it to reason about multi-
+      ✓            CIDER [94]         0.417    0.437      0.427
+      ✓        PatchmatchNet [80]     0.427    0.377      0.417
+                                                                            view triangulation natively instead of relying on ad hoc
+      ✓           MASt3R [43]         0.403    0.344      0.374             alignment procedures, such as in DUSt3R, which only av-
+      ✓        GeoMVSNet [106]        0.331    0.259      0.295             erages multiple pairwise camera triangulations.
+      ✗             DUSt3R [87]       2.677    0.805      1.741
+      ✗               Ours            0.389    0.374      0.382             4.3. Point Map Estimation
+                                                                            We also compare the accuracy of our predicted point cloud
+Table 2. Dense MVS Estimation on the DTU [35] Dataset.                      to DUSt3R and MASt3R on the ETH3D [65] dataset. For
+Methods operating with known ground-truth camera are in the top
+                                                                            each scene, we randomly sample 10 frames. The pre-
+part of the table, while the bottom part contains the methods that
+do not know the ground-truth camera.
+                                                                            dicted point cloud is aligned to the ground truth using the
+                                                                            Umeyama [77] algorithm. The results are reported after fil-
+                                                                            tering out invalid points using the official masks. We re-
+          Methods         Acc.↓     Comp.↓    Overall↓   Time
+                                                                            port Accuracy, Completeness, and Overall (Chamfer dis-
+         DUSt3R           1.167     0.842      1.005     ∼ 7s               tance) for point map estimation. As shown in Tab. 3, al-
+        MASt3R            0.968     0.684      0.826     ∼ 9s
+      Ours (Point)        0.901     0.518      0.709     ∼ 0.2s             though DUSt3R and MASt3R conduct expensive optimiza-
+   Ours (Depth + Cam)     0.873     0.482      0.677     ∼ 0.2s             tion (global alignment–—around 10 seconds per scene),
+                                                                            our method still outperforms them significantly in a simple
+Table 3. Point Map Estimation on ETH3D [65]. DUSt3R and                     feed-forward regime at only 0.2 seconds per reconstruction.
+MASt3R use global alignment while ours is feed-forward and,                     Meanwhile, compared to directly using our estimated
+hence, much faster. The row Ours (Point) indicates the results              point maps, we found that the predictions from our depth
+using the point map head directly, while Ours (Depth + Cam) de-             and camera heads (i.e., unprojecting the predicted depth
+notes constructing point clouds from the depth map head com-
+                                                                            maps to 3D using the predicted camera parameters) yield
+bined with the camera head.
+                                                                            higher accuracy. We attribute this to the benefits of de-
+                                                                            composing a complex task (point map estimation) into sim-
+the predicted camera poses and tracks with BA further im-                   pler subproblems (depth map and camera prediction), even
+proves accuracy. Note that our method directly predicts                     though the camera, depth maps, and point maps are jointly
+close-to-accurate point/depth maps, which can serve as a                    supervised during training.
+good initialization for BA. This eliminates the need for tri-                   We present a qualitative comparison with DUSt3R on
+angulation and iterative refinement in BA as done by [83],                  in-the-wild scenes in Fig. 3, with additional examples in-
+making our approach significantly faster (only around 2 sec-                cluded in the supplementary material. VGGT outputs high-
+onds even with BA). Hence, while the feed-forward mode of                   quality predictions and generalizes well, excelling on chal-
+VGGT outperforms all previous alternatives (whether they                    lenging out-of-domain examples, such as oil paintings, non-
+are feed-forward or not), there is still room for improvement               overlapping frames, and scenes with repeating or homoge-
+since post-optimization still brings benefits.                              neous textures like deserts.
+
+4.2. Multi-view Depth Estimation                                            4.4. Image Matching
+Following MASt3R [43], we further evaluate our multi-                       Two-view image matching is a widely-explored topic [47,
+view depth estimation results on the DTU [35] dataset. We                   61, 69] in computer vision. It represents a specific case of
+report the standard DTU metrics, including Accuracy (the                    rigid point tracking, which is restricted to only two views
+smallest Euclidean distance from the prediction to ground                   and, hence, a suitable evaluation benchmark to measure our
+truth), Completeness (the smallest Euclidean distance from                  tracking accuracy, even though our model is not special-
+the ground truth to prediction), and their average Overall                  ized for this task. We follow the standard protocol [21, 61]
+(i.e., Chamfer distance). In Tab. 2, DUSt3R and our VGGT                    on the ScanNet dataset [9] and report the results in Tab. 4.
+are the only two methods operating without the knowl-                       For each image pair, we extract the matches and use them
+edge of ground truth cameras. MASt3R derives depth maps                     to estimate an essential matrix, which is then decomposed
+by triangulating matches using the ground truth cameras.                    to a relative camera pose. The final metric is the relative
+Meanwhile, deep multi-view stereo methods like GeoMVS-                      pose accuracy, measured by AUC. For evaluation, we use
+Net use ground truth cameras to construct cost volumes.                     ALIKED [107] to detect keypoints, treating them as query
+    Our method substantially outperforms DUSt3R, reduc-                     points yq . These are then passed to our tracking branch T
+ing the Overall score from 1.741 to 0.382. More impor-                      to find correspondences in the second frame. We adopt the
+
+
+
+                                                                     5299
+     Method            AUC@5 ↑      AUC@10 ↑      AUC@20 ↑                                  ETH3D Dataset                 Acc.↓          Comp.↓      Overall↓
+     SuperGlue [60]       16.2         33.8          51.8                                 Cross-Attention                 1.287          0.835           1.061
+     LoFTR [69]           22.1         40.8          57.6                            Global Self-Attention Only           1.032          0.621           0.827
+     DKM [20]             29.4         50.7          68.3                              Alternating-Attention              0.901          0.518           0.709
+     CasMTR [5]           27.1         47.0          64.4
+     Roma [21]            31.8         53.4          70.9
+                                                                             Table 5. Ablation Study for Transformer Backbone on ETH3D.
+     Ours                 33.9         55.2          73.4                    We compare our alternating-attention architecture against two
+                                                                             variants: one using only global self-attention and another employ-
+Table 4. Two-View matching comparison on ScanNet-1500 [9,                    ing cross-attention.
+60]. Although our tracking head is not specialized for the two-
+                                                                                       w. Lcamera   w. Ldepth   w. Ltrack        Acc.↓     Comp.↓        Overall↓
+view setting, it outperforms the state-of-the-art two-view matching
+method Roma. Measured in AUC (higher is better).                                            ✗          ✓              ✓          1.042     0.627          0.834
+                                                                                            ✓          ✗              ✓          0.920     0.534          0.727
+                                                                                            ✓          ✓              ✗          0.976     0.603          0.790
+evaluation hyperparameters (e.g., the number of matches,                                    ✓          ✓              ✓          0.901     0.518          0.709
+RANSAC thresholds) from Roma [21]. Despite not being
+explicitly trained for two-view matching, Tab. 4 shows that                  Table 6. Ablation Study for Multi-task Learning, which shows
+VGGT achieves the highest accuracy among all baselines.                      that simultaneous training with camera, depth and track estimation
+                                                                             yields the highest accuracy in point map estimation on ETH3D.
+4.5. Ablation Studies
+Feature Backbone. We first validate the effectiveness of                     Input Images
+
+our proposed Alternating-Attention design by comparing it
+against two alternative attention architectures: (a) global
+self-attention only, and (b) cross-attention. To ensure a                    Ground Truth
+
+
+fair comparison, all model variants maintain an identical
+number of parameters, using a total of 2L attention lay-
+                                                                              Prediction
+ers. For the cross-attention variant, each frame indepen-
+dently attends to tokens from all other frames, maximiz-
+ing cross-frame information fusion although significantly                    Figure 4. Qualitative Examples of Novel View Synthesis. The
+increasing the runtime, particularly as the number of input                  top row shows the input images, the middle row displays the
+frames grows. The hyperparameters, such as the hidden di-                    ground truth images from target viewpoints, and the bottom row
+mension and the number of heads, are kept the same. Point                    presents our synthesized images.
+map estimation accuracy is chosen as the evaluation metric
+for our ablation study, as it reflects the model’s joint under-                       Method        Known Input Cam       Size    PSNR ↑     SSIM ↑         LPIPS ↓
+standing of scene geometry and camera parameters. Results                          LGM [72]                ✓              256      21.44         0.832       0.122
+in Tab. 5 demonstrate that our Alternating-Attention archi-                      GS-LRM [103]              ✓              256      29.59         0.944       0.051
+                                                                                  LVSM [36]                ✓              256      31.71         0.957       0.027
+tecture outperforms both baseline variants by a clear mar-
+                                                                                   Ours-NVS∗               ✗              224      30.41         0.949       0.033
+gin. Additionally, our other preliminary exploratory exper-
+iments consistently showed that architectures using cross-
+                                                                             Table 7. Quantitative comparisons for view synthesis on
+attention generally underperform compared to those exclu-
+                                                                             GSO [17] dataset. Finetuning VGGT for feed-forward novel view
+sively employing self-attention.                                             synthesis, it demonstrates competitive performance even without
+Multi-task Learning. We also verify the benefit of train-                    knowing camera extrinsic and intrinsic parameters for the input
+ing a single network to simultaneously learn multiple 3D                     images. Note that ∗ indicates using a small training set (only 20%).
+quantities, even though these outputs may potentially over-
+lap (e.g., depth maps and camera parameters together can                     Feed-forward Novel View Synthesis is progressing
+produce point maps). As shown in Tab. 6, there is a no-                      rapidly [4, 31, 34, 36, 70, 84, 95, 104]. Most existing meth-
+ticeable decrease in the accuracy of point map estimation                    ods take images with known camera parameters as input
+when training without camera, depth, or track estimation.                    and predict the target image corresponding to a new camera
+Notably, incorporating camera parameter estimation clearly                   viewpoint. Instead of relying on an explicit 3D representa-
+enhances point map accuracy, whereas depth estimation                        tion, we follow LVSM [36] and modify VGGT to directly
+contributes only marginal improvements.                                      output the target image. However, we do not assume known
+                                                                             camera parameters for the input frames.
+4.6. Finetuning for Downstream Tasks                                            We follow the training and evaluation protocol of LVSM
+We now show that the VGGT pre-trained feature extractor                      closely, e.g., using 4 input views and adopting Plücker rays
+can be reused in downstream tasks.                                           to represent target viewpoints. We make a simple modifi-
+
+
+
+                                                                      5300
+      Ours
+CoTracker
+ +Ours
+
+
+
+
+    Figure 5. Visualization of Rigid and Dynamic Point Tracking. Top: VGGT’s tracking module T outputs keypoint tracks for an
+    unordered set of input images depicting a static scene. Bottom: We finetune the backbone of VGGT to enhance a dynamic point tracker
+    CoTracker [38], which processes sequential inputs.
+
+
+                              Kinetics         RGB-S           DAVIS               Following standard practices, we report these point-tracking
+        Method
+                         AJ      vis
+                                δavg   OA AJ     vis
+                                                δavg   OA AJ     vis
+                                                                δavg   OA          metrics: Occlusion Accuracy (OA), which comprises the bi-
+                                                                                                                             vis
+                                                                                   nary accuracy of occlusion predictions; δavg  , comprising the
+        TAPTR [44]      49.0 64.4 85.2 60.8 76.2 87.0 63.0 76.1 91.1
+        LocoTrack [8]   52.9 66.8 85.3 69.7 83.2 89.5 62.9 75.3 87.2               mean proportion of visible points accurately tracked within
+        BootsTAPIR [16] 54.6 68.4 86.5 70.8 83.0 89.9 61.4 73.6 88.7               a certain pixel threshold; and Average Jaccard (AJ), mea-
+        CoTracker [38]   49.6 64.3 83.3 67.4 78.9 85.2 61.8 76.1 88.3              suring tracking and occlusion prediction accuracy together.
+        CoTracker + Ours 57.2 69.0 88.9 72.1 84.0 91.6 64.7 77.5 91.4                 We adapt the state-of-the-art CoTracker2 model [39] by
+                                                                                   substituting its backbone with our pretrained feature back-
+    Table 8. Dynamic Point Tracking Results on the TAP-Vid                         bone. This is necessary because VGGT is trained on un-
+    benchmarks. Although our model was not designed for dynamic                    ordered image collections instead of sequential dynamic
+    scenes, simply fine-tuning CoTracker with our pretrained weights               videos. Our backbone predicts the tracking features Ti ,
+    significantly enhances performance, demonstrating the robustness               which replace the outputs of the feature extractor and later
+    and effectiveness of our learned features.                                     enter the rest of the CoTracker2 architecture, which finally
+                                                                                   predicts the tracks. We finetune the entire modified tracker
+    cation to VGGT. As before, the input images are converted                      on Kubric [29]. As illustrated in Tab. 8, the integration of
+    into tokens by DINO. Then, for the target views, we use                        pretrained VGGT significantly enhances CoTracker’s per-
+    a convolutional layer to encode their Plücker ray images                      formance on the TAP-Vid benchmark [13]. For instance,
+                                                                                                                           vis
+    into tokens. These tokens, representing both the input im-                     VGGT’s tracking features improve the δavg    metric from 78.9
+    ages and the target views, are concatenated and processed                      to 84.0 on the TAP-Vid RGB-S dataset. Despite the inclu-
+    by the AA transformer. Subsequently, a DPT head is used                        sion of videos featuring rapid dynamic motions in TAP-Vid,
+    to regress the RGB colors for the target views. It is impor-                   our model’s strong performance demonstrates the general-
+    tant to note that we do not input the Plücker rays for the                    ization capability of its features.
+    source images. Hence, the model is not given the camera
+    parameters for these input frames.                                             5. Conclusions
+       LVSM was trained on the Objaverse dataset [11]. We
+                                                                                   We present Visual Geometry Grounded Transformer
+    use a similar internal dataset of approximately 20% the size
+                                                                                   (VGGT), a feed-forward neural network that can directly
+    of Objaverse. Further details on training and evaluation can
+                                                                                   estimate all key 3D scene properties for hundreds of input
+    be found in [36]. As shown in Tab. 7, despite not requir-
+                                                                                   views. It achieves state-of-the-art results in multiple 3D
+    ing the input camera parameters and using less training data
+                                                                                   tasks, including camera parameter estimation, multi-view
+    than LVSM, our model achieves competitive results on the
+                                                                                   depth estimation, dense point cloud reconstruction, and 3D
+    GSO dataset [17]. We expect that better results would be
+                                                                                   point tracking. Our simple, neural-first approach departs
+    obtained using a larger training dataset. Qualitative exam-
+                                                                                   from traditional visual geometry-based methods, which rely
+    ples are shown in Fig. 4.
+                                                                                   on post-optimization to obtain accurate and task-specific re-
+    Dynamic Point Tracking has emerged as a highly com-                            sults. The simplicity and efficiency of our approach make
+    petitive task in recent years [15, 32, 39, 93], and it serves                  it well-suited for real-time applications, which is another
+    as another downstream application for our learned features.                    benefit over optimization-based approaches.
+
+
+
+                                                                            5301
+References                                                                      Zisserman, and Yi Yang. Tap-vid: A benchmark for track-
+                                                                                ing any point in a video. arXiv, 2022. 2, 8
+ [1] Josh Achiam, Steven Adler, Sandhini Agarwal, Lama
+                                                                           [14] Carl Doersch, Yi Yang, Mel Vecerik, Dilara Gokay, Ankush
+     Ahmad, Ilge Akkaya, Florencia Leoni Aleman, Diogo
+                                                                                Gupta, Yusuf Aytar, Joao Carreira, and Andrew Zisserman.
+     Almeida, Janko Altenschmidt, Sam Altman, Shyamal
+                                                                                TAPIR: Tracking any point with per-frame initialization
+     Anadkat, et al. Gpt-4 technical report. arXiv preprint
+                                                                                and temporal refinement. arXiv, 2306.08637, 2023. 2
+     arXiv:2303.08774, 2023. 2
+                                                                           [15] Carl Doersch, Yi Yang, Mel Vecerik, Dilara Gokay, Ankush
+ [2] Sameer Agarwal, Yasutaka Furukawa, Noah Snavely, Ian
+                                                                                Gupta, Yusuf Aytar, Joao Carreira, and Andrew Zisserman.
+     Simon, Brian Curless, Steven M Seitz, and Richard
+                                                                                TAPIR: tracking any point with per-frame initialization and
+     Szeliski. Building rome in a day. Communications of the
+                                                                                temporal refinement. In Proc. CVPR, 2023. 3, 8
+     ACM, 54(10):105–112, 2011. 2
+                                                                           [16] Carl Doersch, Yi Yang, Dilara Gokay, Pauline Luc, Skanda
+ [3] Eric Brachmann, Jamie Wynn, Shuai Chen, Tommaso Cav-                       Koppula, Ankush Gupta, Joseph Heyward, Ross Goroshin,
+     allari, Áron Monszpart, Daniyar Turmukhambetov, and                       João Carreira, and Andrew Zisserman. Bootstap: Boot-
+     Victor Adrian Prisacariu. Scene coordinate reconstruction:                 strapped training for tracking-any-point. arXiv preprint
+     Posing of image collections via incremental learning of a                  arXiv:2402.00847, 2024. 8
+     relocalizer. In ECCV, 2024. 2
+                                                                           [17] Laura Downs, Anthony Francis, Nate Koenig, Brandon
+ [4] Ang Cao, Justin Johnson, Andrea Vedaldi, and David                         Kinman, Ryan Hickman, Krista Reymann, Thomas B
+     Novotny. Lightplane: Highly-scalable components for neu-                   McHugh, and Vincent Vanhoucke. Google scanned objects:
+     ral 3Dfields. In Proceedings of the International Confer-                  A high-quality dataset of 3d scanned household items. In
+     ence on 3D Vision (3DV), 2025. 7                                           2022 International Conference on Robotics and Automa-
+ [5] Chenjie Cao and Yanwei Fu. Improving transformer-based                     tion (ICRA), pages 2553–2560. IEEE, 2022. 7, 8
+     image matching by cascaded capturing spatially informa-               [18] Abhimanyu Dubey, Abhinav Jauhri, Abhinav Pandey, Ab-
+     tive keypoints. In Proceedings of the IEEE/CVF Inter-                      hishek Kadian, Ahmad Al-Dahle, Aiesha Letman, Akhil
+     national Conference on Computer Vision (ICCV), pages                       Mathur, Alan Schelten, Amy Yang, Angela Fan, Anirudh
+     12129–12139, 2023. 7                                                       Goyal, Anthony Hartshorn, Aobo Yang, Archi Mitra,
+ [6] Mathilde Caron, Hugo Touvron, Ishan Misra, Hervé Jégou,                  Archie Sravankumar, Artem Korenev, Arthur Hinsvark,
+     Julien Mairal, Piotr Bojanowski, and Armand Joulin.                        Arun Rao, Aston Zhang, Aurélien Rodriguez, Austen
+     Emerging properties in self-supervised vision transformers.                Gregerson, Ava Spataru, Baptiste Rozière, Bethany Biron,
+     In Proc. ICCV, 2021. 2                                                     Binh Tang, Bobbie Chern, Charlotte Caucheteux, Chaya
+ [7] Hongkai Chen, Zixin Luo, Jiahui Zhang, Lei Zhou, Xuyang                    Nayak, Chloe Bi, Chris Marra, Chris McConnell, Chris-
+     Bai, Zeyu Hu, Chiew-Lan Tai, and Long Quan. Learning                       tian Keller, Christophe Touret, Chunyang Wu, Corinne
+     to match features with seeded graph matching network. In                   Wong, Cristian Canton Ferrer, Cyrus Nikolaidis, Damien
+     Proceedings of the IEEE/CVF International Conference on                    Allonsius, Daniel Song, Danielle Pintz, Danny Livshits,
+     Computer Vision, pages 6301–6310, 2021. 2                                  David Esiobu, Dhruv Choudhary, Dhruv Mahajan, Diego
+ [8] Seokju Cho, Jiahui Huang, Jisu Nam, Honggyu An, Seun-                      Garcia-Olano, Diego Perino, Dieuwke Hupkes, Egor
+     gryong Kim, and Joon-Young Lee. Local all-pair corre-                      Lakomkin, Ehab AlBadawy, Elina Lobanova, Emily Di-
+     spondence for point tracking. Proc. ECCV, 2024. 2, 8                       nan, Eric Michael Smith, Filip Radenovic, Frank Zhang,
+ [9] Angela Dai, Angel X Chang, Manolis Savva, Maciej Hal-                      Gabriel Synnaeve, Gabrielle Lee, Georgia Lewis Ander-
+     ber, Thomas Funkhouser, and Matthias Nießner. Scannet:                     son, Graeme Nail, Grégoire Mialon, Guan Pang, Guillem
+     Richly-annotated 3d reconstructions of indoor scenes. In                   Cucurell, Hailey Nguyen, Hannah Korevaar, Hu Xu, Hugo
+     Proceedings of the IEEE conference on computer vision                      Touvron, Iliyan Zarov, Imanol Arrieta Ibarra, Isabel M.
+     and pattern recognition, pages 5828–5839, 2017. 6, 7                       Kloumann, Ishan Misra, Ivan Evtimov, Jade Copet, Jaewon
+[10] Timothée Darcet, Maxime Oquab, Julien Mairal, and Pi-                     Lee, Jan Geffert, Jana Vranes, Jason Park, Jay Mahadeokar,
+     otr Bojanowski. Vision transformers need registers. arXiv                  Jeet Shah, Jelmer van der Linde, Jennifer Billock, Jenny
+     preprint arXiv:2309.16588, 2023. 4                                         Hong, Jenya Lee, Jeremy Fu, Jianfeng Chi, Jianyu Huang,
+[11] Matt Deitke, Dustin Schwenk, Jordi Salvador, Luca Weihs,                   Jiawen Liu, Jie Wang, Jiecao Yu, Joanna Bitton, Joe Spisak,
+     Oscar Michel, Eli VanderBilt, Ludwig Schmidt, Kiana                        Jongsoo Park, Joseph Rocca, Joshua Johnstun, Joshua Saxe,
+     Ehsani, Aniruddha Kembhavi, and Ali Farhadi. Objaverse:                    Junteng Jia, Kalyan Vasuden Alwala, Kartikeya Upasani,
+     A universe of annotated 3d objects. In Proceedings of                      Kate Plawiak, Ke Li, Kenneth Heafield, and Kevin Stone.
+     the IEEE/CVF Conference on Computer Vision and Pattern                     The Llama 3 herd of models. arXiv, 2407.21783, 2024. 2
+     Recognition, pages 13142–13153, 2023. 8                               [19] Mihai Dusmanu, Ignacio Rocco, Tomas Pajdla, Marc Polle-
+[12] Daniel DeTone, Tomasz Malisiewicz, and Andrew Rabi-                        feys, Josef Sivic, Akihiko Torii, and Torsten Sattler. D2-
+     novich. Superpoint: Self-supervised interest point detection               net: A trainable cnn for joint description and detection of
+     and description. In Proceedings of the IEEE conference on                  local features. In Proceedings of the ieee/cvf conference on
+     computer vision and pattern recognition workshops, pages                   computer vision and pattern recognition, pages 8092–8101,
+     224–236, 2018. 2                                                           2019. 2
+[13] Carl Doersch, Ankush Gupta, Larisa Markeeva, Adrià Re-               [20] Johan Edstedt, Ioannis Athanasiadis, Mårten Wadenbäck,
+     casens, Lucas Smaira, Yusuf Aytar, João Carreira, Andrew                  and Michael Felsberg. DKM: Dense kernelized feature
+
+
+
+
+                                                                    5302
+     matching for geometry estimation. In IEEE Conference on              [32] Adam W Harley, Zhaoyuan Fang, and Katerina Fragki-
+     Computer Vision and Pattern Recognition, 2023. 7                          adaki. Particle video revisited: Tracking through occlusions
+[21] Johan Edstedt, Qiyu Sun, Georg Bökman, Mårten                           using point trajectories. In Proc. ECCV, 2022. 2, 8
+     Wadenbäck, and Michael Felsberg. Roma: Robust dense                 [33] Richard Hartley and Andrew Zisserman. Multiple View Ge-
+     feature matching. In Proceedings of the IEEE/CVF Confer-                  ometry in Computer Vision. Cambridge University Press,
+     ence on Computer Vision and Pattern Recognition, pages                    2000. 1, 2
+     19790–19800, 2024. 6, 7                                              [34] Yicong Hong, Kai Zhang, Jiuxiang Gu, Sai Bi, Yang Zhou,
+[22] Patrick Esser, Robin Rombach, and Björn Ommer. Taming                    Difan Liu, Feng Liu, Kalyan Sunkavalli, Trung Bui, and
+     transformers for high-resolution image synthesis. In Proc.                Hao Tan. LRM: Large reconstruction model for single im-
+     CVPR, 2021. 2                                                             age to 3D. In Proc. ICLR, 2024. 2, 7
+[23] Martin A Fischler and Robert C Bolles. Random sample                 [35] Rasmus Jensen, Anders Dahl, George Vogiatzis, Engil Tola,
+     consensus: a paradigm for model fitting with applications                 and Henrik Aanæs. Large scale multi-view stereopsis eval-
+     to image analysis and automated cartography. Communica-                   uation. In 2014 IEEE Conference on Computer Vision and
+     tions of the ACM, 24(6):381–395, 1981. 3                                  Pattern Recognition, pages 406–413. IEEE, 2014. 6
+[24] Jan-Michael Frahm, Pierre Fite-Georgel, David Gallup,                [36] Haian Jin, Hanwen Jiang, Hao Tan, Kai Zhang, Sai Bi,
+     Tim Johnson, Rahul Raguram, Changchang Wu, Yi-Hung                        Tianyuan Zhang, Fujun Luan, Noah Snavely, and Zexiang
+     Jen, Enrique Dunn, Brian Clipp, Svetlana Lazebnik, et al.                 Xu. LVSM: a large view synthesis model with minimal 3D
+     Building rome on a cloudless day. In Computer Vision–                     inductive bias. arXiv, 2410.17242, 2024. 4, 7, 8
+     ECCV 2010: 11th European Conference on Computer Vi-                  [37] Nikita Karaev, Iurii Makarov, Jianyuan Wang, Natalia
+     sion, Heraklion, Crete, Greece, September 5-11, 2010, Pro-                Neverova, Andrea Vedaldi, and Christian Rupprecht. Co-
+     ceedings, Part IV 11, pages 368–381. Springer, 2010. 2                    tracker3: Simpler and better point tracking by pseudo-
+[25] Qiancheng Fu, Qingshan Xu, Yew Soon Ong, and Wen-                         labelling real videos. arXiv preprint arXiv:2410.11831,
+     bing Tao. Geo-neus: Geometry-consistent neural implicit                   2024. 2
+     surfaces learning for multi-view reconstruction. Advances            [38] Nikita Karaev, Ignacio Rocco, Benjamin Graham, Natalia
+     in Neural Information Processing Systems, 35:3403–3416,                   Neverova, Andrea Vedaldi, and Christian Rupprecht. Co-
+     2022. 2                                                                   tracker: It is better to track together. Proc. ECCV, 2024. 2,
+[26] Yasutaka Furukawa, Carlos Hernández, et al. Multi-view                   8
+     stereo: A tutorial. Foundations and Trends® in Computer              [39] Nikita Karaev, Ignacio Rocco, Ben Graham, Natalia
+     Graphics and Vision, 9(1-2):1–148, 2015. 2                                Neverova, Andrea Vedaldi, and Christian Rupprecht. Co-
+[27] Silvano Galliani, Katrin Lasinger, and Konrad Schindler.                  Tracker: It is better to track together. In Proceedings of the
+     Massively parallel multiview stereopsis by surface normal                 European Conference on Computer Vision (ECCV), 2024.
+     diffusion. In Proceedings of the IEEE international confer-               3, 5, 8
+     ence on computer vision, pages 873–881, 2015. 2                      [40] Alex Kendall and Roberto Cipolla. Modelling uncertainty
+[28] Silvano Galliani, Katrin Lasinger, and Konrad Schindler.                  in deep learning for camera relocalization. In Proc. ICRA.
+     Massively parallel multiview stereopsis by surface normal                 IEEE, 2016. 5
+     diffusion. In ICCV, 2015. 6                                          [41] Guillaume Le Moing, Jean Ponce, and Cordelia Schmid.
+                                                                               Dense optical tracking: Connecting the dots. In CVPR,
+[29] Klaus Greff, Francois Belletti, Lucas Beyer, Carl Doersch,
+                                                                               2024. 2
+     Yilun Du, Daniel Duckworth, David J Fleet, Dan Gnanapra-
+     gasam, Florian Golemo, Charles Herrmann, Thomas Kipf,                [42] Vincent Lepetit, Francesc Moreno-Noguer, and Pascal Fua.
+     Abhijit Kundu, Dmitry Lagun, Issam Laradji, Hsueh-                        Ep n p: An accurate o (n) solution to the p n p problem. In-
+     Ti (Derek) Liu, Henning Meyer, Yishu Miao, Derek                          ternational journal of computer vision, 81:155–166, 2009.
+     Nowrouzezahrai, Cengiz Oztireli, Etienne Pot, Noha Rad-                   3
+     wan, Daniel Rebain, Sara Sabour, Mehdi S. M. Sajjadi,                [43] Vincent Leroy, Yohann Cabon, and Jérôme Revaud.
+     Matan Sela, Vincent Sitzmann, Austin Stone, Deqing Sun,                   Grounding image matching in 3d with mast3r. arXiv
+     Suhani Vora, Ziyu Wang, Tianhao Wu, Kwang Moo Yi,                         preprint arXiv:2406.09756, 2024. 2, 5, 6
+     Fangcheng Zhong, and Andrea Tagliasacchi. Kubric: a                  [44] Hongyang Li, Hao Zhang, Shilong Liu, Zhaoyang Zeng,
+     scalable dataset generator. In Proc. CVPR, 2022. 8                        Tianhe Ren, Feng Li, and Lei Zhang. Taptr: Tracking
+[30] Xiaodong Gu, Zhiwen Fan, Siyu Zhu, Zuozhuo Dai,                           any point with transformers as detection. arXiv preprint
+     Feitong Tan, and Ping Tan. Cascade cost volume for high-                  arXiv:2403.13042, 2024. 2, 8
+     resolution multi-view stereo and stereo matching. In Pro-            [45] Philipp Lindenberger, Paul-Edouard Sarlin, Viktor Larsson,
+     ceedings of the IEEE/CVF conference on computer vision                    and Marc Pollefeys. Pixel-perfect structure-from-motion
+     and pattern recognition, pages 2495–2504, 2020. 2                         with featuremetric refinement. arXiv.cs, abs/2108.08291,
+[31] Junlin Han, Jianyuan Wang, Andrea Vedaldi, Philip Torr,                   2021. 5
+     and Filippos Kokkinos. Flex3d: Feed-forward 3d genera-               [46] Philipp Lindenberger, Paul-Edouard Sarlin, and Marc
+     tion with flexible reconstruction model and input view cu-                Pollefeys. Lightglue: Local feature matching at light speed.
+     ration. arXiv preprint arXiv:2410.00890, 2024. 7                          arXiv preprint arXiv:2306.13643, 2023. 2
+
+
+
+
+                                                                   5303
+[47] Philipp Lindenberger, Paul-Edouard Sarlin, and Marc                   [59] Peter Sand and Seth Teller. Particle video: Long-range mo-
+     Pollefeys. LightGlue: local feature matching at light speed.               tion estimation using point trajectories. IJCV, 80, 2008. 2
+     In Proc. ICCV, 2023. 6                                                [60] Paul-Edouard Sarlin, Daniel DeTone, Tomasz Malisiewicz,
+[48] Shaohui Liu, Yidan Gao, Tianyi Zhang, Rémi Pautrat, Jo-                   and Andrew Rabinovich. Superglue: Learning feature
+     hannes L Schönberger, Viktor Larsson, and Marc Pollefeys.                 matching with graph neural networks. In Proceedings of
+     Robust incremental structure-from-motion with hybrid fea-                  the IEEE/CVF conference on computer vision and pattern
+     tures. In European Conference on Computer Vision, pages                    recognition, pages 4938–4947, 2020. 2, 5, 7
+     249–269. Springer, 2025. 2                                            [61] Paul-Edouard Sarlin, Daniel DeTone, Tomasz Malisiewicz,
+[49] Zeyu Ma, Zachary Teed, and Jia Deng. Multiview stereo                      and Andrew Rabinovich. SuperGlue: learning feature
+     with cascaded epipolar raft. In European Conference on                     matching with graph neural networks. In Proc. CVPR,
+     Computer Vision, pages 734–750. Springer, 2022. 2                          2020. 6
+[50] Michael Niemeyer, Lars Mescheder, Michael Oechsle,                    [62] Johannes Lutz Schönberger and Jan-Michael Frahm.
+     and Andreas Geiger. Differentiable volumetric rendering:                   Structure-from-motion revisited. In Conference on Com-
+     Learning implicit 3d representations without 3d supervi-                   puter Vision and Pattern Recognition (CVPR), 2016. 2
+     sion. In Proceedings of the IEEE/CVF conference on com-               [63] Johannes Lutz Schönberger and Jan-Michael Frahm.
+     puter vision and pattern recognition, pages 3504–3515,                     Structure-from-motion revisited. In Proc. CVPR, 2016. 3
+     2020. 2                                                               [64] Johannes L Schönberger, Enliang Zheng, Jan-Michael
+[51] David Novotný, Diane Larlus, and Andrea Vedaldi. Captur-                  Frahm, and Marc Pollefeys. Pixelwise view selection for
+     ing the geometry of object categories from video supervi-                  unstructured multi-view stereo. In Computer Vision–ECCV
+     sion. IEEE Transactions on Pattern Analysis and Machine                    2016: 14th European Conference, Amsterdam, The Nether-
+     Intelligence, 2018. 5                                                      lands, October 11-14, 2016, Proceedings, Part III 14, pages
+[52] John Oliensis. A critique of structure-from-motion algo-                   501–518. Springer, 2016. 2
+     rithms. Computer Vision and Image Understanding, 80(2):               [65] Thomas Schops, Johannes L Schonberger, Silvano Galliani,
+     172–214, 2000. 2                                                           Torsten Sattler, Konrad Schindler, Marc Pollefeys, and An-
+[53] Maxime Oquab, Timothée Darcet, Théo Moutakanni,                          dreas Geiger. A multi-view stereo benchmark with high-
+     Huy V. Vo, Marc Szafraniec, Vasil Khalidov, Pierre Fer-                    resolution images and multi-camera videos. In Proceed-
+     nandez, Daniel HAZIZA, Francisco Massa, Alaaeldin El-                      ings of the IEEE conference on computer vision and pattern
+     Nouby, Mido Assran, Nicolas Ballas, Wojciech Galuba,                       recognition, pages 3260–3269, 2017. 6
+     Russell Howes, Po-Yao Huang, Shang-Wen Li, Ishan                      [66] Yan Shi, Jun-Xiong Cai, Yoli Shavit, Tai-Jiang Mu, Wensen
+     Misra, Michael Rabbat, Vasu Sharma, Gabriel Synnaeve,                      Feng, and Kai Zhang. Clustergnn: Cluster-based coarse-
+     Hu Xu, Herve Jegou, Julien Mairal, Patrick Labatut, Ar-                    to-fine graph neural network for efficient feature matching.
+     mand Joulin, and Piotr Bojanowski. DINOv2: Learning                        In Proceedings of the IEEE/CVF Conference on Computer
+     robust visual features without supervision. Transactions on                Vision and Pattern Recognition, pages 12517–12526, 2022.
+     Machine Learning Research, 2024. 2, 4                                      2
+[54] Onur Özyeşil, Vladislav Voroninski, Ronen Basri, and                [67] Cameron Smith, David Charatan, Ayush Tewari, and Vin-
+     Amit Singer. A survey of structure from motion*. Acta                      cent Sitzmann. FlowMap: high-quality camera poses, in-
+     Numerica, 26:305–364, 2017. 2                                              trinsics, and depth via gradient descent. arXiv, 2404.15259,
+[55] Rui Peng, Rongjie Wang, Zhenyu Wang, Yawen Lai, and                        2024. 2
+     Ronggang Wang. Rethinking depth estimation for multi-                 [68] Noah Snavely, Steven M Seitz, and Richard Szeliski. Photo
+     view stereo: A unified representation. In Proceedings of                   tourism: exploring photo collections in 3d. In ACM sig-
+     the IEEE/CVF conference on computer vision and pattern                     graph 2006 papers, pages 835–846. 2006. 2
+     recognition, pages 8645–8654, 2022. 2                                 [69] Jiaming Sun, Zehong Shen, Yuang Wang, Hujun Bao, and
+[56] Alec Radford, Jong Wook Kim, Chris Hallacy, Aditya                         Xiaowei Zhou. Loftr: Detector-free local feature matching
+     Ramesh, Gabriel Goh, Sandhini Agarwal, Girish Sastry,                      with transformers. In Proceedings of the IEEE/CVF con-
+     Amanda Askell, Pamela Mishkin, Jack Clark, Gretchen                        ference on computer vision and pattern recognition, pages
+     Krueger, and Ilya Sutskever. Learning transferable visual                  8922–8931, 2021. 6, 7
+     models from natural language supervision. In Proc. ICML,              [70] Stanislaw Szymanowicz, Chrisitian Rupprecht, and Andrea
+     pages 8748–8763, 2021. 2                                                   Vedaldi. Splatter image: Ultra-fast single-view 3d recon-
+[57] René Ranftl, Alexey Bochkovskiy, and Vladlen Koltun. Vi-                  struction. In Proceedings of the IEEE/CVF conference
+     sion transformers for dense prediction. In Proceedings of                  on computer vision and pattern recognition, pages 10208–
+     the IEEE/CVF international conference on computer vi-                      10217, 2024. 7
+     sion, pages 12179–12188, 2021. 3, 5                                   [71] Chengzhou Tang and Ping Tan. Ba-net: Dense bundle ad-
+[58] Jeremy Reizenstein, Roman Shapovalov, Philipp Henzler,                     justment network. arXiv preprint arXiv:1806.04807, 2018.
+     Luca Sbordone, Patrick Labatut, and David Novotny. Com-                    2
+     mon Objects in 3D: Large-scale learning and evaluation of             [72] Jiaxiang Tang, Zhaoxi Chen, Xiaokang Chen, Tengfei
+     real-life 3D category reconstruction. In Proc. ICCV, 2021.                 Wang, Gang Zeng, and Ziwei Liu. Lgm: Large multi-
+     5                                                                          view gaussian model for high-resolution 3d content cre-
+
+
+
+
+                                                                    5304
+     ation. In European Conference on Computer Vision, pages                  domain images with optimal training supervision. arXiv,
+     1–18. Springer, 2024. 7                                                  2410.19115, 2024. 2
+[73] Zhenggang Tang, Yuchen Fan, Dilin Wang, Hongyu Xu,                  [87] Shuzhe Wang, Vincent Leroy, Yohann Cabon, Boris
+     Rakesh Ranjan, Alexander Schwing, and Zhicheng Yan.                      Chidlovskii, and Jerome Revaud. DUSt3R: Geometric 3D
+     Mv-dust3r+: Single-stage scene reconstruction from sparse                vision made easy. In Proc. CVPR, 2024. 1, 2, 3, 4, 5, 6
+     views in 2 seconds. arXiv preprint arXiv:2412.06974,                [88] Yuesong Wang, Zhaojie Zeng, Tao Guan, Wei Yang, Zhuo
+     2024. 2, 5                                                               Chen, Wenkai Liu, Luoyuan Xu, and Yawei Luo. Adap-
+[74] Zachary Teed and Jia Deng. Deepv2d: Video to depth                       tive patch deformation for textureless-resilient multi-view
+     with differentiable structure from motion. arXiv preprint                stereo. In Proceedings of the IEEE/CVF Conference on
+     arXiv:1812.04605, 2018. 2                                                Computer Vision and Pattern Recognition (CVPR), pages
+[75] Zachary Teed and Jia Deng. Droid-slam: Deep visual slam                  1621–1630, 2023. 2
+     for monocular, stereo, and rgb-d cameras. Advances in               [89] Xingkui Wei, Yinda Zhang, Zhuwen Li, Yanwei Fu, and
+     neural information processing systems, 34:16558–16569,                   Xiangyang Xue. Deepsfm: Structure from motion via deep
+     2021. 2                                                                  bundle adjustment. In Computer Vision–ECCV 2020: 16th
+[76] Michał Tyszkiewicz, Pascal Fua, and Eduard Trulls. Disk:                 European Conference, Glasgow, UK, August 23–28, 2020,
+     Learning local features with policy gradient. Advances in                Proceedings, Part I 16, pages 230–247. Springer, 2020. 2
+     Neural Information Processing Systems, 33:14254–14265,              [90] Xinyue Wei, Kai Zhang, Sai Bi, Hao Tan, Fujun Luan,
+     2020. 2                                                                  Valentin Deschaintre, Kalyan Sunkavalli, Hao Su, and Zex-
+[77] Shinji Umeyama. Least-squares estimation of transforma-                  iang Xu. MeshLRM: large reconstruction model for high-
+     tion parameters between two point patterns. IEEE Trans.                  quality mesh. arXiv, 2404.12385, 2024. 4
+     Pattern Anal. Mach. Intell., 13(4), 1991. 6                         [91] Yi Wei, Shaohui Liu, Yongming Rao, Wang Zhao, Jiwen
+[78] Benjamin Ummenhofer, Huizhong Zhou, Jonas Uhrig,                         Lu, and Jie Zhou. Nerfingmvs: Guided optimization of neu-
+     Nikolaus Mayer, Eddy Ilg, Alexey Dosovitskiy, and                        ral radiance fields for indoor multi-view stereo. In Proceed-
+     Thomas Brox. Demon: Depth and motion network for                         ings of the IEEE/CVF International Conference on Com-
+     learning monocular stereo. In Proceedings of the IEEE con-               puter Vision (ICCV), pages 5610–5619, 2021. 2
+     ference on computer vision and pattern recognition, pages           [92] Changchang Wu. Towards linear-time incremental struc-
+     5038–5047, 2017. 2                                                       ture from motion. In 2013 International Conference on 3D
+[79] Ashish Vaswani, Noam Shazeer, Niki Parmar, Jakob                         Vision-3DV 2013, pages 127–134. IEEE, 2013. 2
+     Uszkoreit, Llion Jones, Aidan N. Gomez, Lukasz Kaiser,              [93] Yuxi Xiao, Qianqian Wang, Shangzhan Zhang, Nan Xue,
+     and Illia Polosukhin. Attention is all you need. In Proc.                Sida Peng, Yujun Shen, and Xiaowei Zhou. Spatialtracker:
+     NeurIPS, 2017. 2, 4                                                      Tracking any 2d pixels in 3d space. In Proceedings of
+[80] Fangjinhua Wang, Silvano Galliani, Christoph Vogel, Pablo                the IEEE/CVF Conference on Computer Vision and Pattern
+     Speciale, and Marc Pollefeys. Patchmatchnet: Learned                     Recognition, pages 20406–20417, 2024. 8
+     multi-view patchmatch stereo. In CVPR, pages 14194–                 [94] Qingshan Xu and Wenbing Tao. Learning inverse depth re-
+     14203, 2021. 6                                                           gression for multi-view stereo with correlation cost volume.
+[81] Jianyuan Wang, Yiran Zhong, Yuchao Dai, Stan Birchfield,                 In AAAI, 2020. 6
+     Kaihao Zhang, Nikolai Smolyanskiy, and Hongdong Li.                 [95] Yinghao Xu, Zifan Shi, Wang Yifan, Hansheng Chen,
+     Deep two-view structure-from-motion revisited. In Pro-                   Ceyuan Yang, Sida Peng, Yujun Shen, and Gordon Wet-
+     ceedings of the IEEE/CVF conference on Computer Vision                   zstein. GRM: Large gaussian reconstruction model for effi-
+     and Pattern Recognition, pages 8953–8962, 2021. 2                        cient 3D reconstruction and generation. arXiv, 2403.14621,
+[82] Jianyuan Wang, Christian Rupprecht, and David Novotny.                   2024. 7
+     PoseDiffusion: solving pose estimation via diffusion-aided          [96] Jianing Yang, Alexander Sax, Kevin J Liang, Mikael
+     bundle adjustment. In Proc. ICCV, 2023. 5                                Henaff, Hao Tang, Ang Cao, Joyce Chai, Franziska Meier,
+[83] Jianyuan Wang, Nikita Karaev, Christian Rupprecht, and                   and Matt Feiszli. Fast3r: Towards 3d reconstruction
+     David Novotny. VGGSfM: visual geometry grounded deep                     of 1000+ images in one forward pass. arXiv preprint
+     structure from motion. In Proc. CVPR, 2024. 1, 2, 3, 5, 6                arXiv:2501.13928, 2025. 2, 5
+[84] Peng Wang, Hao Tan, Sai Bi, Yinghao Xu, Fujun Luan,                 [97] Lihe Yang, Bingyi Kang, Zilong Huang, Xiaogang Xu, Ji-
+     Kalyan Sunkavalli, Wenping Wang, Zexiang Xu, and Kai                     ashi Feng, and Hengshuang Zhao. Depth anything: Un-
+     Zhang. PF-LRM: pose-free large reconstruction model for                  leashing the power of large-scale unlabeled data. In Proc.
+     joint pose and shape prediction. arXiv.cs, abs/2311.12024,               CVPR, 2024. 2
+     2023. 7                                                             [98] Yao Yao, Zixin Luo, Shiwei Li, Tian Fang, and Long
+[85] Qianqian Wang, Yifei Zhang, Aleksander Holynski,                         Quan. Mvsnet: Depth inference for unstructured multi-
+     Alexei A. Efros, and Angjoo Kanazawa. Continuous 3d                      view stereo. In ECCV, 2018. 6
+     perception model with persistent state, 2025. 2, 5                  [99] Yao Yao, Zixin Luo, Shiwei Li, Tian Fang, and Long
+[86] Ruicheng Wang, Sicheng Xu, Cassie Dai, Jianfeng Xi-                      Quan. Mvsnet: Depth inference for unstructured multi-
+     ang, Yu Deng, Xin Tong, and Jiaolong Yang. MoGe: un-                     view stereo. In Proceedings of the European conference
+     locking accurate monocular geometry estimation for open-                 on computer vision (ECCV), pages 767–783, 2018. 2
+
+
+
+
+                                                                  5305
+[100] Lior Yariv, Yoni Kasten, Dror Moran, Meirav Galun, Matan
+      Atzmon, Basri Ronen, and Yaron Lipman. Multiview neu-
+      ral surface reconstruction by disentangling geometry and
+      appearance. Advances in Neural Information Processing
+      Systems, 33:2492–2502, 2020. 2
+[101] Gokul Yenduri, Ramalingam M, Chemmalar Selvi G.,
+      Supriya Y, Gautam Srivastava, Praveen Kumar Reddy
+      Maddikunta, Deepti Raj G, Rutvij H. Jhaveri, Prabadevi
+      B, Weizheng Wang, Athanasios V. Vasilakos, and
+      Thippa Reddy Gadekallu. Generative pre-trained trans-
+      former: A comprehensive review on enabling technologies,
+      potential applications, emerging challenges, and future di-
+      rections. arXiv.cs, abs/2305.10435, 2023. 2
+[102] Kwang Moo Yi, Eduard Trulls, Vincent Lepetit, and Pascal
+      Fua. LIFT: Learned Invariant Feature Transform. In Proc.
+      ECCV, 2016. 2
+[103] Kai Zhang, Sai Bi, Hao Tan, Yuanbo Xiangli, Nanxuan
+      Zhao, Kalyan Sunkavalli, and Zexiang Xu. Gs-lrm: Large
+      reconstruction model for 3d gaussian splatting. In European
+      Conference on Computer Vision, pages 1–19. Springer,
+      2024. 7
+[104] Kai Zhang, Sai Bi, Hao Tan, Yuanbo Xiangli, Nanxuan
+      Zhao, Kalyan Sunkavalli, and Zexiang Xu. GS-LRM: large
+      reconstruction model for 3D Gaussian splatting. arXiv,
+      2404.19702, 2024. 7
+[105] Shangzhan Zhang, Jianyuan Wang, Yinghao Xu, Nan Xue,
+      Christian Rupprecht, Xiaowei Zhou, Yujun Shen, and Gor-
+      don Wetzstein. Flare: Feed-forward geometry, appear-
+      ance and camera estimation from uncalibrated sparse views,
+      2025. 2, 5
+[106] Zhe Zhang, Rui Peng, Yuxi Hu, and Ronggang Wang. Ge-
+      omvsnet: Learning multi-view stereo with geometry per-
+      ception. In CVPR, 2023. 2, 6
+[107] Xiaoming Zhao, Xingming Wu, Weihai Chen, Peter CY
+      Chen, Qingsong Xu, and Zhengguo Li. Aliked: A lighter
+      keypoint and descriptor extraction network via deformable
+      transformation. IEEE Transactions on Instrumentation and
+      Measurement, 72:1–16, 2023. 6
+[108] Tinghui Zhou, Matthew Brown, Noah Snavely, and
+      David G Lowe. Unsupervised learning of depth and ego-
+      motion from video. In Proceedings of the IEEE conference
+      on computer vision and pattern recognition, pages 1851–
+      1858, 2017. 2
+[109] Tinghui Zhou, Richard Tucker, John Flynn, Graham Fyffe,
+      and Noah Snavely.         Stereo magnification: Learning
+      view synthesis using multiplane images. arXiv preprint
+      arXiv:1805.09817, 2018. 5
+
+
+
+
+                                                                    5306
+

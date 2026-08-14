@@ -660,8 +660,27 @@ def build_model_for_eval(model_dir: str, device: str,
     return model
 
 # ========================= 数据加载 =========================
+def _compute_rgb_quality_stats(image_path: str):
+    """
+    Compute simple RGB quality metrics on the grayscale image.
+    Brightness: mean intensity in [0, 1].
+    Contrast: RMS contrast / standard deviation in [0, 1].
+    """
+    img_gray = cv2.imread(image_path, cv2.IMREAD_GRAYSCALE)
+    if img_gray is None:
+        return None
+    img_norm = img_gray.astype(np.float32) / 255.0
+    brightness = float(np.mean(img_norm))
+    contrast = float(np.sqrt(np.mean((img_norm - brightness) ** 2)))
+    return {
+        "brightness": brightness,
+        "contrast": contrast,
+    }
+
+
 def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
-                   max_images: int = None, tolerance: float = MAX_TIMESTAMP_TOLERANCE_SEC):
+                   max_images: int = None, tolerance: float = MAX_TIMESTAMP_TOLERANCE_SEC,
+                   max_rgb_brightness: float = None, max_rgb_contrast: float = None):
     rgb_dir = os.path.join(seq_root, "rgb")
     if not os.path.exists(rgb_dir):
         raise ValueError(f"RGB 目录不存在: {rgb_dir}")
@@ -671,6 +690,37 @@ def load_eval_data(seq_root: str, img_size: int = 448, use_lidar: bool = False,
                         if f.lower().endswith(img_exts)])
     if not img_paths:
         raise ValueError("未找到图像")
+
+    filtered_img_paths = []
+    rejected_quality = []
+    for img_path in img_paths:
+        quality = _compute_rgb_quality_stats(img_path)
+        if quality is None:
+            continue
+        brightness = quality["brightness"]
+        contrast = quality["contrast"]
+        if max_rgb_brightness is not None and brightness > max_rgb_brightness:
+            rejected_quality.append((img_path, brightness, contrast, "brightness"))
+            continue
+        if max_rgb_contrast is not None and contrast > max_rgb_contrast:
+            rejected_quality.append((img_path, brightness, contrast, "contrast"))
+            continue
+        filtered_img_paths.append(img_path)
+
+    if max_rgb_brightness is not None or max_rgb_contrast is not None:
+        print(
+            f"[Data][Quality] kept={len(filtered_img_paths)}/{len(img_paths)} "
+            f"max_brightness={max_rgb_brightness} max_contrast={max_rgb_contrast}"
+        )
+        if rejected_quality:
+            sample_rejects = rejected_quality[:5]
+            for img_path, brightness, contrast, reason in sample_rejects:
+                print(
+                    f"[Data][Quality] reject({reason}) {os.path.basename(img_path)} "
+                    f"brightness={brightness:.4f} contrast={contrast:.4f}"
+                )
+
+    img_paths = filtered_img_paths
     if max_images:
         img_paths = img_paths[:max_images]
     print(f"[Data] 图像: {len(img_paths)} 张")
@@ -1581,6 +1631,18 @@ def main():
     parser.add_argument("--img_size", type=int, default=448)
     parser.add_argument("--max_images", type=int, default=None)
     parser.add_argument(
+        "--max_rgb_brightness",
+        type=float,
+        default=None,
+        help="only keep RGB images whose grayscale mean brightness is <= this value in [0, 1]",
+    )
+    parser.add_argument(
+        "--max_rgb_contrast",
+        type=float,
+        default=None,
+        help="only keep RGB images whose grayscale RMS contrast is <= this value in [0, 1]",
+    )
+    parser.add_argument(
         "--tolerance",
         type=float,
         default=0.05,
@@ -1621,6 +1683,8 @@ def main():
         use_lidar=bool(args.use_lidar),
         max_images=args.max_images,
         tolerance=args.tolerance,
+        max_rgb_brightness=args.max_rgb_brightness,
+        max_rgb_contrast=args.max_rgb_contrast,
     )
 
     print("\n[3/4] 开始推理...")

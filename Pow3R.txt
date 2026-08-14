@@ -1,0 +1,820 @@
+                         This CVPR paper is the Open Access version, provided by the Computer Vision Foundation.
+                                      Except for this watermark, it is identical to the accepted version;
+                                the final published version of the proceedings is available on IEEE Xplore.
+
+
+
+
+                               Pow3R: Empowering Unconstrained 3D
+                             Reconstruction with Camera and Scene Priors
+
+                             Wonbong Jang* Philippe Weinzaepfel† Vincent Leroy†
+                                      Lourdes Agapito* Jerome Revaud†
+                                        *         †
+                                          UCL       Naver Labs Europe
+                     {ucabwja,l.agapito}@ucl.ac.uk                  firstname.lastname@naverlabs.com
+
+
+                                     DUSt3R                                              Pow3R
+                                     (RGB only)                                            (RGB,
+                                                                                         intrinsics,
+                                                                                           poses)
+
+
+
+
+Figure 1. Qualitative comparison of raw 3D reconstructions between DUSt3R and Pow3R for the image pair on the left. DUSt3R cannot
+leverage auxiliary information potentially available at test time, resulting in noisy and low-resolution estimates, whereas Pow3R allows to
+inject such priors at test time in a versatile manner, enabling new capabilities such as high-resolution processing as a direct by-product.
+
+                          Abstract                                       1. Introduction
+   We present Pow3R, a novel large 3D vision regression                  Building general models for 3D perception that can unify
+model that is highly versatile in the input modalities it ac-            different 3D vision tasks such as depth estimation, key-
+cepts. Unlike previous feed-forward models that lack any                 point matching, dense reconstruction or camera pose pre-
+mechanism to exploit known camera or scene priors at test                diction, remains a complex and exciting open challenge.
+time, Pow3R incorporates any combination of auxiliary in-                Traditional Structure from Motion (SfM) approaches such
+formation such as intrinsics, relative pose, dense or sparse             as COLMAP [59] do not apply pre-learned priors, so each
+depth, alongside input images, within a single network.                  scene must be optimized independently. On the other hand,
+Building upon the recent DUSt3R paradigm, a transformer-                 most learning-based approaches focus on specific 3D vi-
+based architecture that leverages powerful pre-training, our             sion tasks such as depth completion [26, 52], monocular
+lightweight and versatile conditioning acts as additional                and stereo depth estimation [46], pose estimation [73, 89]
+guidance for the network to predict more accurate estimates              or novel view synthesis [27, 42]. While these dedicated
+when auxiliary information is available. During training we              approaches have been successful to some extent, this trend
+feed the model with random subsets of modalities at each it-             contrasts with other domains such as natural language pro-
+eration, which enables the model to operate under different              cessing where a single model like ChatGPT [45], trained
+levels of known priors at test time. This in turn opens up new           with a vast collection of data, solves a range of different
+capabilities, such as performing inference in native image               tasks without requiring re-training. While some models like
+resolution, or point-cloud completion. Our experiments on                CroCo-v2, DINOv2 or Stable Diffusion [15, 54, 77], trained
+3D reconstruction, depth completion, multi-view depth pre-               on large image datasets, have served as learned priors for
+diction, multi-view stereo, and multi-view pose estimation               other tasks, including 3D vision ones, they are still far from
+tasks yield state-of-the-art results and confirm the effective-          multi-purpose foundation models like ChatGPT is for NLP.
+ness of Pow3R at exploiting all available information. The                  DUSt3R [75] marked a significant step forward in
+project webpage is https://europe.naverlabs.com/pow3r.                   regression-based 3D foundation models. DUSt3R performs
+
+
+
+                                                                  1071
+3D dense reconstruction from uncalibrated and unposed im-                adjustment to optimize camera locations. Recently, SfM has
+ages, solving many downstream vision tasks at once with-                 incorporated learning-based approaches leveraging neural
+out the need for fine-tuning. Its success can be attributed to           networks as components [4, 10, 35, 57, 66, 70, 74, 85], but it
+two main factors: (i) its use of a pointmap representation,              remains brittle to outliers and challenging conditions. Like-
+which provides flexibility over its output space and enables             wise, multi-view stereo (MVS) aims to reconstruct dense
+to regress camera parameters, poses and depth easily and                 3D surface through handcrafted pipelines based on trian-
+(ii) its use of a transformer architecture that exploits power-          gulation from multiple viewpoints [18, 19, 60]. Learning-
+ful pretraining combined with a vast amount of 3D training               based approaches have also been incorporated for MVS to
+data. Despite its huge success, DUSt3R [75] and its suc-                 reconstruct 3D from few images [24, 30, 44, 64, 78, 83],
+cessor MASt3R [31] are extremely limited in terms of their               and more recently by adopting the RAFT architecture [40]
+input space, i.e. they only take RGB images. Yet, in prac-               or using generic Transformers [9]. In contrast, the recent
+tice, many real-world applications do provide extra modal-               DUSt3R framework [31, 75], upon which we build our ap-
+ities such that calibrated camera intrinsics, sparse or dense            proach, departs from these methods altogether by defining
+depth from RGB-D sensors or LIDAR, etc. This raises the                  a simple and unified neural framework to 3D reconstruc-
+question of how best to exploit additional input modalities,             tion based on the paradigm of pointmap regression. The
+and whether this not just boosts performance but also en-                idea is that, ideally, learning-based MVS should be capa-
+ables new capabilities, such as obtaining the full depth from            ble of reconstructing 3D from a few images without strictly
+sparse point clouds of SfM or LiDAR.                                     requiring the availability of camera parameters.
+    In this paper, we introduce Pow3R, a new 3D feed-                    Guiding 3D. In this paper, we refer to guidance as the no-
+forward model that empowers DUSt3R with any subset of                    tion that a method can optionally take in 3D priors (typi-
+priors available at test time such as camera intrinsics, sparse          cally camera parameters or sparse depth) to help with some
+or dense depth, or relative camera poses. Each modality is               prediction task. This can take different forms in the vast lit-
+injected into the network in a lightweight fashion. To al-               erature of 3D vision works. COLMAP [60], for instance,
+low the model to operate under different conditions at test              can take camera parameters for rectifying camera views;
+time, random subsets of input modalities are fed at each                 however, it is an optimization-based method, meaning that
+training iteration. As a result, we obtain a single model that           each scene has to be processed independently. Recently,
+performs on par with DUSt3R when no prior information                    UniDepth [46] is a monocular depth and intrinsic estima-
+is available but outperforms it when it exists. Our model                tion method capable of optionally providing camera intrin-
+also gains new capabilities as a by-product: for instance,               sics as additional guide to generate depthmap, with an ar-
+the camera intrinsics input allow to process images whose                chitecture specifically handcrafted for that purpose. Also,
+principal point is far from the center, thus allowing to per-            depth completion models [68, 69, 76, 80] such as Comple-
+form extreme cropping, e.g. for performing sliding window                tionFormer [26] take sparse depth input as guidance in order
+inference. As a side contribution, our model directly out-               to inpaint the full depthmap, but are also typically capable
+puts the pointmaps of the second image in its coordinate                 of inferring depth from an image alone. Overall, however,
+system, allowing faster relative pose estimation. To sum                 there is currently no learning-based model to the best of our
+up, our contributions are:                                               knowledge that guides its output by taking any subset of
+• Pow3R is a holistic 3D geometric vision model capable of               sparse depth, camera intrinsics and camera extrinsics.
+   taking any subset (including none) of camera intrinsics,              Depth Completion. Given sparse depths and a correspond-
+   pose and depthmaps with corresponding input images.                   ing RGB image, the task is to densify depth by propa-
+• Extensive experiments demonstrate an important boost in                gating sparse measurements. CNN-based approaches were
+   performance over DUSt3R which cannot exploit priors,                  adopted by [38, 39], and [11] proposed convolutional spa-
+   yielding state-of-the-art results in three benchmarks.                tial propagation network (CSPN). Multi-branch networks,
+• By predicting the same pointmaps in two different camera               which process RGB and sparse depth separately, were used
+   coordinate systems, we can achieve more accurate rela-                in [23, 43, 48, 52, 68, 71, 79, 90]. CompletionFormer [26]
+   tive pose, orders of magnitude faster.                                leverages both CNN and ViT architectures to capture both
+                                                                         global and local features. Most methods focus only on the
+2. Related work                                                          specific depth completion task from a single image and par-
+Structure-from-Motion and MVS. SfM [12, 13, 22, 25,                      tial depth as the input, often without incorporating cam-
+59] builds 3D sparse maps by optimizing camera parame-                   era intrinsics. Using the pointmap representation, Pow3R,
+ters using only RGB images. Traditional approaches con-                  based on a ViT architecture, can complete the depth map
+sists of handcrafted pipelines to match keypoints [5, 7, 21,             from both RGB images and sparse point clouds, while tak-
+36, 55], form pixel correspondences across multiple im-                  ing relative pose or camera intrinsics as auxiliary input.
+ages, determine geometric relations, and perform bundle                  Pose Estimation from Sparse views. Learning-based ap-
+
+
+
+                                                                  1072
+                Patchify                                                                           ages as described below.
+  Image 𝑰𝟏                                                          𝑋1,1      focal 𝑓መ𝟏
+             1                ViT          Transformer    Head1,1
+Intrinsics 𝐾                                                        𝐶 1,1           ෡1
+                                                                              Depth 𝐷              Pointmaps. For each pixel (i, j) in an image I, we as-
+               (optional)   encoder         Decoder1
+ Depth 𝐷1                             𝐹1
+                                                                                                   sume there exists a corresponding single 3D point Xi,j ,
+Relative pose 𝑷𝟏,𝟐                               Cross-attention    𝑋 𝟐,1      Relative            where X ∈ RW ×H×3 is a pointmap. Given camera in-
+                                                                    𝐶 𝟐,1      pose 𝑃෠1,𝟐
+                Patchify                                                                           trinsics K and a depthmap D, we can compute Xi,j =
+  Image 𝑰𝟐
+Intrinsics 𝐾 𝟐                ViT          Transformer
+                                                          Head2,1
+                                                                                                   K −1 [iDi,j , jDi,j , Di,j ] in the camera coordinate system.
+               (optional)                   Decoder2                𝑋 𝟐,𝟐     focal fመ2
+ Depth 𝐷2
+                            encoder
+                                      𝐹2                  Head2,2
+                                                                    𝐶   𝟐,𝟐         ෡𝟐
+                                                                              Depth 𝐷
+                                                                                                   In the following, we denote as X n,m the pointmap of im-
+                                                                                                   age I n expressed in the coordinate system of camera I m .
+Figure 2. Overview of the model architecture. Following
+                                                                                                   To swap the coordinate system from camera I k to camera
+DUSt3R [75], images are encoded then decoded with a ViT back-                                                                                              −1
+                                                                                                   I m , we have X n,k = Pm,k X n,m where Pm,k = Pk Pm        .
+bone into pointmaps, from which focals, depthmaps and relative
+pose can be extracted. Pow3R introduces optional inputs to guide
+                                                                                                   3.1. Overall architecture
+the regression with prior knowledge about the camera intrinsics
+and depth (fed into the encoder) and the pose (into the decoder).                                  We follow the recently proposed DUSt3R framework [75].
+                                                                                                   DUSt3R is a breakthrough foundation model based on vi-
+proaches involve regressing relative pose, applying prob-                                          sion transformers (ViT) that can regress two 3D pointmaps
+abilistic methods, using energy-based or diffusion mod-                                            X 1,1 , X 2,1 given solely two unposed and uncalibrated input
+els [3, 33, 53, 73, 88]. RayDiffusion [89] models cam-                                             images. Nevertheless, DUSt3R’s inability to leverage po-
+era rays instead of camera parameters, applying diffusion                                          tentially available information about cameras or depth lim-
+on rays, then recovers the camera pose using DLT [2].                                              its its practical use. To remedy these drawbacks, we en-
+DUSt3R discovers camera pose from pointmaps using PnP,                                             hance the original DUSt3R network F in two ways.
+while Pow3R predicts pointmaps in both camera coordinate                                               First, we introduce specific modules to incorporate any
+frames, allowing the use of Procrustes alignment.                                                  subset of extra information such as camera intrinsics, cam-
+                                                                                                   era poses and depthmaps seamlessly into DUSt3R. Second,
+DUSt3R and its developments. DUSt3R [75] does not re-
+                                                                                                   we predict an additional pointmap X 2,2 , which represents
+quire calibrated images for 3D reconstruction, can handle
+                                                                                                   the pointmap of image I 2 in its own coordinate system. Pre-
+extreme viewpoint changes, and deals with both single and a
+                                                                                                   dicting three pointmaps offers further capabilities, namely
+few images within the same framework. Its pointmap repre-
+                                                                                                   the possibility of recovering all information about both cam-
+sentation eases the training by not having to deal with cam-
+                                                                                                   eras in a single forward pass, as explained in Sec. 3.3. We
+era parameters directly. MASt3R [31] improves DUSt3R
+                                                                                                   first describe the overall architecture, see Fig. 2, and then
+by also predicting dense local features, trained with an ad-
+                                                                                                   detail the dedicated modules to inject auxiliary information.
+ditional matching loss. Splatt3R [65] marries MASt3R with
+GS. Spann3R [72] predicts pointmaps in global coordinate                                           Encoder. We use a shared ViT encoder to encode both im-
+and adopts an external spatial memory that tracks relevant                                         ages independently. In addition to I, the encoder can re-
+3D information. MonST3R [87] further trains DUSt3R on                                              ceive auxiliary information about intrinsics K and depth D
+dynamic scenes and generates time-varying dynamic point                                            for each image. For the two input images I 1 , I 2 and their
+clouds, as well as camera intrinsics and poses from a dy-                                          respective auxiliary information Ω1 ∈ σ({K1 , D1 }), Ω2 ∈
+namic video. In this work, we take a different and comple-                                         σ({K2 , D2 }), where σ denotes the set of all subsets, the
+mentary direction and instead improve the core capabilities                                        encoder processes the information in a Siamese manner:
+of DUSt3R, which could benefit all aforementioned works.
+                                                                                                      F 1 = Encoder(I 1 , Ω1 ), F 2 = Encoder(I 2 , Ω2 ).    (1)
+3. Methodology                                                                                     Decoder. Likewise, the network has two decoders, each
+We aim to train a network F that can take two input images                                         with its corresponding head, one predicting X 1,1 and the
+I 1 , I 2 ∈ RW ×H×3 of a given static scene and any subset                                         other one estimating X 2,1 and X 2,2 . Both decoders com-
+of auxiliary information Ω ⊆ {K1 , K2 , P1,2 , D1 , D2 }, in                                       municate via cross-attention between their own tokens and
+order to regress a 3D reconstruction of the scene. Here,                                           the outputs of the previous block of the other decoder. Each
+K1 , K2 ∈ R3×3 are camera intrinsics, P1,2 ∈ R4×4                                                  decoder may receive the relative pose P12 as additional in-
+denote the relative pose between the two cameras, and                                              put or not. Assume we provide the auxiliary information
+D1 , D2 ∈ RW ×H are depthmaps with associated masks                                                ΩD ∈ σ({P12 }) at the i-th block of both decoders:
+M 1 , M 2 ∈ {0, 1}W ×H specifying pixels with valid depth
+                                                                                                         G1i = DecoderBlock1i G1i−1 , G2i−1 , ΩD ,
+                                                                                                                                                   
+data (i.e. masks are possibly sparse). The network F is
+                                                                                                         G2i = DecoderBlock2i G2i−1 , G1i−1 , ΩD ,
+                                                                                                                                                   
+tasked to regress several pointmaps from which the cam-                                                                                                     (2)
+era intrinsic and extrinsic parameters as well as the dense
+depthmaps can be straightforwardly extracted for both im-                                          After B decoder blocks in each branch, the head regresses
+
+
+
+                                                                                            1073
+several pointmaps and their associated confidence map:                       Image        Patch       Image
+                                                                                                                         SA      +   +       +             MLP       +
+                                                                            patches      embed        tokens
+
+                      X 1,1 , C 1,1 = Head1 G1B ,
+                                                
+                                                                              Ray         Patch        Ray              Rays
+       X 2,1 , X 2,2 , C 2,1 , C 2,2 = Head2 G2B .
+                                                
+                                                       (3)                  patches      embed        tokens            MLP
+
+                                                                             Depth        Patch       Depth             Depth
+                                                                            patches      embed        tokens             MLP
+Unlike DUSt3R which uses a DPT head [50], here we em-                                                                                Encoder block
+ploy a linear head for both Head1 and Head2 as it is more
+efficient and performs similarly.                                           Image
+                                                                                                  U            SA   +           CA       +       +          MLP      +
+                                                                            tokens
+3D Regression Loss. Following DUSt3R, we supervise the                      CLS token
+
+model to minimize the distance between ground-truth and                     Tokens from the
+                                                                              other image                                                            (adding only
+predicted pointmaps in a scale-invariant manner, allowing                   Relative      Pose             Pose          pose                        to CLS token)
+                                                                                                           token
+the model to train on multiple datasets with various scales.                 pose        embed                           MLP
+                                                                                                                                     Decoder block
+The regression loss between predicted and ground-truth                   Figure 3. Architecture for injecting auxiliary modalities. Top:
+pointmaps (resp. X n,m and X̂ n,m ) at pixel (i, j) is defined           injection of optional intrinsics and depth into the encoder. Intrin-
+as Lregr                  n,m          n,m
+      i,j (n, m) = ∥Xi,j /zm − X̂i,j /ẑm ∥, where zm , ẑm              sics are encoded into ray patches, sparse depth is patchified. Each
+serve as scale normalizer. That is, zm is the average norm of            of these modalities goes into a block-specific MLP and are token-
+all valid 3D points expressed in coordinate system of image              wise added in the middle of the transformer block. Bottom: injec-
+I m , i.e. z1 = norm(X 1,1 ∪ X 2,1 ), z2 = norm(X 2,2 ) and              tion of optional relative pose into the decoder. The relative pose is
+likewise for ẑ1 , ẑ2 , with norm(X) = mean({∥Xi,j ∥ |i, j ∈            fed to a first embedding layer followed by an MLP. This token is
+DX }) and DX the set of valid pixels.                                    added to the CLS token of the decoder after the self-attention (SA)
+                                                                         and cross-attention (CA), but before the MLP. Experiments show
+Confidence-aware loss. The model jointly learns to pre-                  that injection in the first block only suffices.
+                                n,m
+dict a confidence level Ci,j        of each pixel (i, j). The
+confidence-aware regression loss for a given pointmap                    Sec. 4.5. We now describe how to compute the initial em-
+X n,m can be expressed as the 3D regression loss Lregr                   beddings for each specific modality.
+weighted by the confidence map:
+                                                                         Intrinsics. Following [89], we generate camera rays from
+                     X n,m regr                       n,m                the intrinsic matrix K ∈ R3×3 , thereby establishing a direct
+  Lconf (n, m) =           Ci,j Li,j (n, m) − α log Ci,j  , (4)
+                                                                         correspondence between RGB pixels and rays. The ray at
+                 i,j∈D
+                                                                         pixel location (i, j) is computed as K −1 [i, j, 1] and encodes
+with α = 0.2. This loss penalizes the model less when the                the viewing direction of that pixel w.r.t. the current camera
+prediction is not accurate on harder areas, encouraging the              pose. This allows us to potentially process non-centered
+model to extrapolate. The final loss is expressed as                     crops and hence to perform inference in higher image reso-
+                                                                         lutions, see Sec. 3.3. Similarly to RGB inputs, we patchify
+       L = Lconf (1, 1) + Lconf (2, 1) + βLconf (2, 2),    (5)           and embed dense rays and provide them to the encoder.
+                                                                         Depthmaps / Point Clouds. Given a depthmap D and its
+where β is a hyper-parameter typically set to β = 1.                     sparsity mask M , we first normalize D′ = D/norm(D)
+3.2. Adding Versatile Conditioning                                       to handle any depth ranges at train and test time. As for
+                                                                         RGB and rays, we patchify the stacked maps [D′ , M ] ∈
+The knowledge of auxiliary information can significantly                 RW ×H×2 and compute patch embeddings, which are then
+enhance 3D predictions at test time. Our model leverages                 fed to the encoder. By jointly patchifying the depth and its
+up to five different modalities, which include two intrinsics            valid mask we can handle any level of sparsity.
+K1 , K2 , two depthmaps D1 , D2 for each image and the rel-
+                                                                         Camera Pose. Given the relative pose P12 = [R12 |t12 ],
+ative pose P12 . To condition the output on it, we first embed
+                                                                         we normalize the translation scale as t′12 = t12 /∥t12 ∥ since
+the auxiliary information using dedicated MLPs and then
+                                                                         our output is unscaled. Unlike depthmaps or camera intrin-
+inject these embeddings at different points in the pipeline.
+                                                                         sics, the camera pose cannot be expressed as a dense pixel
+   We discuss different options in this regard. In the first
+                                                                         map. Rather, camera pose affects the whole pixels between
+strategy, denoted as ‘embed’, we simply add the auxiliary
+                                                                         two images, so the embedding is instead added to the global
+embeddings to the token embeddings before the first trans-
+                                                                         CLS token of both decoders.
+former block, as would be done for standard positional em-
+beddings [16]. In the second strategy, denoted as ‘inject-n’,            3.3. Downstream Tasks
+we instead insert dedicated MLPs for each modality in a
+subset of n transformer blocks, as shown in Fig. 3. Our ex-              Depthmaps. In the pointmap representation, the z-axis of
+periments show that ‘inject-1’ performs slightly better than             X 1,1 , X 2,2 directly corresponds to the depthmaps of the
+‘embed’ and similarly with ‘inject-n’, where n > 1, see                  first and second image, respectively. Note that DUSt3R
+
+
+
+                                                                  1074
+                                                     DUSt3R baseline
+                                 crop   downscale
+  512 pixels
+
+
+
+
+                                          Pow3R
+
+                         512 pixels                   Pow3R (native resolution, sliding window)
+Figure 4. Native resolution example. Methods like DUSt3R require centered principal point and would thus downscale the image to its
+training resolution, leading to blurry prediction (top). With camera intrinsics input, we can process any crop in the image leading to native
+resolution prediction (bottom row), for example by dividing the image into 4 crops, that are independently process as the first input image,
+while the second input image of the network is set to the downscaled image.
+
+
+only outputs X 1,1 , hence it requires two forward passes of                  dinate system, we resort to the global alignment algorithm
+the pairs (I 1 , I 2 ) and (I 2 , I 1 ) to extract both depthmaps.            from DUSt3R [75] that minimizes a global energy function
+High-resolution processing. A limitation of DUSt3R is                         to find per-camera intrinsics, depthmaps and poses that are
+that it is trained for a specific resolution and does not gener-              consistent with all the pairwise predictions. Results of the
+alize to larger resolutions. A simple fix would be to include                 optimization are global scene point-clouds, which can for
+higher resolutions during training, but (i) many datasets do                  instance serve for multi-view stereo estimation.
+not provide high-resolution ground-truths, and (ii) the train-
+ing cost could become prohibitive. Pow3R, in contrast, can                    3.4. Training Procedure
+handle crops natively given camera intrinsics of the crop,                    During training, we feed the network with annotated im-
+as these provide the crop position information (i.e. via focal                age associated with random subsets of auxiliary informa-
+length and principal point). We can thus perform prediction                   tion, the goal being for it to learn to handle any situation at
+in a sliding window fashion, yielding predictions matching                    test time. For each pair, we first chose a random number m
+any target resolution by simple stitching. Comparison be-                     of modalities with uniform probability, and then randomly
+tween standard and higher resolution processing are shown                     select the m modalities likewise. Depthmaps are randomly
+in Fig. 4. Note that prediction for each crop may have a dif-                 sparsified. When giving intrinsics, we also perform aggres-
+ferent scale, by design, and cannot be stitched directly. We                  sive non-centered cropping with 50% probability, so that the
+find that simply computing the median scale factor in over-                   network learns to perform high-resolution inference.
+lapping areas is sufficient, and we blend the overlapping re-                 Training data and recipe. We follow the training recipe
+gions based on confidence without further post-processing.                    from DUSt3R [75] in terms of training data and protocol.
+Focal Estimation. Similar to DUSt3R, we can recover fo-                       Namely, we use the provided pairs for 8 datasets: Habi-
+cals for both input images from pointmap X 1,1 and X 2,2                      tat [58], MegaDepth [32], ARKitScenes [6], Static Scenes
+with the robust Weiszfeld fast iterative solver [47]. Simi-                   3D [41], BlendedMVS [82], ScanNet++ [84], Co3D-
+lar to depthmap prediction, DUSt3R needs to infer (I2 , I1 )                  v2 [51] and Waymo [67], resulting in a total of 8.5M image
+in order to compute the focal of the second image, while                      pairs. These datasets include indoor and outdoor scenes,
+Pow3R predicts them in a single pass.                                         as well as real and synthetic ones. To train the model, we
+Relative Pose Estimation. Pow3R predicts the relative                         follow [75] and first train the network with a resolution of
+pose directly by Procrustes alignment [8, 37] to get the                      224px for 3 days on 8 A100 GPUs, and then finetune it in
+scaled relative pose P ∗ = [R∗ |t∗ ] between X 2,2 and X 2,1 ,                512px with variable aspect-ratio for 2 more days.
+as it predicts the pointmaps of the second image in two dif-
+ferent camera coordinates.
+                                                                              4. Experimental Evaluation
+     ∗         ∗
+                 X q 2,2 2,1      2,2      2,1 2
+ R , t = arg min    Ci,j Ci,j σ(RXi,j +t)−Xi,j   . (6)                        We first study the impact of auxiliary information guidance
+                   σ,R,t
+                           i,j
+                                                                              (Sec. 4.1). We then experiment across many 3D vision tasks
+ Procrustes alignment is known to be sensitive to noise                       (Secs. 4.2 to 4.4) without retraining, i.e. mostly zero-shot
+and outliers; however, in our case, it performs similar to                    settings. We finally present some ablations in Sec. 4.5.
+RANSAC [17] with PnP [22, 29], while being an order of                        DUSt3R baseline. We point out that our overall training
+magnitude faster (see Sec. 4.4).                                              data, protocols and architecture are exactly the same as
+Global alignment. The network F predicts pointmaps for                        DUSt3R, except for the additional head that predict X 2,2
+image pairs. To align all predictions in the same world coor-                 (+0.1% parameters) and for the modules used for injecting
+
+
+
+                                                                       1075
+           aux. modalities       focal          depth          rel. pose                                  130                                                                    LRRU
+          K1 K2 D1 D2 RT      acc@1.015       τ @1.03      RRA@2◦     RTA@2◦                                                                                                     TPVF
+                                                                                                          120                                                                    BPNet
+ DUSt3R   × × × × ×           36.6           77.6          69.2          49.7                                                                                                    CompletionFormer
+
+
+
+
+                                                                                              RMSE (mm)
+          ×   ×   ×   ×   ×   39.4           79.4          71.9          53.8                             110                                                                    NLSPN
+                                                                                                                                                                                 GuideNet
+          ✓   ×   ×   ×   ×   75.4 (+36.0)   80.6 (+1.2)   77.1 (+5.3)   62.8 (+8.9)                      100                                                                    Pow3R
+          ×   ✓   ×   ×   ×   67.3 (+27.9)   80.3 (+0.9)   74.5 (+2.6)   59.1 (+5.2)
+          ✓   ✓   ×   ×   ×   98.0 (+58.6)   81.4 (+2.0)   80.3 (+8.5)   74.2(+20.3)                      90
+          ×   ×   ✓   ×   ×   48.9 (+9.5)    89.1 (+9.7)   82.5(+10.6)   64.9(+11.0)
+          ×   ×   ×   ✓   ×   49.5 (+10.1)   91.0(+11.7)   83.4(+11.5)   64.8(+10.9)
+                                                                                                          80
+ Pow3R
+          ×   ×   ✓   ✓   ×   58.2 (+18.9)   95.4(+16.0)   89.6(+17.7)   77.6(+23.8)                       0.0%   0.2%          0.4%            0.6%               0.8%          1.0%           1.2%
+          ×   ×   ×   ×   ✓   48.6 (+9.2)    81.6 (+2.2)   92.3(+20.5)   77.0(+23.1)                                                         sparsity (%)
+          ✓   ✓   ✓   ✓   ×   99.2 (+59.8)   95.4(+16.0)   95.7(+23.9)   94.3(+40.5)           Figure 5. Depth completion performance on NYUd for various
+          ✓   ✓   ×   ×   ✓   98.1 (+58.7)   82.9 (+3.6)   95.1(+23.2)   87.3(+33.5)
+          ×   ×   ✓   ✓   ✓   68.6 (+29.2)   95.4(+16.0)   98.1(+26.2)   91.3(+37.5)           input depth sparsity.
+          ✓   ✓   ✓   ✓   ✓   99.3 (+59.9)   95.4(+16.0)   99.0(+27.2)   98.1(+44.3)
+
+Table 1. Impact of guiding at test time for models trained                                                          aux. mod.     High-            KITTI                     T&T            Time
+at 224×224 resolution. We report performances on Habitat for                                                        Ks RT          Res.         rel↓        τ↑            rel↓     τ↑       (sec)↓
+DUSt3R, which cannot handle auxiliary modalities, and our sin-                                        DUSt3R512     ×    ×             ×        5.4         49.5          3.3      75.1      0.13
+gle model with different sets of modalities; we show in green the                                     Pow3R512      ✓    ✓              ×       5.3         48.7          3.2      78.2      0.13
+absolute improvement w.r.t. the results without auxiliary modality.                                   Pow3R512      ✓    ✓             (n)      7.5         34.4          3.9      68.0      0.48
+                                                                                                      Pow3R512      ✓    ✓             ✓        4.6         53.5          2.5      82.3      0.40
+the auxiliary information (+4% parameters for the inject-1                                     Table 2. Multi-view depth estimation results in high-resolution
+variant that we use unless stated otherwise).                                                  using a sliding-window scheme and providing the crop intrinsics
+Metrics. When evaluating focal lengths, we report the ac-                                      to Pow3R. (n): naively inputting high-resolution images without
+curacy for a tight relative error threshold of 1.5%. For evalu-                                downsampling to Pow3R.
+ating depthmap, we report the Absolute Relative Error (rel)
+and the Inlier Ratio (τ ) at a threshold of 3%. When eval-                                     handling any combination of priors in a unified fashion. We
+uating poses, we opt for scale-invariant metrics and mea-                                      are not aware of any other approach that can seamlessly in-
+sure the relative rotation and translation accuracies (RRA                                     tegrate all these priors in a learning-based method.
+and RTA resp.) of the relative pose at task-specific thresh-                                   Depth completion. We also evaluate Pow3R on the depth
+olds, and the mean Average Accuracy (mAA), defined as                                          completion task given RGB images with sparse depthmaps.
+the area under the curve accuracy of the angular differences                                   We vary the sparsity (the ratio of pixels with known depth)
+at min(RRA, RTA).                                                                              and demonstrate its impact on the NYUv2 dataset [63] in
+                                                                                               Figure 5. Although Pow3R is not trained on the NYUv2
+4.1. Guiding the output prediction                                                             dataset, it still achieves state-of-the-art results for sparse
+Impact of guidance. We first study the impact of provid-                                       depth completion. Our analysis indicates that the true per-
+ing different subsets of auxiliary information in terms of                                     formance of Pow3R on NYUv2 is likely underestimated due
+downstream 3D vision performance. Namely, we report ac-                                        to numerous errors in the ground-truth depth annotations;
+curacies in Tab. 1 for focal, depth, and rotation prediction                                   further details are available in the supplementary material.
+on the Habitat validation dataset. In the supplementary ma-                                    On the KITTI [20] dataset, we obtain a mean absolute error
+terial, we also provide results on the Infinigen dataset [49],                                 below 30cm, which is competitive with the state of the art,
+which is not included in our training set, and observe similar                                 considering that KITTI is not included in the training set.
+outcomes. We first note that in the absence of modalities,                                     High-Resolution processing. With the possibility of spec-
+Pow3R performs slightly better than a DUSt3R baseline,                                         ifying camera intrinsics, new capabilities arise. Namely,
+even though Pow3R is trained with just RGB images during                                       Pow3R can perform high-resolution pointmap regression
+a fraction of its training. This shows that Pow3R does not                                     with a simple sliding-window approach. We process fixed-
+lose its native strength for unconstrained regression despite                                  resolution crops of the original images under the guidance
+having gained more capabilities.                                                               of both (i) the crop information, provided in term of cam-
+    Interestingly, we observe in Tab. 1 the impact of each                                     era intrinsics, and (ii) a second image, itself possibly down-
+modality for each prediction task, and the synergetic ef-                                      scaled or cropped as well. More details are provided in
+fects of interacting modalities. For instance, the model                                       Sec. 3.3 and Fig. 4. When applied, results significantly im-
+performs better for focal length estimation with depthmaps                                     prove compared to processing the images at 512-pixel res-
+and/or relative pose, and Pow3R’s depth prediction im-                                         olution, as shown in Tab. 2. We also compare with a naive
+proves with intrinsics and/or relative pose. Moreover, rel-                                    baseline where we simply feed high-resolution images di-
+ative pose prediction becomes more accurate with intrinsics                                    rectly to Pow3R, but it dramatically fails.
+and/or depthmap. Overall, the model’s performance consis-                                      Camera controllability. We study how controllable are the
+tently improves when provided with additional camera or                                        regression outputs on 10K Habitat test pairs given arbitrary
+scene priors, demonstrating the effectiveness of Pow3Rin                                       camera parameters. For each test pair with ground-truth fo-
+
+
+
+                                                                                       1076
+                          4                                                               16                                                                             GT                Co3Dv2                          Speed
+                                    identity                                                                                   Conf1              Method
+                                                                                                                                                                                                           RealEstate10K
+                          3         Median focal ratio                                    14                                   Conf2
+                        2.5                                                                                                                                           intrinsics   RRA@15 RTA@15 mAA(30)    mAA(30)        (fps)
+                          2         25-75 percentiles                                     12
+
+
+
+
+                                                                         avg confidence
+pred. focal ratio
+
+
+
+
+                                    10-90 percentiles                                                                                              Colmap+SG [56]        ✓          36.1    27.3    25.3       45.2          -
+                        1.5                                                               10
+                        1.2                                                                                                                        PixSfM [34]           ✓          33.7    32.9    30.1       49.4          -
+                          1                                                                8                                                       RelPose [88]          ×          57.1     -       -          -            -
+                        0.8                                                                                                                    (a) PoseDiff [73]         ×          80.5    79.8    66.5       48.0          -
+                                                                                           6
+                        0.5                                                                                                                        RelPose++ [33]        ×          85.5     -       -          -            -
+                                                                                           4                                                       RayDiff [89]          ×          93.3     -       -          -            -
+                        0.3                                                                2                                                      DUSt3R (PnP) [75]      ×          94.3    88.4    77.2       61.7         3.2
+                              0.3     0.5      0.8 1 1.21.5 2 2.5 3 4                          0.3   0.5      0.8 1 1.21.5 2 2.5 3 4
+                                            input focal ratio                                              input focal ratio                   (b) Pow3R (PnP)           ×          94.8    89.9    78.5       62.5        3.2
+                                                                                                                                                   Pow3R (Pro)           ×          94.6    90.3    78.1       66.3        30.9
+                        40
+                        35                     identity                                                                        Conf1               Pow3R w/ K (Pro)      ✓          95.0    92.1    82.2       72.5        30.1
+                                               Median pose error (deg)                    12                                   Conf2
+                        30                     25-75 percentiles                                                                              Table 5. Multiview pose estimation on the CO3Dv2 and
+pred. rot angle (deg)
+
+
+
+
+                                                                         avg confidence
+                        25                     10-90 percentiles                                                                              RealEstate10K. (a) denotes multiview methods, while (b) denotes
+                                                                                          10
+                        20                                                                                                                    pairwise methods. Pow3R with Procrustes alignment (Pro) per-
+                        15                                                                 8
+                                                                                                                                              forms better than DUSt3R (PnP) and other multi-view based pose
+                        10
+                         5                                                                 6                                                  estimation approaches, and even more so with known intrinsics,
+                         0                                                                                                                    while being much faster. RealEstate10K is not in the training set.
+                              40         20       0        20     40                            40     20       0        20     40
+                                       input rot-y angle (deg)                                       input rot-y angle (deg)
+Figure 6. Controllability study. We study how the model reacts
+when presented with false focal (top) and false relative pose (bot-                                                                           for Pow3R-512). However, it is clear that providing aux-
+tom). We plot the input vs. predicted camera parameters in the                                                                                iliary information consistently improves the depth esti-
+left column and the average confidence in the right column. Inter-                                                                            mates. In fact, Pow3R-512 with both pose and intrinsics
+estingly, the model seems to not take the input information at face                                                                           achieves state-of-the-art performance on the ETH3D, DTU,
+value and instead makes an informed decision whether to use it or                                                                             and Tanks and Temples datasets, as well as on average
+not, in which latter case the confidence becomes low.                                                                                         across datasets. Interestingly, intrinsics tend to improve
+                                                                                                                                              performance more than the GT pose, which alone seems to
+cal f and relative pose P12 , we purposefully input a wrong                                                                                   have a negligible impact. This might be due to the fact that
+focal (resp. relative pose) and measure the output focal fˆ                                                                                   camera pose primarily helps the prediction of X 2,1 , while
+(resp. pose P̂12 ) as predicted from the raw pointmaps. Re-                                                                                   the depthmap of this task is obtained from the z axis of X 1,1
+sults are presented in Fig. 6 in terms of focal ratio fˆ/f and                                                                                alone. Still, we observe a clear synergy in providing jointly
+angle dgeodesic (P12 , P̂12 ). Interestingly, the model accepts to                                                                            intrinsics and relative pose.
+follow the guidance whenever it is close to the ground truth
+value (i.e. staying close to the identity transformation) but
+                                                                                                                                              4.3. Multi-View Stereo
+then refuses to follow it when it gets too different, showing
+that the model is able to somehow ‘judge’ of the guidance’s                                                                                   We evaluate the quality of global 3D reconstructions on the
+worth. In all cases, the output confidence clearly correlates                                                                                 DTU [1] benchmark in the presence and absence of aux-
+with the agreement between the guidance and the ground                                                                                        iliary information. For each subset of available informa-
+truth. Overall, the model is thus not taking the auxiliary                                                                                    tion from {(K1 , K2 ), P12 }, we extract pairwise predictions
+information at face value, and instead combines it with the                                                                                   from image pairs and align them in a global coordinate sys-
+other modalities (e.g. RGB) it in a more subtle and informed                                                                                  tem, as described in Sec 3.3. Performance is evaluated in
+way than what could be achieved with handcrafted meth-                                                                                        terms of accuracy, which is the smallest Euclidean distance
+ods. This suggests that Pow3R would be robust to noise in                                                                                     to the ground-truth, and completeness as the smallest dis-
+the auxiliary information.                                                                                                                    tance to the reconstructed shape, with the overall average.
+
+4.2. Multi-View Depth Estimation                                                                                                              Results are presented in Tab. 4. We first attempt at repro-
+                                                                                                                                              ducing the original DUSt3R results using the official code-
+Following RobustMVD [62], performances are measured                                                                                           base and obtain slightly worse results than reported in [75].
+on the KITTI [20], ScanNet [14], ETH3D [61], DTU [1],                                                                                         Using the same codebase, Pow3R with RGB only is able to
+and Tanks and Temples [28] datasets. We report in Tab. 3                                                                                      improve over these and match the original results. Interest-
+the Absolute Relative Error (rel) and Inlier Ratio (τ ) for                                                                                   ingly, adding ground-truth intrinsics results in a significant
+each dataset when using (1) images alone, (2) images with                                                                                     boost (19% rel. improvement), but adding the camera poses
+relative poses, (3) images with camera intrinsics, and (4)                                                                                    instead slightly degrades the results (-4%). However, us-
+images with both modalities, and provide results for more                                                                                     ing both intrinsics and pose results in a major improvement
+state-of-the-art methods in the supplementary material.                                                                                       (36% rel. improvement), demonstrating a synergetic effect
+Results. Pow3R again performs roughly on par with                                                                                             between both modalities. We hypothesize that the pose is
+DUSt3R in the absence of auxiliary information (e.g. 3.73                                                                                     of little value for easy cases like DTU, and that it does not
+average error across all datasets for DUSt3R-512 vs. 3.64                                                                                     help the model to properly resolve the focals.
+
+
+
+                                                                                                                                       1077
+                            GT       KITTI        ScanNet          ETH3D          DTU             T&T         Average
+ Method                                                                                                                           Method                             Acc.↓       Comp.↓     Overall↓
+                           range   rel↓ τ ↑      rel↓   τ↑        rel↓ τ ↑      rel↓ τ ↑       rel↓ τ ↑      rel↓ τ ↑
+                                                                                                                                                 †
+ COLMAP [59, 60] (K+RT)      ×     12.0   58.2   14.6     34.2    16.4   55.1     0.7 96.5      2.7   95.0    9.3     67.8        DUSt3R [75]                        2.677       0.805       1.741
+ COLMAP Dense [59, 60] (K+RT) ×    26.9   52.7   38.0     22.5    89.8   23.2   20.8 69.3      25.7   76.4   40.2     48.8        DUSt3R (repr.)                     2.191       1.598       1.894
+ MVSNet [81] (K+RT)          ✓     18.6   30.7   22.7     20.9    21.6   35.6   (1.8) (86.7)    6.5   74.6   14.2     49.7        Pow3R                              2.116       1.370       1.743
+ Vis-MVSNet [86] (K+RT)      ✓      9.5   55.4    8.9     33.5    10.8   43.3   (1.8) (87.4)    4.1   87.2    7.0     61.4        Pow3Rw/ K                          1.722       1.119       1.420
+ MVS-Former++ [9] (K+RT)     ✓     29.2   15.2   15.2     21.9    21.4   32.5   (1.2)( 91.9)    7.6   71.5   14.9     46.6
+ CER-MVS [40] (K+RT)         ×     14.3   32.2   21.1     24.3    11.7   47.5     4.1 71.3      6.4   82.1   11.5     51.5
+                                                                                                                                  Pow3Rw/ Rt                         2.205       1.429       1.817
+                                                                                                                                  Pow3Rw/ K+RT                       1.384       0.846       1.115
+ DUSt3R [75]                 ×      5.4   49.5   (3.1)   (71.8)    3.0   76.0    3.9   68.6     3.3   75.1    3.7     68.2
+ Pow3R                       ×      5.7   45.7   (3.2)   (68.8)    3.0   74.7    3.0    Table 4. MVS results with the accuracy, com-
+                                                                                       74.3     3.3   76.6    3.6     68.0
+ Pow3R w/ RT                 ×      5.7   45.8   (3.2)   (69.7)    2.9   75.6    3.3   71.6     3.2   77.9    3.7     68.1
+ Pow3R w/ K                  ×      5.3   48.3   (3.1)   (70.8)    2.9   76.0    1.6    pleteness and their average (in mm) on the
+                                                                                       89.9     3.2   77.3    3.2     72.5
+ Pow3R w/ K+RT               ×      5.3   48.7   (3.1)   (71.4)    2.8   77.1    1.5    DTU dataset. DUSt3R† means results from
+                                                                                       91.1     3.2   78.2    3.2     73.3
+
+Table 3. Multi-view depth evaluation: Pow3R with both pose and intrinsics performs the original paper, and ‘repr.’ means repro-
+better than DUSt3R. More comparisons with the state of the art can be found in the sup- duced with the official public codebase and
+plementary material. (Parentheses) denote training on data from the same domain.        checkpoint.
+
+
+4.4. Multi-View Pose estimation                                                                   Method
+                                                                                                              with
+                                                                                                              X 2,2
+                                                                                                                         Single
+                                                                                                                        Forward
+                                                                                                                                         Focal
+                                                                                                                                    acc@1.015
+                                                                                                                                                        Depth
+                                                                                                                                                       τ @1.03
+                                                                                                                                                                        RRA@2
+                                                                                                                                                                      (Pro) (PnP)
+                                                                                                                                                                                       RTA@2
+                                                                                                                                                                                     (Pro) (PnP)
+                                                                                                                                                                                                   Avg.
+
+We then evaluate Pow3R for the task of multi-view pose                                            DUSt3R       ×             ×           36.8               85.4      69.2 72.4       49.8 57.3    60.5
+                                                                                                               ✓             ×           38.9               79.1      71.7 74.4       52.9 59.2    62.7
+prediction on the Co3Dv2 [51] and RealEstate10K [91]                                              DUSt3R-ft
+                                                                                                               ✓             ✓           38.3               78.5      73.1 74.4       56.3 59.2    63.3
+datasets. Co3Dv2 comprises over 37,000 videos across                                                           ×             ×           66.0               85.7      81.9 83.8       68.6 73.3    76.5
+MS-COCO 51 categories with ground-truth camera de-                                                Pow3R        ✓             ×           67.2               86.1      82.9 84.7       70.0 74.6    77.6
+                                                                                                               ✓             ✓           64.8               85.0      84.2 84.7       73.0 74.6    77.7
+rived from running COLMAP on 200 frames per video.
+                                                                                                Table 6. Impact of regressing X 2,2 . Metrics (in %) on Habi-
+RealEstate10k contains 80,000 YouTube video clips, con-
+                                                                                                tat are averaged over all combinations of input modalities. The
+taining indoor/outdoor scenes, with camera poses obtained                                       ‘with X 2,2 ’ column denotes methods trained to predict it. ‘Single
+via SLAM followed by Bundle Adjustment. For Co3Dv2,                                             forward’ denotes evaluations of models based on X 2,2 prediction,
+we follow the protocol of [73] and for RealEstate10K, we                                        i.e., in a single forward pass, instead of forwarding image pairs and
+use its test set of 1,800 videos. For each sequence, we ran-                                    their swapped versions. The top part shows the original DUSt3R,
+domly select 10 frames and feed 45 pairs to Pow3R. We                                           or finetune (-ft) with X 2,2 prediction.
+report the results in terms of RRA, RTA and mAA in Tab. 5.
+Results. Pow3R predicts X 2,2 , allowing to estimate the                                          Arch.
+                                                                                                               Extra             Focal            Depth              RRA@2            RTA@2
+                                                                                                                                                                                                   Avg.
+                                                                                                              Params         acc@1.015           τ @1.03           (Pro) (PnP)      (Pro) (PnP)
+relative pose between 2 images in a single forward using
+                                                                                                  Embed        16.0M             64.7                84.7          84.1 84.5        72.8 73.8      77.4
+Procrustes Alignment (see Sec. 3.3). In contrast, DUSt3R                                          Inject1      22.6M             64.8                85.0          84.2 84.7        73.0 74.6      77.7
+does not output X 2,2 and relies on PnP to obtain camera                                          Inject4      42.3M             65.9                85.1          84.8 85.2        73.7 75.4      78.3
+poses. Pow3R with PnP achieves slightly better results than                                     Table 7. Architecture ablation. Results (in %), on Habitat, are
+DUSt3R with PnP. Using Procrustes alignment yields sim-                                         averaged over all combinations of input modalities. We compare
+ilar results, while being orders of magnitude faster than                                       the injection architecture for different number of blocks with the
+RANSAC, with a roughly 10× speed-up overall when com-                                           ‘embed’ architecture in which the extra signals are added before
+bining inference and pose estimation times. Finally, perfor-                                    the transformer blocks. ‘Inject1’ offers a good compromise be-
+mance improves even further with known intrinsics, signif-                                      tween performance and number of extra parameters.
+icantly outperforming all the state of the art.
+                                                                                                iary information in Tab. 7. To incorporate additional priors,
+4.5. Architecture ablation
+                                                                                                Pow3R injects those embeddings into the first block of the
+We evaluate the impact of adding the X 2,2 prediction in                                        encoder or decoder, see Fig. 3. We compare this approach
+Tab. 6. For these ablations, models are trained on a subset of                                  to another design choice, where the model embeds them be-
+Habitat and tested on focal, depth, and relative pose predic-                                   fore going through attention blocks. We have also tried to
+tion, with results averaged over all combinations of auxil-                                     perform injection in more than one block, without signifi-
+iary modalities. DUSt3R serves as a baseline, and DUSt3R-                                       cant improvement while the computational cost increases.
+ft is finetuned with an additional X 2,2 head. This output
+can be used at test time to directly predict focals or rela-                                    5. Conclusion
+tive poses, within a single forward pass, instead of having
+to forward both the original pair and its swapped version.                                      We have presented Pow3R, a novel approach to guide large
+We also report the performance, with and without predict-                                       3D vision models, e.g. DUSt3R, with camera and scene pri-
+ing X 2,2 and/or using it. In all cases, predicting X 2,2 leads                                 ors in an implicit manner. Not only does it results in consis-
+to slightly better performance while evaluations can be per-                                    tent gains whenever auxiliary information is available, but
+formed in a single forward pass.                                                                it also unlocks new capabilities such as high-resolution pro-
+    We also explore different ways of conditioning auxil-                                       cessing and sparse-to-dense depth completion.
+
+
+
+                                                                                        1078
+References                                                                       worth 16x16 words: Transformers for image recognition at
+                                                                                 scale. In ICLR, 2021. 4
+ [1] Henrik Aanæs, Rasmus Ramsbøl Jensen, George Vogiatzis,
+                                                                            [17] Martin A. Fischler and Robert C. Bolles. Random sample
+     Engin Tola, and Anders Bjorholm Dahl. Large-scale data for
+                                                                                 consensus: a paradigm for model fitting with applications to
+     multiple-view stereopsis. IJCV, 2016. 7
+                                                                                 image analysis and automated cartography. Communications
+ [2] Yousset I Abdel-Aziz, Hauck Michael Karara, and Michael                     of the ACM, 1981. 5
+     Hauck. Direct linear transformation from comparator co-
+                                                                            [18] Yasutaka Furukawa, Carlos Hernández, et al. Multi-view
+     ordinates into object space coordinates in close range pho-
+                                                                                 stereo: A tutorial. Foundations and Trends® in Computer
+     togrammetry. Photogrammetric engineering & remote sens-
+                                                                                 Graphics and Vision, 2015. 2
+     ing, 2015. 3
+                                                                            [19] Silvano Galliani, Katrin Lasinger, and Konrad Schindler.
+ [3] Vassileios Balntas, Karel Lenc, Andrea Vedaldi, and Krys-
+                                                                                 Massively parallel multiview stereopsis by surface normal
+     tian Mikolajczyk. Hpatches: A benchmark and evaluation of
+                                                                                 diffusion. In ICCV, 2015. 2
+     handcrafted and learned local descriptors. In CVPR, 2017. 3
+                                                                            [20] Andreas Geiger, Philip Lenz, Christoph Stiller, and Raquel
+ [4] Daniel Barath, Dmytro Mishkin, Luca Cavalli, Paul-Edouard
+                                                                                 Urtasun. Vision meets robotics: The kitti dataset. IJRR,
+     Sarlin, Petr Hruby, and Marc Pollefeys.           Affineglue:
+                                                                                 2013. 6, 7
+     Joint matching and robust estimation.         arXiv preprint
+     arXiv:2307.15381, 2023. 2                                              [21] Chris Harris, Mike Stephens, et al. A combined corner and
+                                                                                 edge detector. In Alvey vision conference, 1988. 2
+ [5] Axel Barroso-Laguna, Edgar Riba, Daniel Ponsa, and Krys-
+     tian Mikolajczyk. Key. net: Keypoint detection by hand-                [22] Richard Hartley and Andrew Zisserman. Multiple view ge-
+     crafted and learned cnn filters. In ICCV, 2019. 2                           ometry in computer vision. Cambridge university press,
+                                                                                 2003. 2, 5
+ [6] Gilad Baruch, Zhuoyuan Chen, Afshin Dehghan, Tal Dimry,
+     Yuri Feigin, Peter Fu, Thomas Gebauer, Brandon Joffe,                  [23] Mu Hu, Shuling Wang, Bin Li, Shiyu Ning, Li Fan, and
+     Daniel Kurz, Arik Schwartz, et al. Arkitscenes: A diverse                   Xiaojin Gong. Penet: Towards precise and efficient image
+     real-world dataset for 3d indoor scene understanding using                  guided depth completion. In ICRA, 2021. 2
+     mobile rgb-d data. In NeurIPS, 2021. 5                                 [24] Wonbong Jang and Lourdes Agapito. Codenerf: Disentan-
+ [7] Herbert Bay. Surf: Speeded up robust features. ECCV, 2006.                  gled neural radiance fields for object categories. In ICCV,
+     2                                                                           2021. 2
+ [8] Romain Brégier. Deep regression on manifolds: a 3D rota-              [25] Nianjuan Jiang, Zhaopeng Cui, and Ping Tan. A global linear
+     tion case study. In 3DV, 2021. 5                                            method for camera pose registration. In ICCV, 2013. 2
+ [9] Chenjie Cao, Xinlin Ren, and Yanwei Fu. Mvsformer++:                   [26] Shengyu Jiang, Chen Wang, Yuhong Zhang, and Zhibin
+     Revealing the devil in transformer’s details for multi-view                 Wang. Completionformer: Efficient and accurate depth com-
+     stereo. In ICLR, 2024. 2, 8                                                 pletion via hybrid attention with transformers. In CVPR,
+[10] Hongkai Chen, Zixin Luo, Lei Zhou, Yurun Tian, Ming-                        2023. 1, 2
+     min Zhen, Tian Fang, David Mckinnon, Yanghai Tsin, and                 [27] Bernhard Kerbl, Georgios Kopanas, Thomas Leimkühler,
+     Long Quan. Aspanformer: Detector-free image matching                        and George Drettakis. 3d gaussian splatting for real-time
+     with adaptive span transformer. In ECCV, 2022. 2                            radiance field rendering. ACM trans. Graphics, 2023. 1
+[11] Xinjing Cheng, Peng Wang, and Ruigang Yang. Depth esti-                [28] Arno Knapitsch, Jaesik Park, Qian-Yi Zhou, and Vladlen
+     mation via affinity learned with convolutional spatial propa-               Koltun. Tanks and temples: Benchmarking large-scale scene
+     gation network. In ECCV, 2018. 2                                            reconstruction. ACM trans. Graphics, 2017. 7
+[12] David J Crandall, Andrew Owens, Noah Snavely, and                      [29] Vincent Lepetit, Francesc Moreno-Noguer, and Pascal Fua.
+     Daniel P Huttenlocher. Sfm with mrfs: Discrete-continuous                   Epnp: An accurate o(n) solution to the pnp problem. IJCV,
+     optimization for large-scale structure from motion. IEEE                    2009. 5
+     trans. PAMI, 2012. 2                                                   [30] Vincent Leroy, Jean-Sébastien Franco, and Edmond Boyer.
+[13] Hainan Cui, Xiang Gao, Shuhan Shen, and Zhanyi Hu.                          Volume sweeping: Learning photoconsistency for multi-
+     Hsfm: Hybrid structure-from-motion. In CVPR, 2017. 2                        view shape reconstruction. IJCV, 2021. 2
+[14] Angela Dai, Angel X Chang, Manolis Savva, Maciej Hal-                  [31] Vincent Leroy, Yohann Cabon, and Jérôme Revaud. Ground-
+     ber, Thomas Funkhouser, and Matthias Nießner. Scannet:                      ing image matching in 3d with MASt3R. In ECCV, 2024. 2,
+     Richly-annotated 3d reconstructions of indoor scenes. In                    3
+     CVPR, 2017. 7                                                          [32] Zhengqi Li and Noah Snavely. Megadepth: Learning single-
+[15] Timothée Darcet, Mathilde Caron, Piotr Bojanowski, Ishan                   view depth prediction from internet photos. In CVPR, 2018.
+     Misra, Armand Joulin, Julien Mairal, Hervé Jégou, and Hugo                5
+     Touvron. Dinov2: Learning robust visual features without               [33] Amy Lin, Jason Y Zhang, Deva Ramanan, and Shubham Tul-
+     supervision. TMLR, 2024. 1                                                  siani. Relpose++: Recovering 6d poses from sparse-view
+[16] Alexey Dosovitskiy, Lucas Beyer, Alexander Kolesnikov,                      observations. In 3DV, 2024. 3, 7
+     Dirk Weissenborn, Xiaohua Zhai, Thomas Unterthiner,                    [34] Philipp Lindenberger, Paul-Edouard Sarlin, Viktor Larsson,
+     Mostafa Dehghani, Matthias Minderer, Georg Heigold, Syl-                    and Marc Pollefeys. Pixel-perfect structure-from-motion
+     vain Gelly, Jakob Uszkoreit, and Neil Houlsby. An image is                  with featuremetric refinement. In ICCV, 2021. 7
+
+
+
+
+                                                                     1079
+[35] Philipp Lindenberger, Paul-Edouard Sarlin, and Marc Polle-            [52] Kyeongha Rho, Jinsung Ha, and Youngjung Kim. Guide-
+     feys. Lightglue: Local feature matching at light speed. In                 former: Transformers for image guided depth completion.
+     ICCV, 2023. 2                                                              In CVPR, 2022. 1, 2
+[36] David G Lowe. Distinctive image features from scale-                  [53] Chris Rockwell, Justin Johnson, and David F Fouhey. The
+     invariant keypoints. IJCV, 2004. 2                                         8-point algorithm as an inductive bias for relative pose pre-
+[37] Bin Luo and Edwin R. Hancock. Procrustes alignment with                    diction by vits. In 3DV, 2022. 3
+     the em algorithm. In CAIP, 1999. 5                                    [54] Robin Rombach, Andreas Blattmann, Dominik Lorenz,
+[38] Fangchang Ma, Guilherme Venturelli Cavalheiro, and Sertac                  Patrick Esser, and Björn Ommer. High-resolution image syn-
+     Karaman. Sparse-to-dense: Depth prediction from sparse                     thesis with latent diffusion models. In CVPR, 2022. 1
+     depth samples and a single image. In ICRA, 2018. 2                    [55] Edward Rosten and Tom Drummond. Machine learning for
+[39] Fangchang Ma, Guilherme Venturelli Cavalheiro, and Sertac                  high-speed corner detection. In ECCV, 2006. 2
+     Karaman. Self-supervised sparse-to-dense: Self-supervised             [56] Paul-Edouard Sarlin, Cesar Cadena, Roland Siegwart, and
+     depth completion from lidar and monocular camera. In                       Marcin Dymczyk. From coarse to fine: Robust hierarchical
+     ICRA, 2019. 2                                                              localization at large scale. In CVPR, 2019. 7
+[40] Zeyu Ma, Zachary Teed, and Jia Deng. Multiview stereo                 [57] Paul-Edouard Sarlin, Daniel DeTone, Tomasz Malisiewicz,
+     with cascaded epipolar raft. In ECCV, 2022. 2, 8                           and Andrew Rabinovich. Superglue: Learning feature
+[41] Nikolaus Mayer, Eddy Ilg, Philip Hausser, Philipp Fischer,                 matching with graph neural networks. In CVPR, 2020. 2
+     Daniel Cremers, Alexey Dosovitskiy, and Thomas Brox. A                [58] Manolis Savva, Abhishek Kadian, Oleksandr Maksymets,
+     large dataset to train convolutional networks for disparity,               Yili Zhao, Erik Wijmans, Bhavana Jain, Julian Straub, Jia
+     optical flow, and scene flow estimation. In CVPR, 2016. 5                  Liu, Vladlen Koltun, Jitendra Malik, et al. Habitat: A plat-
+[42] Ben Mildenhall, Pratul P Srinivasan, Matthew Tancik,                       form for embodied ai research. In ICCV, 2019. 5
+     Jonathan T Barron, Ravi Ramamoorthi, and Ren Ng. Nerf:
+                                                                           [59] Johannes L Schonberger and Jan-Michael Frahm. Structure-
+     Representing scenes as neural radiance fields for view syn-
+                                                                                from-motion revisited. In CVPR, 2016. 1, 2, 8
+     thesis. Communications of the ACM, 2021. 1
+                                                                           [60] Johannes L Schönberger, Enliang Zheng, Jan-Michael
+[43] Danish Nazir, Marcus Liwicki, Didier Stricker, and Muham-
+                                                                                Frahm, and Marc Pollefeys. Pixelwise view selection for
+     mad Zeshan Afzal. Semattnet: Towards attention-based
+                                                                                unstructured multi-view stereo. In ECCV, 2016. 2, 8
+     semantic aware guided depth completion. arXiv preprint
+     arXiv:2204.13635, 2022. 2                                             [61] Thomas Schops, Johannes L Schonberger, Silvano Galliani,
+                                                                                Torsten Sattler, Konrad Schindler, Marc Pollefeys, and An-
+[44] Michael Niemeyer, Lars Mescheder, Michael Oechsle, and
+                                                                                dreas Geiger. A multi-view stereo benchmark with high-
+     Andreas Geiger. Differentiable volumetric rendering: Learn-
+                                                                                resolution images and multi-camera videos. In CVPR, 2017.
+     ing implicit 3d representations without 3d supervision. In
+                                                                                7
+     CVPR, 2020. 2
+[45] OpenAI. Chatgpt-4, 2024. 1                                            [62] Philipp Schröppel, Jan Bechtold, Artemij Amiranashvili, and
+                                                                                Thomas Brox. A benchmark and a baseline for robust multi-
+[46] Luigi Piccinelli, Yung-Hsu Yang, Christos Sakaridis, Mattia
+                                                                                view depth estimation. In 3DV, 2022. 7
+     Segu, Siyuan Li, Luc Van Gool, and Fisher Yu. Unidepth:
+     Universal monocular metric depth estimation. In CVPR,                 [63] Nathan Silberman, Derek Hoiem, Pushmeet Kohli, and Rob
+     2024. 1, 2                                                                 Fergus. Indoor segmentation and support inference from
+[47] Frank Plastria. The weiszfeld algorithm: Proof, amend-                     rgbd images. In ECCV, 2012. 6
+     ments, and extensions. Foundations of Location Analysis,              [64] Vincent Sitzmann, Michael Zollhöfer, and Gordon Wet-
+     2011. 5                                                                    zstein. Scene representation networks: Continuous 3d-
+[48] Jiaxiong Qiu, Zhaopeng Cui, Yinda Zhang, Xingdi Zhang,                     structure-aware neural scene representations. In NeurIPS,
+     Shuaicheng Liu, Bing Zeng, and Marc Pollefeys. Deepli-                     2019. 2
+     dar: Deep surface normal guided depth prediction for out-             [65] Brandon Smart, Chuanxia Zheng, Iro Laina, and Vic-
+     door scene from sparse lidar data and single color image. In               tor Adrian Prisacariu.         Splatt3r: Zero-shot gaussian
+     CVPR, 2019. 2                                                              splatting from uncalibrated image pairs. arXiv preprint
+[49] Alexander Raistrick, Lahav Lipson, Zeyu Ma, Lingjie Mei,                   arXiv:2408.13912, 2024. 3
+     Mingzhe Wang, Yiming Zuo, Karhan Kayan, Hongyu Wen,                   [66] Jiaming Sun, Zehong Shen, Yuang Wang, Hujun Bao, and
+     Beining Han, Yihan Wang, Alejandro Newell, Hei Law,                        Xiaowei Zhou. Loftr: Detector-free local feature matching
+     Ankit Goyal, Kaiyu Yang, and Jia Deng. Infinite photore-                   with transformers. In CVPR, 2021. 2
+     alistic worlds using procedural generation. In CVPR, 2023.            [67] Pei Sun, Henrik Kretzschmar, Xerxes Dotiwalla, Aurelien
+     6                                                                          Chouard, Vijaysai Patnaik, Paul Tsui, James Guo, Yin Zhou,
+[50] René Ranftl, Alexey Bochkovskiy, and Vladlen Koltun. Vi-                  Yuning Chai, Benjamin Caine, et al. Scalability in perception
+     sion transformers for dense prediction. In ICCV, 2021. 4                   for autonomous driving: Waymo open dataset. In CVPR,
+[51] Jeremy Reizenstein, Roman Shapovalov, Philipp Henzler,                     2020. 5
+     Luca Sbordone, Patrick Labatut, and David Novotny. Com-               [68] Jie Tang, Fei-Peng Tian, Wei Feng, Jian Li, and Ping Tan.
+     mon objects in 3d: Large-scale learning and evaluation of                  Learning guided convolutional network for depth comple-
+     real-life 3d category reconstruction. In ICCV, 2021. 5, 8                  tion. IEEE trans. Image Processing, 2020. 2
+
+
+
+
+                                                                    1080
+[69] Jie Tang, Fei-Peng Tian, Boshi An, Jian Li, and Ping Tan. Bi-          [86] Jingyang Zhang, Yao Yao, Shiwei Li, Zixin Luo, and Tian
+     lateral propagation network for depth completion. In CVPR,                  Fang. Visibility-aware multi-view stereo network. In BMVC,
+     2024. 2                                                                     2020. 8
+[70] Shitao Tang, Jiahui Zhang, Siyu Zhu, and Ping Tan. Quadtree            [87] Junyi Zhang, Charles Herrmann, Junhwa Hur, Varun Jam-
+     attention for vision transformers. In ICLR, 2022. 2                         pani, Trevor Darrell, Forrester Cole, Deqing Sun, and Ming-
+[71] Wouter Van Gansbeke, Davy Neven, Bert De Brabandere,                        Hsuan Yang. Monst3r: A simple approach for estimating
+     and Luc Van Gool. Sparse and noisy lidar completion with                    geometry in the presence of motion. In ICLR, 2025. 3
+     rgb guidance and uncertainty. In MVA, 2019. 2                          [88] Jason Y Zhang, Deva Ramanan, and Shubham Tulsiani. Rel-
+[72] Hengyi Wang and Lourdes Agapito. 3d reconstruction with                     pose: Predicting probabilistic relative rotation for single ob-
+     spatial memory. In 3DV, 2025. 3                                             jects in the wild. In ECCV, 2022. 3, 7
+[73] Jianyuan Wang, Christian Rupprecht, and David Novotny.                 [89] Jason Y Zhang, Amy Lin, Moneish Kumar, Tzu-Hsuan
+     Posediffusion: Solving pose estimation via diffusion-aided                  Yang, Deva Ramanan, and Shubham Tulsiani. Cameras as
+     bundle adjustment. In ICCV, 2023. 1, 3, 7, 8                                rays: Pose estimation via ray diffusion. In ICLR, 2024. 1, 3,
+                                                                                 4, 7
+[74] Shuzhe Wang, Juho Kannala, Marc Pollefeys, and Daniel
+     Barath. Guiding local feature matching with surface curva-             [90] Yinda Zhang and Thomas Funkhouser. Deep depth comple-
+     ture. In ICCV, 2023. 2                                                      tion of a single rgb-d image. In CVPR, 2018. 2
+                                                                            [91] Tinghui Zhou, Richard Tucker, John Flynn, Graham Fyffe,
+[75] Shuzhe Wang, Vincent Leroy, Yohann Cabon, Boris
+                                                                                 and Noah Snavely. Stereo magnification: Learning view syn-
+     Chidlovskii, and Jerome Revaud. Dust3r: Geometric 3d vi-
+                                                                                 thesis using multiplane images. SIGGRAPH, 2018. 8
+     sion made easy. In CVPR, 2024. 1, 2, 3, 5, 7, 8
+[76] Yufei Wang, Bo Li, Ge Zhang, Qi Liu, Tao Gao, and Yuchao
+     Dai. Lrru: Long-short range recurrent updating networks for
+     depth completion. In ICCV, 2023. 2
+[77] Philippe Weinzaepfel, Thomas Lucas, Vincent Leroy,
+     Yohann Cabon, Vaibhav Arora, Romain Brégier, Gabriela
+     Csurka, Leonid Antsfeld, Boris Chidlovskii, and Jérôme
+     Revaud. Croco v2: Improved cross-view completion pre-
+     training for stereo matching and optical flow. In ICCV, 2023.
+     1
+[78] Olivia Wiles, Georgia Gkioxari, Richard Szeliski, and Justin
+     Johnson. SynSin: End-to-end view synthesis from a single
+     image. In CVPR, 2020. 2
+[79] Zhiqiang Yan, Kun Wang, Xiang Li, Zhenyu Zhang, Baobei
+     Xu, Jun Li, and Jian Yang. Rignet++: Semantic assisted
+     repetitive image guided network for depth completion. In
+     ECCV, 2022. 2
+[80] Zhiqiang Yan, Yuankai Lin, Kun Wang, Yupeng Zheng,
+     Yufei Wang, Zhenyu Zhang, Jun Li, and Jian Yang. Tri-
+     perspective view decomposition for geometry-aware depth
+     completion. In CVPR, 2024. 2
+[81] Yao Yao, Zixin Luo, Shiwei Li, Tian Fang, and Long Quan.
+     Mvsnet: Depth inference for unstructured multi-view stereo.
+     In ECCV, 2018. 8
+[82] Yao Yao, Zixin Luo, Shiwei Li, Jingyang Zhang, Yufan Ren,
+     Lei Zhou, Tian Fang, and Long Quan. Blendedmvs: A large-
+     scale dataset for generalized multi-view stereo networks. In
+     CVPR, 2020. 5
+[83] Lior Yariv, Yoni Kasten, Dror Moran, Meirav Galun, Matan
+     Atzmon, Basri Ronen, and Yaron Lipman. Multiview neu-
+     ral surface reconstruction by disentangling geometry and ap-
+     pearance. In NeurIPS, 2020. 2
+[84] Chandan Yeshwanth, Yueh-Cheng Liu, Matthias Nießner,
+     and Angela Dai. Scannet++: A high-fidelity dataset of 3d
+     indoor scenes. In ICCV, 2023. 5
+[85] Kwang Moo Yi, Eduard Trulls, Vincent Lepetit, and Pascal
+     Fua. Lift: Learned invariant feature transform. In ECCV,
+     2016. 2
+
+
+
+
+                                                                     1081
+

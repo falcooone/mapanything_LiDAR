@@ -1,5 +1,5 @@
 ﻿#!/usr/bin/env python3
-# coding: utf-8
+# -*- coding: utf-8 -*-
 """
 MapAnything Training Script (LiDAR Warmup + Unified Training)
 ================================================================
@@ -10,8 +10,8 @@ MapAnything Training Script (LiDAR Warmup + Unified Training)
   冷启动阶段 (epoch <= warmup):
     - 冻结所有 LoRA 参数 (lora_A / lora_B)
     - fusion_module : LiDAR/RGB gated fusion (LiDAR warmup favors the LiDAR branch)
-    - 可训练: lidars_encoder, fusion_module, pose_head*, dense_head*
-    - Pose/Dense heads 中原本冻结的基参数也会解冻，让 head 适配 LiDAR 特征
+    - warmup 阶段可训练: lidars_encoder, fusion_module
+    - 预测头和共享层在 warmup 阶段冻结，joint 阶段解冻
 
   联合训练阶段 (epoch > warmup):
     - 解冻所有 LoRA 参数
@@ -26,6 +26,7 @@ import gc
 import copy
 import sys
 import json
+import hashlib
 import time
 import argparse
 import glob
@@ -47,6 +48,31 @@ from torch.optim.lr_scheduler import CosineAnnealingLR, LinearLR, SequentialLR
 from PIL import Image
 from scipy.spatial.transform import Rotation as SciR
 import open3d as o3d
+
+def _patch_torch_hub_for_local_dinov2():
+    """
+    Redirect torch.hub.load("facebookresearch/dinov2", ...) to the vendored
+    local DINOv2 implementation so torchrun never touches GitHub.
+    """
+    if getattr(torch.hub.load, "_mapanything_local_dinov2_patch", False):
+        return
+
+    original_load = torch.hub.load
+
+    def _patched_load(repo_or_dir, model, *args, **kwargs):
+        if repo_or_dir == "facebookresearch/dinov2":
+            from mapanything.models.external.dinov2.hub import backbones as dinov2_backbones
+
+            if not hasattr(dinov2_backbones, model):
+                raise ValueError(f"Unsupported DINOv2 hub model: {model}")
+            return getattr(dinov2_backbones, model)(*args, **kwargs)
+        return original_load(repo_or_dir, model, *args, **kwargs)
+
+    _patched_load._mapanything_local_dinov2_patch = True
+    torch.hub.load = _patched_load
+
+
+_patch_torch_hub_for_local_dinov2()
 
 from mapanything.models import MapAnything
 from safetensors.torch import load_file
@@ -79,6 +105,26 @@ def f_log(x: torch.Tensor, eps: float = 1e-6) -> torch.Tensor:
     sign_x = torch.sign(x)
     abs_x = torch.abs(x) + eps
     return (sign_x * torch.log1p(abs_x)).to(x.dtype)
+
+
+def _compute_rgb_quality_stats(image_path: str):
+    """
+    Compute simple grayscale-based RGB quality stats in [0, 1].
+    Brightness is the grayscale mean.
+    Contrast is the grayscale RMS contrast (standard deviation around the mean).
+    """
+    try:
+        img = Image.open(image_path).convert("L")
+        img_np = np.asarray(img, dtype=np.float32) / 255.0
+    except Exception:
+        return None
+
+    brightness = float(np.mean(img_np))
+    contrast = float(np.sqrt(np.mean((img_np - brightness) ** 2)))
+    return {
+        "brightness": brightness,
+        "contrast": contrast,
+    }
 
 
 class RobustRegressionLoss(nn.Module):
@@ -190,6 +236,39 @@ def inject_lora_to_module(module: nn.Module, r: int = 8, lora_alpha: int = 8):
             inject_lora_to_module(child, r, lora_alpha)
 
 
+def collect_lora_stats(model: nn.Module) -> Dict[str, float]:
+    base_model = model.module if hasattr(model, "module") else model
+    stats = {
+        "num_layers": 0.0,
+        "a_norm": 0.0,
+        "b_norm": 0.0,
+        "delta_norm": 0.0,
+        "base_norm": 0.0,
+    }
+
+    with torch.no_grad():
+        for module in base_model.modules():
+            if not isinstance(module, LinearWithLoRA):
+                continue
+            stats["num_layers"] += 1.0
+            a = module.lora_A.detach().float()
+            b = module.lora_B.detach().float()
+            delta = (a @ b) * float(module.scaling)
+            base_w = module.linear.weight.detach().float()
+
+            stats["a_norm"] += float(torch.sum(a * a).item())
+            stats["b_norm"] += float(torch.sum(b * b).item())
+            stats["delta_norm"] += float(torch.sum(delta * delta).item())
+            stats["base_norm"] += float(torch.sum(base_w * base_w).item())
+
+    if stats["num_layers"] > 0:
+        stats["a_norm"] = math.sqrt(stats["a_norm"])
+        stats["b_norm"] = math.sqrt(stats["b_norm"])
+        stats["delta_norm"] = math.sqrt(stats["delta_norm"])
+        stats["base_norm"] = math.sqrt(stats["base_norm"])
+    return stats
+
+
 # ========================= EMA =========================
 
 class ModelEMA:
@@ -287,8 +366,11 @@ def compute_features_for_indices(pcd, indices, radius=0.1, max_nn=30):
 GLOBAL_DEPTH_MAX = 40.0
 LIDAR_NUM_CHANNELS = 9
 MAX_TIMESTAMP_TOLERANCE_SEC = 0.05
+# LiDAR projection warnings: if fewer than this many points land in the image,
+# we emit a debug warning so bad samples are easy to spot during training.
+MIN_LIDAR_PROJECTED_POINTS_WARN = 16
 # The cache version must change whenever the channel layout changes.
-LIDAR_CACHE_VERSION = "k_projection_9ch_y_z_x_tolerance_50ms_v4"
+LIDAR_CACHE_VERSION = "k_projection_9ch_calibrated_extrinsic_v1"
 
 
 def _empty_lidar_feature(gen_size: int) -> np.ndarray:
@@ -298,6 +380,89 @@ def _empty_lidar_feature(gen_size: int) -> np.ndarray:
 def _lidar_points_to_camera_axes(points_xyz: np.ndarray) -> np.ndarray:
     # Confirmed manually from projection overlays: X_cam=Y_lidar, Y_cam=Z_lidar, Z_cam=X_lidar.
     return np.stack([points_xyz[:, 1], points_xyz[:, 2], points_xyz[:, 0]], axis=1).astype(np.float32)
+
+
+def _load_lidar_extrinsics_matrix(extrinsics_path: str = "") -> Tuple[np.ndarray, str]:
+    """
+    Load a 4x4 LiDAR->camera transform from a file.
+
+    Supported formats:
+      - .npy: a 4x4 numpy array
+      - .txt / .csv / .dat: 4x4 numeric matrix loaded by np.loadtxt
+      - .json: either a 4x4 nested list, a dict containing a 4x4 matrix,
+        or the calibration_summary.json emitted by the calibration script.
+
+    If the file is missing or invalid, fall back to the compatibility axis mapping.
+    """
+    default_T = np.eye(4, dtype=np.float32)
+    default_T[:3, :3] = np.array(
+        [
+            [0.0, 1.0, 0.0],
+            [0.0, 0.0, 1.0],
+            [1.0, 0.0, 0.0],
+        ],
+        dtype=np.float32,
+    )
+
+    candidates = []
+    if extrinsics_path:
+        candidates.append(extrinsics_path)
+
+    for path in candidates:
+        if not path or not os.path.exists(path):
+            continue
+        try:
+            ext = os.path.splitext(path)[1].lower()
+            if ext == ".npy":
+                T = np.load(path).astype(np.float32)
+            elif ext in (".txt", ".csv", ".dat"):
+                T = np.loadtxt(path).astype(np.float32)
+            elif ext == ".json":
+                with open(path, "r", encoding="utf-8") as f:
+                    data = json.load(f)
+                if isinstance(data, list):
+                    T = np.array(data, dtype=np.float32)
+                elif isinstance(data, dict):
+                    if "rgb" in data and isinstance(data["rgb"], dict) and "T_lidar_to_rgb" in data["rgb"]:
+                        T = np.array(data["rgb"]["T_lidar_to_rgb"], dtype=np.float32)
+                    elif "depth" in data and isinstance(data["depth"], dict) and "T_lidar_to_depth" in data["depth"]:
+                        T = np.array(data["depth"]["T_lidar_to_depth"], dtype=np.float32)
+                    else:
+                        for key in ("T_lidar_to_cam", "T_lidar_to_rgb", "T_lidar_to_depth", "T"):
+                            if key in data:
+                                T = np.array(data[key], dtype=np.float32)
+                                break
+                        else:
+                            T = np.array([], dtype=np.float32)
+                else:
+                    T = np.array([], dtype=np.float32)
+            else:
+                T = np.array([], dtype=np.float32)
+            if T.shape == (4, 4):
+                return T, os.path.abspath(path)
+        except Exception:
+            continue
+
+    return default_T, ""
+
+
+def _lidar_projection_tag(T_lidar_to_cam: np.ndarray, source: str) -> str:
+    digest = hashlib.sha1(np.asarray(T_lidar_to_cam, dtype=np.float32).tobytes()).hexdigest()[:12]
+    return f"{source}:{digest}"
+
+
+def _transform_lidar_points_to_camera(points_xyz: np.ndarray, T_lidar_to_cam: np.ndarray) -> np.ndarray:
+    points_xyz = np.asarray(points_xyz, dtype=np.float32)
+    if points_xyz.size == 0:
+        return points_xyz.reshape(0, 3)
+    if T_lidar_to_cam is None:
+        return _lidar_points_to_camera_axes(points_xyz)
+    T = np.asarray(T_lidar_to_cam, dtype=np.float32)
+    if T.shape != (4, 4):
+        return _lidar_points_to_camera_axes(points_xyz)
+    pts_h = np.concatenate([points_xyz, np.ones((len(points_xyz), 1), dtype=np.float32)], axis=1)
+    pts_cam = (T @ pts_h.T).T[:, :3]
+    return pts_cam.astype(np.float32)
 
 
 def _make_lidar_diag(reason: str, **kwargs) -> Dict[str, object]:
@@ -473,6 +638,7 @@ def generate_pcd_lidar_feature(
     K: np.ndarray,
     src_size: Tuple[int, int],
     gen_size: int = 224,
+    lidar_to_cam_T: np.ndarray = None,
 ) -> Tuple[np.ndarray, float, Dict[str, object]]:
     pcd = o3d.io.read_point_cloud(pcd_path)
     points = np.asarray(pcd.points)
@@ -490,7 +656,7 @@ def generate_pcd_lidar_feature(
     fx, fy = float(K_proj[0, 0]), float(K_proj[1, 1])
     cx, cy = float(K_proj[0, 2]), float(K_proj[1, 2])
 
-    pts_cam = _lidar_points_to_camera_axes(points.astype(np.float32))
+    pts_cam = _transform_lidar_points_to_camera(points.astype(np.float32), lidar_to_cam_T)
     x, y, z = pts_cam[:, 0], pts_cam[:, 1], pts_cam[:, 2]
     x_min, x_max = float(np.min(x)), float(np.max(x))
     y_min, y_max = float(np.min(y)), float(np.max(y))
@@ -519,6 +685,7 @@ def generate_pcd_lidar_feature(
     v_min, v_max = float(np.min(v)), float(np.max(v))
     in_image = (u >= 0) & (u < W) & (v >= 0) & (v < H)
     num_projected = int(np.count_nonzero(in_image))
+    low_proj_diag = None
     if not np.any(in_image):
         axis_diag = _axis_projection_diagnostics(
             pts_cam,
@@ -553,6 +720,45 @@ def generate_pcd_lidar_feature(
             v_max=v_max,
             axis_projection_candidates=axis_diag[:4],
         )
+    if num_projected < MIN_LIDAR_PROJECTED_POINTS_WARN:
+        axis_diag = _axis_projection_diagnostics(
+            pts_cam,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            width=W,
+            height=H,
+        )
+        # Keep the feature, but mark it as a low-quality projection so the
+        # dataset can surface a warning without breaking training.
+        low_proj_diag = _make_lidar_diag(
+            "too_few_projected_points",
+            num_points=int(len(points)),
+            num_positive_z=num_positive_z,
+            num_projected=num_projected,
+            num_valid_pixels=0,
+            min_projected_points=MIN_LIDAR_PROJECTED_POINTS_WARN,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            src_size=src_size,
+            gen_size=gen_size,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+            u_min=u_min,
+            u_max=u_max,
+            v_min=v_min,
+            v_max=v_max,
+            axis_projection_candidates=axis_diag[:4],
+        )
+        # Continue building the feature map, but the caller will log the warning.
+        # This helps debug weak LiDAR/RGB overlap without losing the sample.
 
     u = u[in_image].astype(int); v = v[in_image].astype(int); z = z[in_image]
     valid_indices = np.where(valid_mask)[0][in_image]
@@ -597,12 +803,61 @@ def generate_pcd_lidar_feature(
     valid_img = np.isfinite(depth_img)
     num_valid_pixels = int(np.count_nonzero(valid_img))
     if not np.any(valid_img):
-        depth_img = np.zeros((H, W), dtype=np.float32)
-        z_d = 1.0
+        return _empty_lidar_feature(gen_size), 1.0, _make_lidar_diag(
+            "empty_valid_pixels",
+            num_points=int(len(points)),
+            num_positive_z=num_positive_z,
+            num_projected=num_projected,
+            num_valid_pixels=num_valid_pixels,
+            min_projected_points=MIN_LIDAR_PROJECTED_POINTS_WARN,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            src_size=src_size,
+            gen_size=gen_size,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+            u_min=u_min,
+            u_max=u_max,
+            v_min=v_min,
+            v_max=v_max,
+        )
     else:
         z_d = float(np.mean(depth_img[valid_img]))
         depth_img[~valid_img] = 0.0
         z_d = max(z_d, 1e-3)
+
+    if num_projected < MIN_LIDAR_PROJECTED_POINTS_WARN:
+        low_proj_diag = _make_lidar_diag(
+            "too_few_projected_points",
+            num_points=int(len(points)),
+            num_positive_z=num_positive_z,
+            num_projected=num_projected,
+            num_valid_pixels=num_valid_pixels,
+            min_projected_points=MIN_LIDAR_PROJECTED_POINTS_WARN,
+            fx=fx,
+            fy=fy,
+            cx=cx,
+            cy=cy,
+            src_size=src_size,
+            gen_size=gen_size,
+            x_min=x_min,
+            x_max=x_max,
+            y_min=y_min,
+            y_max=y_max,
+            z_min=z_min,
+            z_max=z_max,
+            u_min=u_min,
+            u_max=u_max,
+            v_min=v_min,
+            v_max=v_max,
+            axis_projection_candidates=axis_diag[:4] if 'axis_diag' in locals() else [],
+        )
 
     cap = np.stack([curv_img, aniso_img, plan_img], axis=0)
     cap = np.clip(cap, 0.0, 1.0).astype(np.float32)
@@ -617,12 +872,16 @@ def generate_pcd_lidar_feature(
     # cap(3), relative depth(1), normal(3), valid(1), depth edge(1).
     pcd_lidar = np.concatenate([cap, depth_rel, normal, valid, depth_edge], axis=0)
 
+    if low_proj_diag is not None:
+        return pcd_lidar, z_d, low_proj_diag
+
     return pcd_lidar, z_d, _make_lidar_diag(
         "ok",
         num_points=int(len(points)),
         num_positive_z=num_positive_z,
         num_projected=num_projected,
         num_valid_pixels=num_valid_pixels,
+        min_projected_points=MIN_LIDAR_PROJECTED_POINTS_WARN,
         x_min=x_min,
         x_max=x_max,
         y_min=y_min,
@@ -640,9 +899,13 @@ def generate_pcd_lidar_feature(
 
 class Seq1LidarDataset(Dataset):
     def __init__(self, seq_root: str, seq_len: int = 2, stride: int = 1,
-                 img_size: int = 448, pcd_gen_size: int = 224,
-                 cache_dir: str = None, tolerance: float = 0.05,
-                 img_exts: tuple = None, use_lidar: bool = True):
+                  img_size: int = 448, pcd_gen_size: int = 224,
+                  cache_dir: str = None, tolerance: float = 0.05,
+                  img_exts: tuple = None, use_lidar: bool = True,
+                  max_samples: int = None,
+                  max_rgb_brightness: float = None,
+                  max_rgb_contrast: float = None,
+                  lidar_extrinsics_path: str = ""):
         super().__init__()
         self.seq_root = seq_root
         self.seq_len = seq_len
@@ -652,9 +915,15 @@ class Seq1LidarDataset(Dataset):
         self.tolerance = max(float(tolerance), 0.0)
         self.cache_dir = cache_dir
         self.use_lidar = use_lidar
+        self.max_samples = max_samples
+        self.max_rgb_brightness = max_rgb_brightness
+        self.max_rgb_contrast = max_rgb_contrast
         if img_exts is None:
             img_exts = ('.png', '.jpg', '.jpeg', '.bmp', '.tiff', '.tif', '.webp')
         self.img_exts = tuple(e.lower() for e in img_exts)
+        self.lidar_extrinsics_path = lidar_extrinsics_path
+        self.lidar_to_cam_T, self.lidar_calibration_source = _load_lidar_extrinsics_matrix(lidar_extrinsics_path)
+        self.lidar_projection_tag = _lidar_projection_tag(self.lidar_to_cam_T, self.lidar_calibration_source or "legacy")
 
         self.part_folders = []
         for item in sorted(os.listdir(seq_root)):
@@ -707,6 +976,18 @@ class Seq1LidarDataset(Dataset):
         self.intrinsics = self.part_intrinsics[0][0] if self.part_intrinsics else root_K
         self.lidar_diag_counts = {}
         self._lidar_diag_examples = {}
+        self._lidar_diag_warned_reasons = set()
+        if is_main_process(int(os.environ.get('RANK', 0))):
+            if self.lidar_calibration_source:
+                print(
+                    f"[Dataset] LiDAR projection uses calibrated extrinsics: "
+                    f"source={self.lidar_calibration_source} tag={self.lidar_projection_tag}"
+                )
+            else:
+                print(
+                    f"[Dataset] LiDAR projection uses compatibility axis mapping (no extrinsics file found), "
+                    f"tag={self.lidar_projection_tag}"
+                )
 
         self.part_pcds = []
         if use_lidar:
@@ -756,6 +1037,14 @@ class Seq1LidarDataset(Dataset):
                 if diff > self.tolerance:
                     timestamp_diffs.append(diff)
                     continue
+                quality = _compute_rgb_quality_stats(ipath)
+                if quality is not None:
+                    brightness = quality["brightness"]
+                    contrast = quality["contrast"]
+                    if self.max_rgb_brightness is not None and brightness > self.max_rgb_brightness:
+                        continue
+                    if self.max_rgb_contrast is not None and contrast > self.max_rgb_contrast:
+                        continue
                 if self.use_lidar and self._find_closest_pcd(img_ts_sec, pidx) is None:
                     dropped_no_lidar += 1
                     continue
@@ -832,27 +1121,77 @@ class Seq1LidarDataset(Dataset):
         return pcd_info['files'][idx]
 
     def _build_cache(self):
-        if is_main_process(int(os.environ.get('RANK', 0))):
+        is_main = is_main_process(int(os.environ.get('RANK', 0)))
+        total = len(self.all_views_meta)
+        if is_main:
             print(f"Precomputing {LIDAR_NUM_CHANNELS}-channel LiDAR features...")
+            print(f"[Cache] total views={total} cache_dir={self.cache_dir}")
+        started = time.time()
+        hit_count = 0
+        miss_count = 0
+        skipped_no_pcd = 0
+        written_count = 0
+        invalid_count = 0
+        last_log_time = started
+        log_every = max(1, min(200, total // 20 if total else 1))
+
         for i, (ipath, img_ts_ns, pidx, _) in enumerate(self.all_views_meta):
             cache_path = os.path.join(self.cache_dir, f"pcd_{img_ts_ns}.npz")
             if os.path.exists(cache_path):
                 try:
-                    cached = np.load(cache_path)
-                    cache_version = str(cached["version"].item()) if "version" in cached else ""
-                    if cached["feat"].shape[0] == LIDAR_NUM_CHANNELS and cache_version == LIDAR_CACHE_VERSION:
-                        continue
+                    with np.load(cache_path, allow_pickle=False) as cached:
+                        cache_version = str(cached["version"].item()) if "version" in cached else ""
+                        cache_tag = str(cached["projection_tag"].item()) if "projection_tag" in cached else ""
+                        if (
+                            cached["feat"].shape[0] == LIDAR_NUM_CHANNELS
+                            and cache_version == LIDAR_CACHE_VERSION
+                            and cache_tag == self.lidar_projection_tag
+                        ):
+                            hit_count += 1
+                            continue
                 except Exception:
-                    pass
+                    invalid_count += 1
             img_ts_sec = img_ts_ns / 1e9
             pcd_path = self._find_closest_pcd(img_ts_sec, pidx)
             if pcd_path is None:
+                skipped_no_pcd += 1
                 continue
+            miss_count += 1
             K, src_size = self.part_intrinsics[pidx]
-            feat, z_d, diag = generate_pcd_lidar_feature(pcd_path, K, src_size, self.pcd_gen_size)
+            item_t0 = time.time()
+            feat, z_d, diag = generate_pcd_lidar_feature(
+                pcd_path, K, src_size, self.pcd_gen_size, lidar_to_cam_T=self.lidar_to_cam_T
+            )
             self._record_lidar_diag(diag, pcd_path, img_ts_ns, source="cache_build")
-            np.savez(cache_path, feat=feat, scale=z_d, version=LIDAR_CACHE_VERSION)
-        if is_main_process(int(os.environ.get('RANK', 0))):
+            tmp_path = cache_path + ".tmp.npz"
+            np.savez(
+                tmp_path,
+                feat=feat,
+                scale=z_d,
+                version=LIDAR_CACHE_VERSION,
+                projection_tag=self.lidar_projection_tag,
+            )
+            os.replace(tmp_path, cache_path)
+            written_count += 1
+
+            if is_main and (i % log_every == 0 or (time.time() - last_log_time) > 30.0):
+                elapsed = time.time() - started
+                per_item = elapsed / max(i + 1, 1)
+                print(
+                    f"[Cache] {i + 1}/{total} "
+                    f"hit={hit_count} miss={miss_count} written={written_count} "
+                    f"skip_no_pcd={skipped_no_pcd} invalid={invalid_count} "
+                    f"last={time.time() - item_t0:.2f}s avg={per_item:.2f}s/item"
+                )
+                last_log_time = time.time()
+
+        if is_main:
+            elapsed = time.time() - started
+            print(
+                f"[Cache] done in {elapsed / 60.0:.1f} min | "
+                f"hit={hit_count} miss={miss_count} written={written_count} "
+                f"skip_no_pcd={skipped_no_pcd} invalid={invalid_count}"
+            )
             print("缓存完成")
             self._print_lidar_diag_summary(prefix="[Dataset][LiDARDiag][cache]")
 
@@ -871,10 +1210,17 @@ class Seq1LidarDataset(Dataset):
                 data = np.load(cache_path)
                 feat = data["feat"].astype(np.float32)
                 cache_version = str(data["version"].item()) if "version" in data else ""
-                if feat.shape[0] == LIDAR_NUM_CHANNELS and cache_version == LIDAR_CACHE_VERSION:
+                cache_tag = str(data["projection_tag"].item()) if "projection_tag" in data else ""
+                if (
+                    feat.shape[0] == LIDAR_NUM_CHANNELS
+                    and cache_version == LIDAR_CACHE_VERSION
+                    and cache_tag == self.lidar_projection_tag
+                ):
                     return feat, float(data["scale"])
         K, src_size = self.part_intrinsics[pidx]
-        feat, z_d, diag = generate_pcd_lidar_feature(pcd_path, K, src_size, self.pcd_gen_size)
+        feat, z_d, diag = generate_pcd_lidar_feature(
+            pcd_path, K, src_size, self.pcd_gen_size, lidar_to_cam_T=self.lidar_to_cam_T
+        )
         self._record_lidar_diag(diag, pcd_path, int(img_ts_sec * 1e9), source="getitem")
         return feat, z_d
 
@@ -889,6 +1235,20 @@ class Seq1LidarDataset(Dataset):
             }
             example.update(diag)
             self._lidar_diag_examples[reason] = example
+        if reason != "ok" and reason not in self._lidar_diag_warned_reasons and is_main_process(int(os.environ.get('RANK', 0))):
+            self._lidar_diag_warned_reasons.add(reason)
+            msg = (
+                f"[Dataset][LiDARDiag][WARN] source={source} reason={reason} "
+                f"img_ts_ns={int(img_ts_ns)} pcd={pcd_path} "
+                f"num_points={diag.get('num_points')} "
+                f"num_positive_z={diag.get('num_positive_z')} "
+                f"num_projected={diag.get('num_projected')} "
+                f"num_valid_pixels={diag.get('num_valid_pixels')}"
+            )
+            min_proj = diag.get("min_projected_points")
+            if min_proj is not None:
+                msg += f" min_projected_points={min_proj}"
+            print(msg)
 
     def _print_lidar_diag_summary(self, prefix: str):
         if not self.lidar_diag_counts:
@@ -938,7 +1298,10 @@ class Seq1LidarDataset(Dataset):
                 )
 
     def __len__(self):
-        return max(0, (len(self.all_views_meta) - self.seq_len) // self.stride + 1)
+        total = max(0, (len(self.all_views_meta) - self.seq_len) // self.stride + 1)
+        if self.max_samples is None:
+            return total
+        return min(total, max(0, int(self.max_samples)))
 
     def __getitem__(self, idx):
         start = idx * self.stride
@@ -1648,14 +2011,14 @@ def set_lidar_warmup_phase(model, enable_warmup, args, rank):
         if enable_warmup:
             # Warmup should teach the LiDAR branch and the fusion block together,
             # otherwise the fusion layer never learns to surface LiDAR evidence.
-            if is_lidar or is_pose_scale or is_head_base or is_shared:
+            if is_lidar or is_pose_scale:
                 param.requires_grad = True
                 unfrozen_count += 1
             else:
                 param.requires_grad = False
                 frozen_count += 1
         else:
-            if is_lidar or is_pose_scale or is_lora:
+            if is_lidar or is_pose_scale or is_lora or is_head_base or is_shared:
                 param.requires_grad = True
                 unfrozen_count += 1
             else:
@@ -1678,8 +2041,8 @@ def set_lidar_warmup_phase(model, enable_warmup, args, rank):
 def build_optimizer_for_phase(model, args, rank, phase='warmup'):
     """
     根据当前阶段构建优化器。
-    phase='warmup': LiDAR + Head 基参数 + Shared 投影层
-    phase='joint':  LoRA（所有线性层的 A/B）+ LiDAR
+    phase='warmup': LiDAR + pose_scale_proj
+    phase='joint':  LoRA（所有线性层的 A/B）+ LiDAR + head/shared 基参数
     """
     target_model = model.module if hasattr(model, 'module') else model
     
@@ -1735,41 +2098,40 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
         if lidar_params:
             param_groups.append({
                 'params': lidar_params,
-                'lr': args.lr * max(args.lidar_lr_scale, 0.5) * warmup_lr_scale,
+                'lr': args.lr * max(args.lidar_lr_scale, 0.4) * warmup_lr_scale,
                 'weight_decay': args.weight_decay,
                 'name': 'lidar_warmup'
             })
         if fusion_params:
             param_groups.append({
                 'params': fusion_params,
-                'lr': args.lr * max(args.fusion_lr_scale, 0.2) * warmup_lr_scale,
+                'lr': args.lr * max(args.fusion_lr_scale, 0.15) * warmup_lr_scale,
                 'weight_decay': args.weight_decay,
                 'name': 'fusion_warmup'
+            })
+        if pose_scale_params:
+            param_groups.append({
+                'params': pose_scale_params,
+                'lr': args.lr * 0.5 * warmup_lr_scale,
+                'weight_decay': args.weight_decay,
+                'name': 'pose_scale'
             })
         if shared_params:
             param_groups.append({
                 'params': shared_params,
-                'lr': args.lr * 0.5 * warmup_lr_scale,
+                'lr': args.lr * 0.35 * warmup_lr_scale,
                 'weight_decay': args.weight_decay,
                 'name': 'shared_proj'
             })
         if head_base_params:
             param_groups.append({
                 'params': head_base_params,
-                'lr': args.lr * warmup_lr_scale,
+                'lr': args.lr * 0.5 * warmup_lr_scale,
                 'weight_decay': args.weight_decay,
                 'name': 'head_base'
             })
-        if pose_scale_params:
-            param_groups.append({
-                'params': pose_scale_params,
-                'lr': args.lr * warmup_lr_scale,
-                'weight_decay': args.weight_decay,
-                'name': 'pose_scale'
-            })
     else:
-        # 联合训练：只训 LoRA（所有线性层的 A/B）+ LiDAR
-        # Head 和 Shared 的基参数冻结，只通过 LoRA 微调
+        # 联合训练：LoRA（encoder/info_sharing/heads）+ LiDAR + head/shared 基参数
         if lora_A_params_head:
             param_groups.append({'params': lora_A_params_head, 'lr': args.lr, 'weight_decay': args.weight_decay, 'name': 'head_lora_A'})
         if lora_B_params_head:
@@ -1778,8 +2140,15 @@ def build_optimizer_for_phase(model, args, rank, phase='warmup'):
             param_groups.append({'params': lora_A_params_encoder, 'lr': args.lr * args.encoder_lr_ratio, 'weight_decay': args.weight_decay, 'name': 'enc_lora_A'})
         if lora_B_params_encoder:
             param_groups.append({'params': lora_B_params_encoder, 'lr': args.lr * args.lr_b_multiplier * args.encoder_lr_ratio, 'weight_decay': 0.0, 'name': 'enc_lora_B'})
-        if pose_scale_params:
-            param_groups.append({'params': pose_scale_params, 'lr': args.lr, 'weight_decay': args.weight_decay, 'name': 'pose_scale'})
+        if head_base_params:
+            param_groups.append({'params': head_base_params, 'lr': args.lr, 'weight_decay': args.weight_decay, 'name': 'head_base'})
+        if shared_params:
+            param_groups.append({
+                'params': shared_params,
+                'lr': args.lr * 0.35,
+                'weight_decay': args.weight_decay,
+                'name': 'shared_proj'
+            })
         if lidar_params:
             param_groups.append({'params': lidar_params, 'lr': args.lr * args.lidar_lr_scale, 'weight_decay': args.weight_decay, 'name': 'lidar_full'})
         if fusion_params:
@@ -1821,7 +2190,20 @@ def build_scheduler(optimizer, args, steps_per_epoch):
 
 # ========================= 训练循环 =========================
 
-def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epoch, args, rank, scheduler, ema=None, phase='joint'):
+def train_one_epoch(
+    model,
+    dataloader,
+    optimizer,
+    scaler,
+    criterion,
+    device,
+    epoch,
+    args,
+    rank,
+    scheduler,
+    ema=None,
+    phase='joint',
+):
     model.train()
     if torch.distributed.is_initialized():
         torch.distributed.barrier()
@@ -1834,6 +2216,7 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
     lidar_total_count = 0
     b_first_norm = None
     nan_grad_batches = 0
+    no_valid_loss_warn_count = 0
 
     # ===================== 梯度监控系统 =====================
     CHECK_GRAD_ONLY = os.environ.get('CHECK_GRAD', '0') == '1'
@@ -1991,6 +2374,15 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
             loss, metrics = criterion(predictions, views, seq_len=args.seq_len)
 
         if loss is None:
+            if is_main_process(rank) and metrics.get('no_valid_loss'):
+                no_valid_loss_warn_count += 1
+                if no_valid_loss_warn_count <= 5 or no_valid_loss_warn_count % 20 == 0:
+                    print(
+                        f"[Warning][Epoch {epoch}][Batch {batch_idx}] "
+                        f"该 batch 没有任何有效监督项，已跳过反传。"
+                        f" 可能原因包括 LiDAR 空投影、深度/位姿 mask 为空，"
+                        f"或该批次所有损失分支都被过滤。"
+                    )
             _cleanup_batch_tensors(views, predictions, None, None)
             t_start = time.time()
             continue
@@ -2113,6 +2505,16 @@ def train_one_epoch(model, dataloader, optimizer, scaler, criterion, device, epo
             for key in ['rpe_trans', 'rpe_rot', 'depth', 'ray', 'world_pts']:
                 if key in metrics:
                     log_str += f" {key}: {metrics[key]:.4f}"
+            if args.lora:
+                lora_stats = collect_lora_stats(model)
+                if lora_stats["num_layers"] > 0:
+                    ratio_ab = lora_stats["b_norm"] / (lora_stats["a_norm"] + 1e-12)
+                    rel_delta = lora_stats["delta_norm"] / (lora_stats["base_norm"] + 1e-12)
+                    log_str += (
+                        f" LoRA[A/B/Δ]: {lora_stats['a_norm']:.2e}/"
+                        f"{lora_stats['b_norm']:.2e}/{lora_stats['delta_norm']:.2e}"
+                        f" B/A={ratio_ab:.3f} Δ/W={rel_delta:.3e}"
+                    )
             print(log_str)
 
         t_start = time.time()
@@ -2140,16 +2542,26 @@ def main():
                         default=["/add02/users/xuyh/seq1/", "/add02/users/xuyh/seq3/"],
                         help="训练数据路径，可指定多个序列")
     parser.add_argument("--model_dir", type=str, default="/home/xuyh/mapanything/")
-    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/32_lora_lidar")
-    parser.add_argument("--cache_dir", type=str, default="./cache/lidar_9ch")
-    parser.add_argument("--epochs", type=int, default=100)
+    parser.add_argument("--output_dir", type=str, default="/add02/users/xuyh/checkpoints/32_lora_lidar_balib")
+    parser.add_argument("--cache_dir", type=str, default="/add02/users/xuyh/cache/lidar_9ch_calib")
+    parser.add_argument(
+        "--lidar_extrinsics_path",
+        type=str,
+        default="/home/xuyh/mapanything/output/calibration/calibration_summary.json",
+        help=(
+            "4x4 LiDAR->camera extrinsics file (.npy/.txt/.json), or the "
+            "calibration_summary.json emitted by scripts/calibrate_lidar_rgb_depth.py. "
+            "If omitted, fall back to the compatibility axis mapping."
+        ),
+    )
+    parser.add_argument("--epochs", type=int, default=10)
     parser.add_argument("--batch_size", type=int, default=1)
     parser.add_argument("--seq_len", type=int, default=4)
     parser.add_argument("--stride", type=int, default=3)
     parser.add_argument("--img_size", type=int, default=448)
-    parser.add_argument("--lr", type=float, default=5e-5)
-    parser.add_argument("--lr_b_multiplier", type=float, default=25.0)
-    parser.add_argument("--encoder_lr_ratio", type=float, default=0.1)
+    parser.add_argument("--lr", type=float, default=3e-5)
+    parser.add_argument("--lr_b_multiplier", type=float, default=20.0)
+    parser.add_argument("--encoder_lr_ratio", type=float, default=0.06)
     parser.add_argument("--weight_decay", type=float, default=0.05)
     parser.add_argument("--warmup_steps", type=int, default=500)
     parser.add_argument("--grad_clip", type=float, default=1.0)
@@ -2177,19 +2589,33 @@ def main():
     parser.add_argument("--use_ema", action="store_true", default=True)
     parser.add_argument("--ema_decay", type=float, default=0.999)
     parser.add_argument("--lidar_dropout_prob", type=float, default=0.0)
+    parser.add_argument("--max_samples_per_dataset", type=int, default=0,
+                        help="每个 seq_root 只使用前 N 个样本；设为 0 或负数表示不限制")
+    parser.add_argument(
+        "--max_rgb_brightness",
+        type=float,
+        default=1,
+        help="训练时仅保留灰度亮度 <= 该值的 RGB 图像；范围建议 [0, 1]",
+    )
+    parser.add_argument(
+        "--max_rgb_contrast",
+        type=float,
+        default=1,
+        help="训练时仅保留灰度 RMS 对比度 <= 该值的 RGB 图像；范围建议 [0, 1]",
+    )
     
     # ========== LiDAR Warmup 新参数 ==========
-    parser.add_argument("--lidar_warmup_epochs", type=int, default=1,
+    parser.add_argument("--lidar_warmup_epochs", type=int, default=4,
                         help="number of early epochs to train LiDAR/fusion before joint LoRA training")
-    parser.add_argument("--lidar_warmup_lr_scale", type=float, default=0.5,
-                        help="warmup 阶段的整体 LR 缩放系数，默认 0.5 更稳")
+    parser.add_argument("--lidar_warmup_lr_scale", type=float, default=0.4,
+                        help="warmup 阶段的整体 LR 缩放系数，默认 0.4 更稳")
     parser.add_argument("--lidar_warmup_gate_alpha", type=float, default=0.60,
                         help="warmup phase fusion gate target for LiDAR emphasis")
     parser.add_argument("--lidar_warmup_rgb_dropout_prob", type=float, default=0.15,
                         help="probability of zeroing RGB inputs during LiDAR warmup")
     parser.add_argument("--loss_depth_weight", type=float, default=0.1)
-    parser.add_argument("--loss_pose_trans_weight", type=float, default=1.5)
-    parser.add_argument("--loss_pose_rot_weight", type=float, default=0.35)
+    parser.add_argument("--loss_pose_trans_weight", type=float, default=2.0)
+    parser.add_argument("--loss_pose_rot_weight", type=float, default=0.5)
     parser.add_argument("--loss_ray_weight", type=float, default=0.1)
     parser.add_argument("--loss_pts3d_cam_weight", type=float, default=0.1)
     parser.add_argument("--loss_world_pts_weight", type=float, default=0.15)
@@ -2226,6 +2652,7 @@ def main():
         print("=" * 65)
         print("MapAnything LiDAR Joint Training")
         print(f"LoRA: {'ON' if args.lora else 'OFF'} | LiDAR: {'ON' if args.lidar else 'OFF'}")
+        print(f"[Input] lidar_extrinsics_path={args.lidar_extrinsics_path or '<compatibility-fallback>'}")
         if args.lidar_warmup_epochs > 0:
             print(f"LiDAR Warmup: first {args.lidar_warmup_epochs} epoch(s) train LiDAR/fusion before joint LoRA")
         print("=" * 65)
@@ -2245,7 +2672,11 @@ def main():
         dataset = Seq1LidarDataset(
             seq_root=args.seq_root[0], seq_len=args.seq_len, stride=args.stride,
             img_size=args.img_size, cache_dir=args.cache_dir, tolerance=args.tolerance,
-            use_lidar=args.lidar
+            use_lidar=args.lidar,
+            max_samples=args.max_samples_per_dataset if args.max_samples_per_dataset > 0 else None,
+            max_rgb_brightness=args.max_rgb_brightness,
+            max_rgb_contrast=args.max_rgb_contrast,
+            lidar_extrinsics_path=args.lidar_extrinsics_path,
         )
     else:
         datasets = []
@@ -2254,7 +2685,11 @@ def main():
             ds = Seq1LidarDataset(
                 seq_root=root, seq_len=args.seq_len, stride=args.stride,
                 img_size=args.img_size, cache_dir=cache_subdir, tolerance=args.tolerance,
-                use_lidar=args.lidar
+                use_lidar=args.lidar,
+                max_samples=args.max_samples_per_dataset if args.max_samples_per_dataset > 0 else None,
+                max_rgb_brightness=args.max_rgb_brightness,
+                max_rgb_contrast=args.max_rgb_contrast,
+                lidar_extrinsics_path=args.lidar_extrinsics_path,
             )
             datasets.append(ds)
         dataset = ConcatDataset(datasets)
